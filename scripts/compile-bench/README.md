@@ -8,7 +8,7 @@ written so a fresh agent session can pick it up from this file alone.
 |---|---|
 | `bench_nautilus.sh` | Runs the scenarios through hyperfine and stores JSON/Markdown/logs. |
 | `compare_results.py` | Puts several machines' result folders side by side (first = reference). |
-| `hyperliquid-edit.patch` | The edit: 3 files, 300 lines in `crates/adapters/hyperliquid` (src + integration tests). |
+| `hyperliquid-edit.patch` | The edit: 3 files, 216 lines in `crates/adapters/hyperliquid` (src + integration tests). |
 | `BASE_COMMIT` | The commit every machine benchmarks from. The patch applies cleanly on it. |
 | `results/<machine>-<timestamp>/` | Committed results, one folder per machine run. |
 
@@ -16,7 +16,9 @@ written so a fresh agent session can pick it up from this file alone.
 
 The edit is the reverse diff of upstream commit `95feaf3` ("Fix Hyperliquid order closure after
 failed modifies"): `src/execution.rs`, `src/websocket/dispatch.rs` and
-`tests/integration/dispatch.rs`, 24 lines added and 276 removed. Each timed run applies it on top
+`tests/integration/dispatch.rs`, 10 lines added and 206 removed (216 changed). The reverted
+revision keeps the base commit's unit-test module (later commits reworked it) minus the one
+test case that asserts the reverted behaviour, so all 1438 Hyperliquid tests pass on the edited tree. Each timed run applies it on top
 of `BASE_COMMIT` with a unique trailing comment per edited file, so no cache can replay an earlier
 run. HEAD never moves (the `nautilus-common` build script embeds the git hash).
 
