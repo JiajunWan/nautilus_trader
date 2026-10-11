@@ -1,0 +1,238 @@
+disk after wipe: /dev/vda        252G   13G   27G  32% /
+warning: PYO3_PYTHON not set and python/.venv missing; using /usr/bin/python3
+
+==> Checking out base commit f9487c5935f1d007b0245698d54b548a7d02be23 (HEAD stays here for every timed run)
+
+==> Installing the pinned toolchain and fetching crates (untimed)
+cargo 1.99.0 (5f94df478 2026-08-27)
+
+==> Environment recorded in /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/env.txt
+label=cloud-4vcpu-xeon
+date=2026-10-11T12:46:35Z
+hostname=vm
+uname=Linux vm 6.18.44-fc-v114 #1 SMP PREEMPT_DYNAMIC @0 x86_64 x86_64 x86_64 GNU/Linux
+logical_cpus=4
+cpu=Intel(R) Xeon(R) Processor @ 2.10GHz
+lscpu_threads_per_core=1
+memory_kb=16479424
+ec2_instance_type=
+ld_lld=Ubuntu LLD 18.1.3 (compatible with GNU linkers)
+target_dir=/home/user/nt-bench/target
+target_fs=/dev/vda        252G   13G   27G  32% /
+rustc=rustc 1.99.0 (b940084d7 2026-09-28);binary: rustc;commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4;commit-date: 2026-09-28;host: x86_64-unknown-linux-gnu;release: 1.99.0;LLVM version: 23.1.1;
+cargo=cargo 1.99.0 (5f94df478 2026-08-27)
+hyperfine=hyperfine 2.0.0
+nextest=cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)
+sccache=sccache 0.18.0
+repo_base=f9487c5935f1d007b0245698d54b548a7d02be23
+change_commit=patch change.patch
+change_rs_files=3
+change_rs_lines=216
+package=nautilus-hyperliquid
+pkg_features=arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python
+features=arrow,ffi,python,high-precision,streaming,defi
+variant_patch=
+tuned_test_threads=16
+pyo3_python=/usr/bin/python3
+cmd_release=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi --release --timings -j {jobs}
+cmd_debug_ws=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi -j {jobs}
+cmd_debug_crate=cargo build --locked -p nautilus-hyperliquid --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python -j {jobs}
+cmd_test_ws=cargo nextest run --locked --workspace --lib --tests --features arrow,ffi,python,high-precision,streaming,defi --cargo-profile nextest --status-level fail --final-status-level flaky -E package(nautilus-hyperliquid) --build-jobs {jobs} --test-threads {jobs}
+cmd_test_crate=cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python --cargo-profile nextest --status-level fail --final-status-level flaky --build-jobs {jobs} --test-threads {jobs}
+
+==> Sanity pass: building and running nautilus-hyperliquid's tests once on the edited tree (untimed)
+
+==> Scenario test-ws-incremental  (runs=3, -j in {4})  log: /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/test-ws-incremental.log
+Error: The preparation command failed: Command '"/home/user/nautilus_trader/scripts/compile-bench/bench_nautilus.sh" _prep_incremental test-ws-incremental' terminated with non-zero exit code 101 in the first benchmark run. Use the '--show-output' option to debug what went wrong. Append ' || true' to the command if this failure can be ignored.
+---- last 40 lines of /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/test-ws-incremental.log ----
+   Compiling bzip2 v0.6.1
+   Compiling madsim v0.2.34
+   Compiling rcgen v0.14.10
+   Compiling nautilus-event-store v0.66.0 (/home/user/nt-bench/crates/event_store)
+   Compiling nautilus-interactive-brokers v0.66.0 (/home/user/nt-bench/crates/adapters/interactive_brokers)
+   Compiling nautilus-databento v0.66.0 (/home/user/nt-bench/crates/adapters/databento)
+   Compiling nautilus-plugin v0.66.0 (/home/user/nt-bench/crates/plugin)
+   Compiling nautilus-betfair v0.66.0 (/home/user/nt-bench/crates/adapters/betfair)
+   Compiling nautilus-pyo3 v0.66.0 (/home/user/nt-bench/crates/pyo3)
+rustc-LLVM ERROR: IO failure on output stream: No space left on device
+error: could not compile `nautilus-polymarket` (test "integration")
+
+disk after wipe: /dev/vda        252G   13G   27G  32% /
+warning: PYO3_PYTHON not set and python/.venv missing; using /usr/bin/python3
+
+==> Checking out base commit f9487c5935f1d007b0245698d54b548a7d02be23 (HEAD stays here for every timed run)
+
+==> Installing the pinned toolchain and fetching crates (untimed)
+cargo 1.99.0 (5f94df478 2026-08-27)
+
+==> Environment recorded in /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/env.txt
+label=cloud-4vcpu-xeon
+date=2026-10-11T13:09:33Z
+hostname=vm
+uname=Linux vm 6.18.44-fc-v114 #1 SMP PREEMPT_DYNAMIC @0 x86_64 x86_64 x86_64 GNU/Linux
+logical_cpus=4
+cpu=Intel(R) Xeon(R) Processor @ 2.10GHz
+lscpu_threads_per_core=1
+memory_kb=16479424
+ec2_instance_type=
+ld_lld=Ubuntu LLD 18.1.3 (compatible with GNU linkers)
+target_dir=/home/user/nt-bench/target
+target_fs=/dev/vda        252G   13G   27G  32% /
+rustc=rustc 1.99.0 (b940084d7 2026-09-28);binary: rustc;commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4;commit-date: 2026-09-28;host: x86_64-unknown-linux-gnu;release: 1.99.0;LLVM version: 23.1.1;
+cargo=cargo 1.99.0 (5f94df478 2026-08-27)
+hyperfine=hyperfine 2.0.0
+nextest=cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)
+sccache=sccache 0.18.0
+repo_base=f9487c5935f1d007b0245698d54b548a7d02be23
+change_commit=patch change.patch
+change_rs_files=3
+change_rs_lines=216
+package=nautilus-hyperliquid
+pkg_features=arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python
+features=arrow,ffi,python,high-precision,streaming,defi
+variant_patch=
+tuned_test_threads=16
+pyo3_python=/usr/bin/python3
+cmd_release=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi --release --timings -j {jobs}
+cmd_debug_ws=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi -j {jobs}
+cmd_debug_crate=cargo build --locked -p nautilus-hyperliquid --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python -j {jobs}
+cmd_test_ws=cargo nextest run --locked --workspace --lib --tests --features arrow,ffi,python,high-precision,streaming,defi --cargo-profile nextest --status-level fail --final-status-level flaky -E package(nautilus-hyperliquid) --build-jobs {jobs} --test-threads {jobs}
+cmd_test_crate=cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python --cargo-profile nextest --status-level fail --final-status-level flaky --build-jobs {jobs} --test-threads {jobs}
+
+==> Scenario debug-ws  (runs=3, -j in {1,4})  log: /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/debug-ws.log
+Error: The preparation command failed: Command '"/home/user/nautilus_trader/scripts/compile-bench/bench_nautilus.sh" _prep_incremental debug-ws' terminated with non-zero exit code 101 in the first benchmark run. Use the '--show-output' option to debug what went wrong. Append ' || true' to the command if this failure can be ignored.
+---- last 40 lines of /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/debug-ws.log ----
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling anstyle v1.0.14
+   Compiling anstream v1.0.0
+   Compiling dbn v0.71.0
+   Compiling prost v0.14.4
+   Compiling nautilus-derive v0.66.0 (/home/user/nt-bench/crates/adapters/derive)
+   Compiling nautilus-lighter v0.66.0 (/home/user/nt-bench/crates/adapters/lighter)
+   Compiling redb v4.3.0
+   Compiling clap_lex v1.1.1
+   Compiling clap_builder v4.6.7
+   Compiling ibapi v5.0.0
+   Compiling databento v0.63.0
+   Compiling clap_derive v4.6.7
+   Compiling nautilus-databento v0.66.0 (/home/user/nt-bench/crates/adapters/databento)
+   Compiling mimalloc v0.1.52
+   Compiling clap v4.6.7
+   Compiling nautilus-interactive-brokers v0.66.0 (/home/user/nt-bench/crates/adapters/interactive_brokers)
+   Compiling nautilus-backtest v0.66.0 (/home/user/nt-bench/crates/backtest)
+   Compiling nautilus-sandbox v0.66.0 (/home/user/nt-bench/crates/adapters/sandbox)
+   Compiling nautilus-plugin v0.66.0 (/home/user/nt-bench/crates/plugin)
+   Compiling libbz2-rs-sys v0.2.5
+   Compiling bzip2 v0.6.1
+   Compiling nautilus-event-store v0.66.0 (/home/user/nt-bench/crates/event_store)
+   Compiling nautilus-cli v0.66.0 (/home/user/nt-bench/crates/cli)
+   Compiling nautilus-betfair v0.66.0 (/home/user/nt-bench/crates/adapters/betfair)
+   Compiling nautilus-pyo3 v0.66.0 (/home/user/nt-bench/crates/pyo3)
+error: linking with `cc` failed: exit status: 1
+  |
+  = note:  "cc" "-m64" "/home/user/nt-bench/target/debug/deps/rustcxZ7cYY/symbols.o" "<48 object files omitted>" "-Wl,--as-needed" "-Wl,-Bstatic" "/home/user/nt-bench/target/debug/deps/{libnautilus_polymarket-0e4d2a882f985a86,libnautilus_live-ff3df58b07bac596,libnautilus_testkit-6c3cbafd3d15e0cd,libitchy-ff1a5adb54f15bbd,libthiserror-16faa8615f08f27e,libnom-581e7ef20f5b7cb2,libnautilus_system-bfb6fa4c80477fa5,libnautilus_trading-3fb4a5fe29a3b8d0,libnautilus_indicators-291977c1a30a5c28,libarraydeque-99c0a845b640b0a1,libnautilus_risk-73193621cdc3b10e,libnautilus_portfolio-4f01e10b45b99236,libnautilus_analysis-0243136b2cc27bcc,libnautilus_data-0ef2a9b1680a6aed,libnautilus_persistence-b86f69436ec6b248,libblake3-42e4415e530dae1d,libconstant_time_eq-d3b91b34bef81ded,libdatafusion-befc4b5dd2d82cf8,libdatafusion_functions_table-b64feed14980aedb,libdatafusion_functions_window-18afc41f76f477e0,libdatafusion_sql-db02f974040cad19,libbigdecimal-7962ea69d35436ac,liblibm-60c2c0483a36625c,libnum_bigint-cc8ea4a30d0d7688,libdatafusion_functions_nested-88d1bdbaf2error: linking with `cc` failed: exit status: 1
+  |
+  = note:  "cc" "-m64" "/home/user/nt-bench/target/debug/deps/rustcWdMfdX/symbols.o" "<257 object files omitted>" "-Wl,--as-needed" "-Wl,-Bstatic" "/home/user/nt-bench/target/debug/deps/{libdotenvy-8c426aee2742886b,libnautilus_polymarket-0e4d2a882f985a86,libnautilus_live-ff3df58b07bac596,libnautilus_testkit-6c3cbafd3d15e0cd,libitchy-ff1a5adb54f15bbd,libthiserror-16faa8615f08f27e,libnom-581e7ef20f5b7cb2,libnautilus_system-bfb6fa4c80477fa5,libnautilus_trading-3fb4a5fe29a3b8d0,libnautilus_indicators-291977c1a30a5c28,libarraydeque-99c0a845b640b0a1,libnautilus_risk-73193621cdc3b10e,libnautilus_portfolio-4f01e10b45b99236,libnautilus_analysis-0243136b2cc27bcc,libnautilus_data-0ef2a9b1680a6aed,libnautilus_persistence-b86f69436ec6b248,libblake3-42e4415e530dae1d,libconstant_time_eq-d3b91b34bef81ded,libdatafusion-befc4b5dd2d82cf8,libdatafusion_functions_table-b64feed14980aedb,libdatafusion_functions_window-18afc41f76f477e0,libdatafusion_sql-db02f974040cad19,libbigdecimal-7962ea69d35436ac,liblibm-60c2c0483a36625c,libnum_bigint-cc8ea4a30d0d7688,libdatafusion_functions_nested-88d1bdbaf25852b6,libdatafusion_physical_optimizer-600a9ac3204384c8,libdatafusion_optimizer-eb508621a35634bf,libdatafusion_catalog_listing-4c8811aec64fe0dd,libdatafusion_datasource_parquet-a80bbdd37916e91f,libdatafusion_pruning-c562ad7136179eef,libdatafusion_datasource_json-5f15cf478b31b6cd,libdatafusion_datasource_csv-ffed2046f9206228,libdatafusion_datasource_arrow-c02564d27f1c0004,libdatafusion_catalog-3a04b196f05bfb09,libdatafusion_datasource-9b3cd969c2962429,libglob-9fba37bdfe6c174b,libdatafusion_physical_expr_adapter-7f34d62c44bebc34,libdatafusion_session-dc6d33b42be0329f,libdatafusion_physical_plan-d047e0db2f7d0b7d,libdatafusion_common_runtime-ee7461a0f40b0af1,libdatafusion_functions_aggregate-7909fb3114038255,libdatafusion_physical_expr-97d4e8d0e1c7e366,libpetgraph-383177522904fb85,libhashbrown-4cc4e9c53ce21e31,libfoldhash-da2d41479be1ddb5,libfixedbitset-96dae181b67857a5,libdatafusion_functions-4c0d914255ea60df,libhex-d8eff48e44ce3548,libdatafusion_execution-c51581eb56f88e6f,libtempfile-fc9f3ec9adb0501c,librustix-a9ced5983e203f85,liblinux_raw_sys-8a42362791e9481f,librand-88c2daf7ae1f56e5,librand_chacha-f5bb1194d9f223da,librand_core-88a33e565a977b1e,libdatafusion_expr-33a78f36c4dfeb09,libdatafusion_functions_aggregate_common-56e0a4a202e692df,libdatafusion_functions_window_common-62107f97c703a00a,libdatafusion_doc-1eaf572fcb9edef9,libdatafusion_physical_expr_common-88ab26abcc01436c,libdatafusion_expr_common-48267fd973ea61c9,libdatafusion_common-a5457acbdebb365e,libitertools-f8d27c58ecc9c9a9,libsqlparser-566dabe7f88a414a,libparquet-673244a95e34845e,libbrotli-f393aedf586961e1,libbrotli_decompressor-1982d5ba0d3f4ab7,liballoc_stdlib-669604ec7603e675,liballoc_no_stdlib-9418f86c13f97536,libflate2-879e970ebac98a78,libzlib_rs-d85f573f71ca4bdb,libsnap-f6ae7c48354f011e,libobject_store-0b18dc0709318b0e,libhumantime-1054b6c146005471,libwalkdir-948088148574b635,libsame_file-6745238f012f0755,libquick_xml-0b3611de94170d3c,libmd5-a1d25b15bce518ea,libitertools-95b5653e5d3841cb,libreqwest-55d57c28b05d95ce,libnautilus_serialization-2e6b4b00c79c3563,libnautilus_execution-8165bb606e2f52eb,libnautilus_network-4c920654b075c35a,libsockudo_ws-421eb69504368470,libfastrand-d810a16c08928f85,libsha1-5a4929bd9bc9214b,libtokio_tungstenite-e3d2d2a24f1f7288,libwebpki_roots-d7964b6c9e2cd15b,libtungstenite-2e104e8d7f3d7354,libdata_encoding-4be91332482d6ece,libsha1-fd07bbda8f285397,libtower_http-a7793781cf9c6ffb,libnautilus_cryptography-5cc85482c3aa455c,libpem-6d4f2f6f91eb170f,libwebpki_roots-18ee1842166695ce,libed25519_dalek-6039580565943c9d,libsha2-43a2feb13da60860,libcurve25519_dalek-43341de326e1f910,libed25519-0762ad3c446b6b5e,libsignature-df355e3b910a0377,libnautilus_common-c492e4745e93fc16,libpyo3_async_runtimes-8e1c3ef9ad4547a2,libsysinfo-dd7cb8154979a339,libnautilus_model-ad50f7b82e9ca060,libbon-a074c14486de74e3,libtabled-bfc00f58f8e01ab2,libpapergrid-5ef8da0c9e22d090,libbytecount-1567228b672dbde1,libarrow-7c4031a1d0d50c74,libarrow_row-cba3f6500261630c,libarrow_json-791a1bd46a78e9b4,libsimdutf8-5f68b398139c67a0,libarrow_ipc-9477c51854ec21e5,liblz4_flex-4967194e228482b0,libtwox_hash-d786e0a68f80824d,libzstd-da73db9f4ec49963,libzstd_safe-d9036043f529ad31,libzstd_sys-b3763655e7b99c6a,libflatbuffers-dd1407b9ddc65974,libarrow_csv-19729c8e84123d2c,libcsv-03b798304229621d,libcsv_core-2dcfe56f38e06c37,libarrow_string-7b0bc67e027bb23f,libregex-596335615e1a4178,libregex_automata-c93674b3f820752e,libaho_corasick-b23252098b3053b5,libregex_syntax-195929d5c1b52b6b,libarrow_cast-7e7d65fc8473a5de,libatoi-a82aec8bf8374bf9,libcomfy_table-f16912dfb1272a30,libunicode_segmentation-65d1db6faa4764f1,libunicode_width-8b6a8df7f11a7f23,liblexical_core-8984cfd40ce77a66,liblexical_write_float-eb72c210dea3ecef,liblexical_write_integer-36d82e72e3280087,liblexical_parse_float-74256c1b1dca8bde,liblexical_parse_integer-ee254463bf34a518,liblexical_util-78d5d5c4e34e8dad,libarrow_arith-b3c86992f7218f08,libarrow_ord-2812c80d906e2aba,libarrow_select-e99388f500f2262a,libarrow_array-227130e01a00c31f,libchrono_tz-0d596b6bcbbac0e7,libphf-b92327db06e00c92,libphf_shared-21233f42372d3d4c,libchrono-0699a1446759a373,libiana_time_zone-eb2f0565236cff73,libarrow_data-520763a38b308766,libarrow_schema-07052f012e53ada8,libarrow_buffer-b51685520975fb99,libhalf-6e3503c815e84c75,libnum_bigint-af5c0f73e50d8217,libnum_integer-72f3fbe8f1cc6cdc,libimplied_vol-3db7412be2657403,libderive_builder-7bc446015e7a53e9,librstest-02506a497dec677c,libnautilus_core-ccf8fd1f082ab6e4,librmp_serde-09ff93b7d87fb427,librmp-4393a406d8b9bcc6,libstrum-90a84ba55a71b0c2,libpyo3_stub_gen-aa30cad4fef07c7f,libtime-cf04b921a1f4922a,libnum_threads-48460696765e166e,libpowerfmt-48d5beb178550361,libnum_conv-94e9ef17d3834657,libderanged-97d03f006a5e2b47,libtime_core-4b02a9b76f8cd3e1,libnum_complex-0c500084dfc5ea86,libtoml-78e24264deafe058,libtoml_writer-a872fbc877f88901,libtoml_parser-561cd3587134edaf,libserde_spanned-13298ac167171e0d,libtoml_datetime-2bbc7746cc57e0e5,libanyhow-5f8e796f23b90925,libpyo3-278dc20069f9c127,libpyo3_ffi-1714da8a3f34c179,libinventory-bb53beb84a8e4b79,libhashbrown-0a4f3115bfcfeb17,libuuid-f63376d030e9ed04,librand-b645a2c129eb40ec,libgetrandom-2a6939cd50a20a66,libchacha20-c5f8b3601a4b146b,libcpufeatures-50c4d9d42594a7f6,librand_core-f8c744fe64788325,libjiff-090b39fbc2db175a,libjiff_tzdb-85fdaff2c8bb2c64,libjiff_core-7d509044b96157d7,librust_decimal-1bfbbb072c5e5c98,libnum_traits-5dfc5b21da7074e5,libustr-d02d645103b3cc8a,liblazy_static-a7118fac13545023,libbyteorder-1a42064544f7f631,libarc_swap-322ba5fb617a4054,libahash-3b3916c060763fb0,libgetrandom-723551e491bdc0d3,liballoy-26f9b7d833cada33,liballoy_signer_local-e4dfbf6eeeffc4a1,librand-3022d67739a18279,librand_chacha-07e8aab804a96b6d,libppv_lite86-1744692898a2a449,libzerocopy-b6e6f3ba73451892,liballoy_contract-78277383118a8f19,liballoy_provider-86ce1f922c5503eb,libdashmap-6efa173248d405b8,libhashbrown-70c76c783b9a2c74,libcrossbeam_utils-d8ff8b06530e4b50,liblru-0350b4b4039fbc22,libasync_stream-f735c92e60024a14,liballoy_rpc_client-5b605fc32d59b1ec,libtokio_stream-61d0023d609d3cc2,libpin_project-6689464d62a4d6fd,liballoy_chains-a9f074636fbbb828,libnum_enum-7d35fdd66a6cac5c,libphf-91abc1d793c4846f,libphf_shared-6cfc5ea3d602e89a,libsiphasher-2cd4c2bcb6b13c8e,liballoy_transport_http-1fd73f278a462b83,liballoy_transport-63ffc4a561204667,libfutures-edb430f4ccbc27bd,libfutures_executor-4a53a63c4553b9ac,libbase64-64c358125a79e6ce,libreqwest-65106d30a6113b92,libserde_urlencoded-dfaefb1c8cf3b897,libryu-5fe4f28351263a6f,librustls_platform_verifier-31f9aeccd8b72ceb,libhyper_rustls-1a20dfe77bf5b70d,librustls_native_certs-150eaee94b83e412,libopenssl_probe-b9cc12b0cda78729,libtokio_rustls-256b232fa1b0d52c,librustls-1d27b93a5ed9c5ec,libwebpki-7e24f71e5f72f778,libaws_lc_rs-a49863b4a37f6ac5,libaws_lc_sys-1fa152019f9a4b8b,libring-969eedc7a8adbfc9,libuntrusted-023609d027a04c0f,librustls_pki_types-ddca1f2778550ef6,libtower_http-e92c879f739067c2,libbitflags-bdcaf0371b12ef28,libtower-82f4a59a9c72f277,libtower_layer-ada6e2a0ee32d02e,libhyper_util-3af4cb5982fe9957,libbase64-138a9c54b7610830,libipnet-53bd9ec97f1f1f7e,libtower_service-df42369dcede7791,libhyper-c6687dfefada6095,libwant-d7bd429a596261b1,libtry_lock-45c36ed11994d8e2,libhttparse-34b9abe099e1a708,libh2-dfe22f6bd3a88021,libfnv-a28fe3411cbaa6e7,libatomic_waker-b7e52317b553772f,libtokio_util-cd09fdbbcc7371b6,libfutures_util-fe1b763bb3059132,libfutures_io-d1b56bd968c48ef0,libslab-efcc91ca5ee6d3d9,libfutures_channel-fd73e298d5c3dd0b,libfutures_task-f9a730cb700af2a9,libfutures_sink-26a05fcfcb11e23f,libhttp_body_util-d4f0a33d77b10c02,libhttp_body-9a2e90b99c8f9f65,liburl-476617aeb4439075,libidna-6b7d48cbd8f258bc,libidna_adapter-5ec6f1355bd7506d,libicu_properties-35a82e6b5bfc58df,libicu_properties_data-e3dce44083ccf497,libicu_normalizer-b4f9abb9607f343c,libicu_normalizer_data-dfd3b189d33659fb,libicu_collections-07348bc7c7d21963,libutf8_iter-423296b3656c83bb,libpotential_utf-3957b400ed3f430a,libicu_provider-b52725969ae732ef,libicu_locale_core-85792ff392e3a576,libtinystr-7ea52b5fbdba1c80,liblitemap-1034233e54aec7b8,libwriteable-9e2cdcbd11d14c71,libzerovec-6f85acd42d3c5b6f,libzerotrie-3311c2c3c675326e,libyoke-523b95fcadd6354e,libstable_deref_trait-fb0d7fafaca51694,libzerofrom-8f77bef10b3acc76,libform_urlencoded-7202b6ed607fa5dd,libpercent_encoding-71dfeb7f6e1bfa13,libsync_wrapper-5f20506f1b2289cb,libfutures_core-a9ff4dc894eae1de,libtokio-84bb93826356b86d,libsignal_hook_registry-a87bb391641fb25c,liberrno-df8700718ced8946,libsocket2-1667a1d602f4d974,libmio-5800900ed1286eb0,libparking_lot-b6262405aabc313f,libparking_lot_core-f2dee3ceffd3db3f,liblock_api-364bddc3c749787a,libscopeguard-b412a2766f9cc3de,liballoy_network-7aad30ba5e9db848,liballoy_rpc_types_any-e3602f0b83980f7f,liballoy_signer-351c803a157af81b,libfutures_utils_wasm-95c731b6c2617727,liballoy_rpc_types_eth-c2d8ad29cfb140e8,liballoy_consensus_any-fafcb52682523a9e,libitertools-5858557c025b0c46,liballoy_network_primitives-39df0b6211f93aae,liballoy_json_rpc-9172873d52c52c90,libhttp-39bc8e6089e3f8de,liballoy_consensus-03b3a710d6dce575,liballoy_eips-c4059b917e7ecc52,libeither-2eb3db3b0aa1d9f4,liballoy_serde-d7e7dd7b937bb6b2,libserde_json-2cceef6375b5b92c,libmemchr-01ba335008f58dde,libzmij-e1aa08fcde4ba463,libindexmap-81163f3f99779a4f,libserde_with-c7c8304d8f60e413,liballoy_eip8141-1bbf43275568619b,liballoy_eip7928-62e03b4ca3adc7f7,liballoy_eip7702-91b5face07618f17,liballoy_eip2930-bbc03c5866f84d96,liballoy_eip2124-5f85778ac6b1bf78,libcrc-b888d9b6014d24d6,libcrc_catalog-3e60c29fae8769de,liballoy_trie-9dd627964a7d7d06,libthiserror-20e5c9407e125934,libtracing-888a10bf1a445aa3,liblog-9da4fb6e71f0853a,libvalue_bag-9d9200c7bca6a84c,libpin_project_lite-2014ed09323f0195,libtracing_core-36445d32f761e35f,libnybbles-c689ec383d6a7fc9,libsmallvec-895e1f2b21c79cc4,libonce_cell-d473eb99fb33ef79,liballoy_core-88b7e9374f0216ac,liballoy_dyn_abi-30eddd285c77c9e8,liballoy_sol_types-2650b0de4105c7d1,liballoy_json_abi-7c290d85bb121920,liballoy_sol_type_parser-da4ae6763c1dadaa,libwinnow-78ef0a5782e72058,liballoy_primitives-51b39aed20f32f06,libitoa-6bf55ed6b9343748,libhashbrown-4519db2182ec1cdb,libequivalent-d7f73e5b1b09a809,liballocator_api2-3bef2702dc7a0fe7,libfoldhash-c46c2072991fede5,libconst_hex-b0252cf9164f01cb,libderive_more-e4cf6ac8396c3403,libk256-a0dd13521eea2a94,libsha2-fa827c517c13b044,libcpufeatures-db80db9b2e897b3a,libecdsa-5b296e563976b8cd,librfc6979-314872b1d917e0c1,libhmac-2f574fa9c2ab04eb,libspki-2a07b22635740863,libsignature-4bf05f43f750c394,libdigest-0a3db1f583cb334e,libblock_buffer-505b2dce1f765714,libcrypto_common-fd0aef669e11bf2a,libelliptic_curve-3fc43e988465add2,libsec1-f8d32b1dff22b454,libder-9b6a376532aa9876,libconst_oid-dac84711e9caab97,libcrypto_bigint-bfb487477a86720e,libgeneric_array-ce92c0be3bd839c7,libbase16ct-ec8e07b5c33d5216,libzeroize-2b8063d481ae06a4,libgroup-8f7be58a8bcb0766,libff-888c6653dfbd3610,librand_core-38a5ea4d1d778e74,libgetrandom-f8dc8b3f117497ec,liblibc-6b1b3c4f44c95e06,libsubtle-2ea85c25ac15e7ee,libruint-6b09ba63b4f9e9c5,liballoy_rlp-e7d90677c9c6e8d8,libarrayvec-02c7feb4d0d977aa,libbytes-0c13e75bc5babfb7,libserde-f974c1760feb0430,libserde_core-44c79a26c5b95e76,libsha3-21629027abd1215f,libkeccak-bbcd22535d6516a9,libcfg_if-78623fdd27ac2772,libdigest-0a91064ab18db285,libctutils-f555eaf8e7bfdbbc,libcmov-4242df9a5b585e5b,libconst_oid-0b963cffb9c23922,libcrypto_common-0d2bb92d02b87c22,libblock_buffer-ec129907c2a63cb0,libhybrid_array-759a6b69ce7954cf,libtypenum-918213e46368c56e}.rlib" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib/{libstd-*,libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libcfg_if-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,liblibc-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-Wl,-Bdynamic" "-lpython3.13" "-lgcc_s" "-lutil" "-lrt" "-lpthread" "-lm" "-ldl" "-lc" "-L" "/home/user/nt-bench/target/debug/deps/rustcWdMfdX/raw-dylibs" "-B<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld" "-fuse-ld=lld" "-Wl,--eh-frame-hdr" "-Wl,-z,noexecstack" "-L" "/home/user/nt-bench/target/debug/build/aws-lc-sys-eae1c82b2b8d00ab/out" "-L" "/home/user/nt-bench/target/debug/build/ring-1a640994b949fca1/out" "-L" "/home/user/nt-bench/target/debug/build/zstd-sys-611734bf800bdfdb/out" "-L" "/home/user/nt-bench/target/debug/build/blake3-290feaf455c74afc/out" "-L" "/usr/lib/x86_64-linux-gnu" "-L" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib" "-o" "/home/user/nt-bench/target/debug/deps/polymarket_set_allowances-cb0ea1b993e1b69e" "-Wl,--gc-sections" "-pie" "-Wl,-z,relro,-z,now" "-Wl,--strip-debug" "-nodefaultlibs" "-fuse-ld=lld" "-Wl,--gc-sections" "-Wl,--as-needed" "-Wl,-z,norelro"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: collect2: fatal error: ld terminated with signal 7 [Bus error]
+          compilation terminated.
+          
+
+error: could not compile `nautilus-polymarket` (bin "polymarket-composite-filter") due to 1 previous error
+error: could not compile `nautilus-polymarket` (bin "polymarket-set-allowances") due to 1 previous error
+error: scenario debug-ws failed
+exit-ws-debug 1
+disk before wipe: /dev/vda        252G   39G  210M 100% /
+disk after wipe: /dev/vda        252G   13G   27G  32% /
+warning: PYO3_PYTHON not set and python/.venv missing; using /usr/bin/python3
+
+==> Checking out base commit f9487c5935f1d007b0245698d54b548a7d02be23 (HEAD stays here for every timed run)
+
+==> Installing the pinned toolchain and fetching crates (untimed)
+cargo 1.99.0 (5f94df478 2026-08-27)
+
+==> Environment recorded in /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/env.txt
+label=cloud-4vcpu-xeon
+date=2026-10-11T13:23:24Z
+hostname=vm
+uname=Linux vm 6.18.44-fc-v114 #1 SMP PREEMPT_DYNAMIC @0 x86_64 x86_64 x86_64 GNU/Linux
+logical_cpus=4
+cpu=Intel(R) Xeon(R) Processor @ 2.10GHz
+lscpu_threads_per_core=1
+memory_kb=16479424
+ec2_instance_type=
+ld_lld=Ubuntu LLD 18.1.3 (compatible with GNU linkers)
+target_dir=/home/user/nt-bench/target
+target_fs=/dev/vda        252G   13G   27G  32% /
+rustc=rustc 1.99.0 (b940084d7 2026-09-28);binary: rustc;commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4;commit-date: 2026-09-28;host: x86_64-unknown-linux-gnu;release: 1.99.0;LLVM version: 23.1.1;
+cargo=cargo 1.99.0 (5f94df478 2026-08-27)
+hyperfine=hyperfine 2.0.0
+nextest=cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)
+sccache=sccache 0.18.0
+repo_base=f9487c5935f1d007b0245698d54b548a7d02be23
+change_commit=patch change.patch
+change_rs_files=3
+change_rs_lines=216
+package=nautilus-hyperliquid
+pkg_features=arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python
+features=arrow,ffi,python,high-precision,streaming,defi
+variant_patch=
+tuned_test_threads=16
+pyo3_python=/usr/bin/python3
+cmd_release=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi --release --timings -j {jobs}
+cmd_debug_ws=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi -j {jobs}
+cmd_debug_crate=cargo build --locked -p nautilus-hyperliquid --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python -j {jobs}
+cmd_test_ws=cargo nextest run --locked --workspace --lib --tests --features arrow,ffi,python,high-precision,streaming,defi --cargo-profile nextest --status-level fail --final-status-level flaky -E package(nautilus-hyperliquid) --build-jobs {jobs} --test-threads {jobs}
+cmd_test_crate=cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python --cargo-profile nextest --status-level fail --final-status-level flaky --build-jobs {jobs} --test-threads {jobs}
+
+==> Freeing disk before the release build (target/debug, target/nextest)
+
+==> Scenario release  (runs=1, -j in {4})  log: /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/release.log
+Error: Command '"/home/user/nautilus_trader/scripts/compile-bench/bench_nautilus.sh" _timed release 4' terminated with non-zero exit code 101 in the first benchmark run. Use the '-i'/'--ignore-failure' option if you want to ignore this. Alternatively, use the '--show-output' option to debug what went wrong.
+---- last 40 lines of /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/release.log ----
+   Compiling libmimalloc-sys v0.1.49
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling dbn v0.71.0
+   Compiling anstream v1.0.0
+   Compiling prost v0.14.4
+   Compiling nautilus-derive v0.66.0 (/home/user/nt-bench/crates/adapters/derive)
+   Compiling nautilus-lighter v0.66.0 (/home/user/nt-bench/crates/adapters/lighter)
+   Compiling clap_lex v1.1.1
+   Compiling redb v4.3.0
+   Compiling clap_builder v4.6.7
+   Compiling ibapi v5.0.0
+   Compiling databento v0.63.0
+   Compiling clap_derive v4.6.7
+   Compiling clap v4.6.7
+   Compiling nautilus-databento v0.66.0 (/home/user/nt-bench/crates/adapters/databento)
+   Compiling mimalloc v0.1.52
+   Compiling nautilus-interactive-brokers v0.66.0 (/home/user/nt-bench/crates/adapters/interactive_brokers)
+   Compiling nautilus-backtest v0.66.0 (/home/user/nt-bench/crates/backtest)
+   Compiling nautilus-sandbox v0.66.0 (/home/user/nt-bench/crates/adapters/sandbox)
+   Compiling libbz2-rs-sys v0.2.5
+   Compiling nautilus-plugin v0.66.0 (/home/user/nt-bench/crates/plugin)
+   Compiling bzip2 v0.6.1
+   Compiling nautilus-event-store v0.66.0 (/home/user/nt-bench/crates/event_store)
+   Compiling nautilus-cli v0.66.0 (/home/user/nt-bench/crates/cli)
+   Compiling nautilus-betfair v0.66.0 (/home/user/nt-bench/crates/adapters/betfair)
+   Compiling nautilus-pyo3 v0.66.0 (/home/user/nt-bench/crates/pyo3)
+error: could not compile `nautilus-cli` (bin "nautilus")
+
+Caused by:
+  process didn't exit successfully: `/root/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name nautilus --edition=2024 crates/cli/src/bin/cli.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 '--warn=clippy::verbose_bit_mask' '--warn=clippy::useless_conversion' '--warn=clippy::use_self' --deny=unreachable_pub '--warn=clippy::unnested_or_patterns' '--warn=clippy::unnecessary_wraps' '--warn=clippy::unnecessary_to_owned' '--warn=clippy::unnecessary_struct_initialization' '--warn=clippy::unnecessary_sort_by' '--warn=clippy::unnecessary_semicolon' '--warn=clippy::unnecessary_self_imports' '--warn=clippy::unnecessary_safety_doc' '--warn=clippy::unnecessary_safety_comment' '--warn=clippy::unnecessary_literal_bound' '--warn=clippy::unnecessary_lazy_evaluations' '--warn=clippy::unnecessary_join' '--warn=clippy::unnecessary_filter_map' '--warn=clippy::unnecessary_debug_formatting' '--warn=clippy::unnecessary_box_returns' --allow=unknown_lints '--warn=clippy::uninlined_format_args' '--warn=clippy::unimplemented' --warn=unexpected_cfgs '--warn=clippy::unchecked_time_subtraction' '--warn=clippy::suspicious_doc_comments' '--warn=clippy::stable_sort_primitive' '--allow=clippy::single_match_else' '--warn=clippy::single_char_pattern' '--allow=clippy::similar_names' '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::return_self_not_must_use' '--warn=clippy::rest_pat_in_fully_bound_structs' '--warn=clippy::ref_as_ptr' '--warn=clippy::redundant_field_names' '--allow=clippy::redundant_else' '--warn=clippy::redundant_closure' '--warn=clippy::redundant_clone' '--warn=clippy::rc_mutex' '--warn=clippy::rc_buffer' '--warn=clippy::range_plus_one' '--warn=clippy::ptr_as_ptr' '--warn=clippy::panic_in_result_fn' '--allow=clippy::or_fun_call' '--warn=clippy::option_option' '--allow=clippy::option_if_let_else' '--warn=clippy::option_as_ref_deref' '--warn=clippy::needless_update' '--warn=clippy::needless_return' '--warn=clippy::needless_raw_strings' '--warn=clippy::needless_raw_string_hashes' '--warn=clippy::needless_range_loop' '--warn=clippy::needless_pass_by_value' '--warn=clippy::needless_pass_by_ref_mut' '--warn=clippy::needless_option_as_deref' '--warn=clippy::needless_match' '--warn=clippy::needless_lifetimes' '--warn=clippy::needless_late_init' '--warn=clippy::needless_for_each' '--warn=clippy::needless_continue' '--warn=clippy::needless_collect' '--warn=clippy::needless_borrows_for_generic_args' '--warn=clippy::needless_borrow' '--warn=clippy::needless_bool' '--warn=clippy::naive_bytecount' '--warn=clippy::mut_mut' '--warn=clippy::multiple_unsafe_ops_per_block' '--warn=clippy::mem_forget' '--warn=clippy::match_like_matches_macro' '--warn=clippy::match_bool' '--warn=clippy::map_unwrap_or' '--warn=clippy::map_identity' '--warn=clippy::map_flatten' '--warn=clippy::manual_while_let_some' '--warn=clippy::manual_strip' '--warn=clippy::manual_string_new' '--warn=clippy::manual_split_once' '--warn=clippy::manual_range_contains' '--warn=clippy::manual_map' '--allow=clippy::manual_let_else' '--warn=clippy::manual_is_variant_and' '--warn=clippy::manual_is_ascii_check' '--warn=clippy::manual_instant_elapsed' '--warn=clippy::manual_flatten' '--warn=clippy::manual_find' '--warn=clippy::manual_filter' '--warn=clippy::manual_assert' '--warn=clippy::lossy_float_literal' '--warn=clippy::let_underscore_future' '--warn=clippy::large_stack_arrays' '--warn=clippy::large_futures' '--warn=clippy::iter_nth_zero' '--warn=clippy::iter_not_returning_iterator' '--warn=clippy::iter_kv_map' '--warn=clippy::items_after_statements' '--warn=clippy::invalid_upcast_comparisons' '--warn=clippy::infallible_try_from' '--warn=clippy::inefficient_to_string' '--warn=clippy::inconsistent_struct_constructor' '--warn=clippy::implicit_clone' '--warn=clippy::ignored_unit_patterns' '--warn=clippy::if_same_then_else' '--warn=clippy::if_not_else' '--warn=clippy::if_let_mutex' '--warn=clippy::identity_op' '--warn=clippy::get_first' '--warn=clippy::float_cmp_const' '--warn=clippy::flat_map_option' '--warn=clippy::filter_map_next' '--warn=clippy::explicit_iter_loop' '--warn=clippy::explicit_into_iter_loop' '--warn=clippy::expl_impl_clone_on_copy' '--warn=clippy::exit' '--warn=clippy::equatable_if_let' '--warn=clippy::empty_drop' '--warn=clippy::disallowed_types' '--warn=clippy::disallowed_methods' '--warn=clippy::debug_assert_with_mut_call' '--warn=clippy::dbg_macro' '--warn=clippy::copy_iterator' '--warn=clippy::collapsible_if' '--warn=clippy::collapsible_else_if' '--warn=clippy::cloned_instead_of_copied' '--warn=clippy::checked_conversions' '--warn=clippy::bytes_count_to_len' '--warn=clippy::borrow_as_ptr' '--warn=clippy::bool_to_int_with_if' '--warn=clippy::await_holding_refcell_ref' '--warn=clippy::await_holding_lock' --check-cfg 'cfg(madsim)' --cfg 'feature="default"' --cfg 'feature="defi"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "defi"))' -C metadata=f2ee9f4f618888f5 -C extra-filename=-1f719b5264d7f4e4 --out-dir /home/user/nt-bench/target/release/deps -C strip=symbols -L dependency=/home/user/nt-bench/target/release/deps --extern anyhow=/home/user/nt-bench/target/release/deps/libanyhow-432c93d09f0474a5.rlib --extern clap=/home/user/nt-bench/target/release/deps/libclap-cc5ba0f1e71a7799.rlib --extern dotenvy=/home/user/nt-bench/target/release/deps/libdotenvy-685d2d6c4d5be150.rlib --extern log=/home/user/nt-bench/target/release/deps/liblog-8410f78a86a032fb.rlib --extern mimalloc=/home/user/nt-bench/target/release/deps/libmimalloc-ffdd8448f1b7e96b.rlib --extern nautilus_blockchain=/home/user/nt-bench/target/release/deps/libnautilus_blockchain-a1e544716c66b3cc.rlib --extern nautilus_cli=/home/user/nt-bench/target/release/deps/libnautilus_cli-5e6289a1d45ea273.rlib --extern nautilus_common=/home/user/nt-bench/target/release/deps/libnautilus_common-824193e18cfdf59d.rlib --extern nautilus_core=/home/user/nt-bench/target/release/deps/libnautilus_core-508364e3d8050a16.rlib --extern nautilus_infrastructure=/home/user/nt-bench/target/release/deps/libnautilus_infrastructure-5c4b35303be49234.rlib --extern nautilus_model=/home/user/nt-bench/target/release/deps/libnautilus_model-bcb69a41875c4a1d.rlib --extern nautilus_persistence=/home/user/nt-bench/target/release/deps/libnautilus_persistence-1913d2cb94b798d5.rlib --extern serde_json=/home/user/nt-bench/target/release/deps/libserde_json-51e9119e61ecac8f.rlib --extern tokio=/home/user/nt-bench/target/release/deps/libtokio-ab11678f3219e1a8.rlib --extern tokio_util=/home/user/nt-bench/target/release/deps/libtokio_util-f2f9b83406ae2265.rlib --extern ustr=/home/user/nt-bench/target/release/deps/libustr-552f131f9dddaa18.rlib -Dwarnings -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--as-needed -C link-arg=-Wl,-z,norelro -C relocation-model=pic -L native=/home/user/nt-bench/target/release/build/libmimalloc-sys-c8d211ea3b593e00/out -L native=/home/user/nt-bench/target/release/build/aws-lc-sys-6ca6177fc8a9e156/out -L native=/home/user/nt-bench/target/release/build/ring-eceaba4c93b12a29/out -L native=/home/user/nt-bench/target/release/build/zstd-sys-3ca5fe619c403464/out -L native=/home/user/nt-bench/target/release/build/blake3-b6bac95b4eeb59d1/out -L native=/home/user/nt-bench/target/release/build/blake3-b6bac95b4eeb59d1/out -L native=/usr/lib/x86_64-linux-gnu` (signal: 9, SIGKILL: kill)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `nautilus-pyo3` (bin "python-stub-gen")
+
+Caused by:
+  process didn't exit successfully: `/root/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name python_stub_gen --edition=2024 crates/pyo3/bin/stub_gen.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 '--warn=clippy::verbose_bit_mask' '--warn=clippy::useless_conversion' '--warn=clippy::use_self' --deny=unreachable_pub '--warn=clippy::unnested_or_patterns' '--warn=clippy::unnecessary_wraps' '--warn=clippy::unnecessary_to_owned' '--warn=clippy::unnecessary_struct_initialization' '--warn=clippy::unnecessary_sort_by' '--warn=clippy::unnecessary_semicolon' '--warn=clippy::unnecessary_self_imports' '--warn=clippy::unnecessary_safety_doc' '--warn=clippy::unnecessary_safety_comment' '--warn=clippy::unnecessary_literal_bound' '--warn=clippy::unnecessary_lazy_evaluations' '--warn=clippy::unnecessary_join' '--warn=clippy::unnecessary_filter_map' '--warn=clippy::unnecessary_debug_formatting' '--warn=clippy::unnecessary_box_returns' --allow=unknown_lints '--warn=clippy::uninlined_format_args' '--warn=clippy::unimplemented' --warn=unexpected_cfgs '--warn=clippy::unchecked_time_subtraction' '--warn=clippy::suspicious_doc_comments' '--warn=clippy::stable_sort_primitive' '--allow=clippy::single_match_else' '--warn=clippy::single_char_pattern' '--allow=clippy::similar_names' '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::return_self_not_must_use' '--warn=clippy::rest_pat_in_fully_bound_structs' '--warn=clippy::ref_as_ptr' '--warn=clippy::redundant_field_names' '--allow=clippy::redundant_else' '--warn=clippy::redundant_closure' '--warn=clippy::redundant_clone' '--warn=clippy::rc_mutex' '--warn=clippy::rc_buffer' '--warn=clippy::range_plus_one' '--warn=clippy::ptr_as_ptr' '--warn=clippy::panic_in_result_fn' '--allow=clippy::or_fun_call' '--warn=clippy::option_option' '--allow=clippy::option_if_let_else' '--warn=clippy::option_as_ref_deref' '--warn=clippy::needless_update' '--warn=clippy::needless_return' '--warn=clippy::needless_raw_strings' '--warn=clippy::needless_raw_string_hashes' '--warn=clippy::needless_range_loop' '--warn=clippy::needless_pass_by_value' '--warn=clippy::needless_pass_by_ref_mut' '--warn=clippy::needless_option_as_deref' '--warn=clippy::needless_match' '--warn=clippy::needless_lifetimes' '--warn=clippy::needless_late_init' '--warn=clippy::needless_for_each' '--warn=clippy::needless_continue' '--warn=clippy::needless_collect' '--warn=clippy::needless_borrows_for_generic_args' '--warn=clippy::needless_borrow' '--warn=clippy::needless_bool' '--warn=clippy::naive_bytecount' '--warn=clippy::mut_mut' '--warn=clippy::multiple_unsafe_ops_per_block' '--warn=clippy::mem_forget' '--warn=clippy::match_like_matches_macro' '--warn=clippy::match_bool' '--warn=clippy::map_unwrap_or' '--warn=clippy::map_identity' '--warn=clippy::map_flatten' '--warn=clippy::manual_while_let_some' '--warn=clippy::manual_strip' '--warn=clippy::manual_string_new' '--warn=clippy::manual_split_once' '--warn=clippy::manual_range_contains' '--warn=clippy::manual_map' '--allow=clippy::manual_let_else' '--warn=clippy::manual_is_variant_and' '--warn=clippy::manual_is_ascii_check' '--warn=clippy::manual_instant_elapsed' '--warn=clippy::manual_flatten' '--warn=clippy::manual_find' '--warn=clippy::manual_filter' '--warn=clippy::manual_assert' '--warn=clippy::lossy_float_literal' '--warn=clippy::let_underscore_future' '--warn=clippy::large_stack_arrays' '--warn=clippy::large_futures' '--warn=clippy::iter_nth_zero' '--warn=clippy::iter_not_returning_iterator' '--warn=clippy::iter_kv_map' '--warn=clippy::items_after_statements' '--warn=clippy::invalid_upcast_comparisons' '--warn=clippy::infallible_try_from' '--warn=clippy::inefficient_to_string' '--warn=clippy::inconsistent_struct_constructor' '--warn=clippy::implicit_clone' '--warn=clippy::ignored_unit_patterns' '--warn=clippy::if_same_then_else' '--warn=clippy::if_not_else' '--warn=clippy::if_let_mutex' '--warn=clippy::identity_op' '--warn=clippy::get_first' '--warn=clippy::float_cmp_const' '--warn=clippy::flat_map_option' '--warn=clippy::filter_map_next' '--warn=clippy::explicit_iter_loop' '--warn=clippy::explicit_into_iter_loop' '--warn=clippy::expl_impl_clone_on_copy' '--warn=clippy::exit' '--warn=clippy::equatable_if_let' '--warn=clippy::empty_drop' '--warn=clippy::disallowed_types' '--warn=clippy::disallowed_methods' '--warn=clippy::debug_assert_with_mut_call' '--warn=clippy::dbg_macro' '--warn=clippy::copy_iterator' '--warn=clippy::collapsible_if' '--warn=clippy::collapsible_else_if' '--warn=clippy::cloned_instead_of_copied' '--warn=clippy::checked_conversions' '--warn=clippy::bytes_count_to_len' '--warn=clippy::borrow_as_ptr' '--warn=clippy::bool_to_int_with_if' '--warn=clippy::await_holding_refcell_ref' '--warn=clippy::await_holding_lock' --check-cfg 'cfg(madsim)' --cfg 'feature="arrow"' --cfg 'feature="default"' --cfg 'feature="defi"' --cfg 'feature="high-precision"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("arrow", "betfair", "default", "defi", "extension-module", "high-precision", "hypersync", "mimalloc", "postgres", "redis", "tracing-bridge"))' -C metadata=76d0e66030b3e6a6 -C extra-filename=-8a40ed53f0120697 --out-dir /home/user/nt-bench/target/release/deps -C strip=symbols -L dependency=/home/user/nt-bench/target/release/deps --extern nautilus_analysis=/home/user/nt-bench/target/release/deps/libnautilus_analysis-d67a2f7f85ae513d.rlib --extern nautilus_architect_ax=/home/user/nt-bench/target/release/deps/libnautilus_architect_ax-1d066b609b226406.rlib --extern nautilus_backtest=/home/user/nt-bench/target/release/deps/libnautilus_backtest-74c11ec93316430c.rlib --extern nautilus_binance=/home/user/nt-bench/target/release/deps/libnautilus_binance-6420bd1b54135e2f.rlib --extern nautilus_blockchain=/home/user/nt-bench/target/release/deps/libnautilus_blockchain-a1e544716c66b3cc.rlib --extern nautilus_bybit=/home/user/nt-bench/target/release/deps/libnautilus_bybit-891cf42b42db567a.rlib --extern nautilus_coinbase=/home/user/nt-bench/target/release/deps/libnautilus_coinbase-10981ebb09ed8a18.rlib --extern nautilus_common=/home/user/nt-bench/target/release/deps/libnautilus_common-824193e18cfdf59d.rlib --extern nautilus_core=/home/user/nt-bench/target/release/deps/libnautilus_core-508364e3d8050a16.rlib --extern nautilus_cryptography=/home/user/nt-bench/target/release/deps/libnautilus_cryptography-45e3e6fcb9b9134a.rlib --extern nautilus_data=/home/user/nt-bench/target/release/deps/libnautilus_data-c9d6f95b5ccc6df6.rlib --extern nautilus_databento=/home/user/nt-bench/target/release/deps/libnautilus_databento-0e60e18cd609d763.rlib --extern nautilus_deribit=/home/user/nt-bench/target/release/deps/libnautilus_deribit-54056355b4c61f48.rlib --extern nautilus_derive=/home/user/nt-bench/target/release/deps/libnautilus_derive-450032ea9acc131e.rlib --extern nautilus_dydx=/home/user/nt-bench/target/release/deps/libnautilus_dydx-d3e2d6dcabde2407.rlib --extern nautilus_execution=/home/user/nt-bench/target/release/deps/libnautilus_execution-33190a3e9463bbe3.rlib --extern nautilus_hyperliquid=/home/user/nt-bench/target/release/deps/libnautilus_hyperliquid-26565ea4b5ab4d13.rlib --extern nautilus_indicators=/home/user/nt-bench/target/release/deps/libnautilus_indicators-240a40dddea91027.rlib --extern nautilus_infrastructure=/home/user/nt-bench/target/release/deps/libnautilus_infrastructure-5c4b35303be49234.rlib --extern nautilus_interactive_brokers=/home/user/nt-bench/target/release/deps/libnautilus_interactive_brokers-50be47c79e5ccb69.rlib --extern nautilus_kraken=/home/user/nt-bench/target/release/deps/libnautilus_kraken-b7ff7b7d072f7775.rlib --extern nautilus_lighter=/home/user/nt-bench/target/release/deps/libnautilus_lighter-11019bd3a1674143.rlib --extern nautilus_live=/home/user/nt-bench/target/release/deps/libnautilus_live-42b49c0184f86b36.rlib --extern nautilus_model=/home/user/nt-bench/target/release/deps/libnautilus_model-bcb69a41875c4a1d.rlib --extern nautilus_network=/home/user/nt-bench/target/release/deps/libnautilus_network-d98bd3d4d7a49cfe.rlib --extern nautilus_okx=/home/user/nt-bench/target/release/deps/libnautilus_okx-30722d5d3fc8dbc7.rlib --extern nautilus_persistence=/home/user/nt-bench/target/release/deps/libnautilus_persistence-1913d2cb94b798d5.rlib --extern nautilus_polymarket=/home/user/nt-bench/target/release/deps/libnautilus_polymarket-0a5df3b211f6223f.rlib --extern nautilus_portfolio=/home/user/nt-bench/target/release/deps/libnautilus_portfolio-4584ce3ab6548a1d.rlib --extern nautilus_pyo3=/home/user/nt-bench/target/release/deps/libnautilus_pyo3.rlib --extern nautilus_risk=/home/user/nt-bench/target/release/deps/libnautilus_risk-a85cff14904a32f0.rlib --extern nautilus_sandbox=/home/user/nt-bench/target/release/deps/libnautilus_sandbox-5b762369033f06ce.rlib --extern nautilus_serialization=/home/user/nt-bench/target/release/deps/libnautilus_serialization-8647df4cfaba2286.rlib --extern nautilus_system=/home/user/nt-bench/target/release/deps/libnautilus_system-e3eeb9a4d5552774.rlib --extern nautilus_tardis=/home/user/nt-bench/target/release/deps/libnautilus_tardis-a5e2b0c3aa798f43.rlib --extern nautilus_testkit=/home/user/nt-bench/target/release/deps/libnautilus_testkit-5630a75d216554db.rlib --extern nautilus_trading=/home/user/nt-bench/target/release/deps/libnautilus_trading-6c7fc22c1c1708c1.rlib --extern pyo3=/home/user/nt-bench/target/release/deps/libpyo3-fe86ac13e4ed733a.rlib --extern pyo3_stub_gen=/home/user/nt-bench/target/release/deps/libpyo3_stub_gen-bf7ac2d1e89d298c.rlib -Dwarnings -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--as-needed -C link-arg=-Wl,-z,norelro -C relocation-model=pic -L native=/home/user/nt-bench/target/release/build/zstd-sys-3ca5fe619c403464/out -L native=/home/user/nt-bench/target/release/build/blake3-b6bac95b4eeb59d1/out -L native=/home/user/nt-bench/target/release/build/blake3-b6bac95b4eeb59d1/out -L native=/home/user/nt-bench/target/release/build/aws-lc-sys-6ca6177fc8a9e156/out -L native=/home/user/nt-bench/target/release/build/ring-eceaba4c93b12a29/out -L native=/usr/lib/x86_64-linux-gnu` (signal: 9, SIGKILL: kill)
+      Timing report saved to /home/user/nt-bench/target/cargo-timings/cargo-timing-20261011T132325157Z-a2ce88c076574294.html
+error: scenario release failed
+exit-release 1
+disk at end: /dev/vda        252G   17G   23G  44% /
+ALL-DONE
