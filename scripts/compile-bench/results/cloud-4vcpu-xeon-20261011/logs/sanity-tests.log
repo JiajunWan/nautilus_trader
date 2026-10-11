@@ -1,0 +1,14 @@
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 21.75s
+────────────
+ Nextest run ID 5fc258a7-a074-46f8-b4fd-0244fa5513b7 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.001s] 1438 tests run: 1438 passed, 4 skipped
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 22.10s
+────────────
+ Nextest run ID c9d09daa-e515-4b8f-8ade-64765de31761 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.566s] 1438 tests run: 1438 passed, 4 skipped

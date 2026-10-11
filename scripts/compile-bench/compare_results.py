@@ -19,6 +19,7 @@ import sys
 
 SCENARIOS = [
     ("test-crate-incremental", "Edit -> build + run one crate's tests, incremental (recommended dev loop)"),
+    ("test-crate-tuned", "test-crate-incremental with nextest --test-threads = 4 x cores (I/O-bound integration tests)"),
     ("test-crate-sccache", "Edit -> build + run one crate's tests, sccache + CARGO_INCREMENTAL=0 (make cargo-test-crate-<pkg> style)"),
     ("test-crate-cold", "Edit -> empty target dir, warm sccache (fresh worktree / CI), one crate's tests"),
     ("test-ws-incremental", "Edit -> build every workspace test binary, incremental, run the crate's tests"),

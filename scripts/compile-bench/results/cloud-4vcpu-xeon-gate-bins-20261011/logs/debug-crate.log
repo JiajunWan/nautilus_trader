@@ -1,0 +1,60 @@
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 8.78s
+--- timed: debug-crate -j 1
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 8.29s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.25s
+--- timed: debug-crate -j 1
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 8.11s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.24s
+--- timed: debug-crate -j 1
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.74s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.87s
+--- timed: debug-crate -j 1
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 8.93s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.41s
+--- timed: debug-crate -j 1
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 8.59s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.45s
+--- timed: debug-crate -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.78s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.12s
+--- timed: debug-crate -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.33s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.60s
+--- timed: debug-crate -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.58s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.59s
+--- timed: debug-crate -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.72s
+--- prepare (debug-crate): base build, then apply edit
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 6.97s
+--- timed: debug-crate -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `dev` profile [unoptimized] target(s) in 7.53s

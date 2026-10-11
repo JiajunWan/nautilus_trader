@@ -1,0 +1,7 @@
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 20.55s
+────────────
+ Nextest run ID 3cc50a95-4d8a-4fe0-bf88-46e637e6a8e8 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.147s] 1438 tests run: 1438 passed, 4 skipped

@@ -1,0 +1,65 @@
+--- prepare (test-crate-incremental): base build, then apply edit
+warning: ignoring --status-level because --no-run is specified
+warning: ignoring --final-status-level because --no-run is specified
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 14.05s
+--- timed: test-crate-incremental -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 13.95s
+────────────
+ Nextest run ID 5a6a03b8-36d6-428b-8679-8c5d5bc81b68 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.306s] 1438 tests run: 1438 passed, 4 skipped
+--- prepare (test-crate-incremental): base build, then apply edit
+warning: ignoring --status-level because --no-run is specified
+warning: ignoring --final-status-level because --no-run is specified
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 14.18s
+--- timed: test-crate-incremental -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 13.50s
+────────────
+ Nextest run ID b8086030-26ea-4a69-bfbb-3d814940e08e with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.656s] 1438 tests run: 1438 passed, 4 skipped
+--- prepare (test-crate-incremental): base build, then apply edit
+warning: ignoring --status-level because --no-run is specified
+warning: ignoring --final-status-level because --no-run is specified
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 13.56s
+--- timed: test-crate-incremental -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 13.41s
+────────────
+ Nextest run ID b1a0bf3f-8e96-4718-b916-19d8c8fcb5d8 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.596s] 1438 tests run: 1438 passed, 4 skipped
+--- prepare (test-crate-incremental): base build, then apply edit
+warning: ignoring --status-level because --no-run is specified
+warning: ignoring --final-status-level because --no-run is specified
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 14.01s
+--- timed: test-crate-incremental -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 14.00s
+────────────
+ Nextest run ID 11d9dfdd-1934-4635-9eb0-11120a1166b9 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.530s] 1438 tests run: 1438 passed, 4 skipped
+--- prepare (test-crate-incremental): base build, then apply edit
+warning: ignoring --status-level because --no-run is specified
+warning: ignoring --final-status-level because --no-run is specified
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 13.95s
+--- timed: test-crate-incremental -j 4
+   Compiling nautilus-hyperliquid v0.66.0 (/home/user/nt-bench/crates/adapters/hyperliquid)
+    Finished `nextest` profile [unoptimized] target(s) in 13.63s
+────────────
+ Nextest run ID bba89d96-f311-4f3a-88fd-8e0d98e7de31 with nextest profile: default
+    Starting 1438 tests across 2 binaries (4 tests skipped)
+────────────
+     Summary [  49.983s] 1438 tests run: 1438 passed, 4 skipped

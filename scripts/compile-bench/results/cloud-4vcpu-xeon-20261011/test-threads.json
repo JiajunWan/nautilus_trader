@@ -1,0 +1,522 @@
+{
+  "schema_version": 2,
+  "metadata": {
+    "hyperfine_version": "2.0.0",
+    "start_time": "2026-10-11T12:15:09Z",
+    "platform": {
+      "os": "Linux",
+      "architecture": "x86_64"
+    }
+  },
+  "primary_metric": "time_wall_clock",
+  "results": [
+    {
+      "command": "cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features 'arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python' --cargo-profile nextest --status-level fail --final-status-level flaky --test-threads 4 >> /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/test-threads.log 2>&1",
+      "name": "test-run-only --test-threads 4",
+      "measurements": [
+        {
+          "time_wall_clock": {
+            "value": 51.38477808386,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 43.26858576000001,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 19.71761916,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 23.550966600000002,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195555328.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 49.96851800586,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 41.517942760000004,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 19.071582160000002,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 22.446360600000002,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195665920.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 50.52527278786,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 42.019414760000004,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 19.81963316,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 22.1997816,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195612672.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        }
+      ],
+      "parameters": {
+        "threads": {
+          "value": "4"
+        }
+      },
+      "summary": {
+        "memory_peak_resident": {
+          "unit": "byte",
+          "count": 3,
+          "mean": 195611306.66666666,
+          "stddev": 55308.640530511446,
+          "median": 195612672.0,
+          "min": 195555328.0,
+          "max": 195665920.0
+        },
+        "time_cpu": {
+          "unit": "second",
+          "count": 3,
+          "mean": 42.26864776000001,
+          "stddev": 0.901540650541618,
+          "median": 42.019414760000004,
+          "min": 41.517942760000004,
+          "max": 43.26858576000001
+        },
+        "time_system": {
+          "unit": "second",
+          "count": 3,
+          "mean": 22.7323696,
+          "stddev": 0.719566596721249,
+          "median": 22.446360600000002,
+          "min": 22.1997816,
+          "max": 23.550966600000002
+        },
+        "time_user": {
+          "unit": "second",
+          "count": 3,
+          "mean": 19.53627816,
+          "stddev": 0.4056580990945442,
+          "median": 19.71761916,
+          "min": 19.071582160000002,
+          "max": 19.81963316
+        },
+        "time_wall_clock": {
+          "unit": "second",
+          "count": 3,
+          "mean": 50.62618962586,
+          "stddev": 0.7135028439173041,
+          "median": 50.52527278786,
+          "min": 49.96851800586,
+          "max": 51.38477808386
+        }
+      }
+    },
+    {
+      "command": "cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features 'arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python' --cargo-profile nextest --status-level fail --final-status-level flaky --test-threads 8 >> /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/test-threads.log 2>&1",
+      "name": "test-run-only --test-threads 8",
+      "measurements": [
+        {
+          "time_wall_clock": {
+            "value": 28.56155300986,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 40.09853776,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 18.44465416,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 21.6538836,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195436544.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 29.672144263859998,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 43.21513276,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 19.68003616,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 23.535096600000003,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195510272.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 28.823402523859997,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 42.01528976,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 19.58104616,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 22.434243600000002,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195547136.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        }
+      ],
+      "parameters": {
+        "threads": {
+          "value": "8"
+        }
+      },
+      "summary": {
+        "memory_peak_resident": {
+          "unit": "byte",
+          "count": 3,
+          "mean": 195497984.0,
+          "stddev": 56310.69013961736,
+          "median": 195510272.0,
+          "min": 195436544.0,
+          "max": 195547136.0
+        },
+        "time_cpu": {
+          "unit": "second",
+          "count": 3,
+          "mean": 41.77632009333333,
+          "stddev": 1.5719799536560062,
+          "median": 42.01528976,
+          "min": 40.09853776,
+          "max": 43.21513276
+        },
+        "time_system": {
+          "unit": "second",
+          "count": 3,
+          "mean": 22.5410746,
+          "stddev": 0.945145615639729,
+          "median": 22.434243600000002,
+          "min": 21.6538836,
+          "max": 23.535096600000003
+        },
+        "time_user": {
+          "unit": "second",
+          "count": 3,
+          "mean": 19.235245493333334,
+          "stddev": 0.68645884602162,
+          "median": 19.58104616,
+          "min": 18.44465416,
+          "max": 19.68003616
+        },
+        "time_wall_clock": {
+          "unit": "second",
+          "count": 3,
+          "mean": 29.01903326586,
+          "stddev": 0.5805659082110539,
+          "median": 28.823402523859997,
+          "min": 28.56155300986,
+          "max": 29.672144263859998
+        }
+      }
+    },
+    {
+      "command": "cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features 'arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python' --cargo-profile nextest --status-level fail --final-status-level flaky --test-threads 16 >> /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/test-threads.log 2>&1",
+      "name": "test-run-only --test-threads 16",
+      "measurements": [
+        {
+          "time_wall_clock": {
+            "value": 23.499567262859998,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 43.39347876,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 20.25466316,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 23.1388156,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195543040.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 22.819427629859998,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 39.85109876,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 18.36665616,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 21.4844426,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195551232.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 22.93158450686,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 39.77074976,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 18.11600216,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 21.6547476,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195604480.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        }
+      ],
+      "parameters": {
+        "threads": {
+          "value": "16"
+        }
+      },
+      "summary": {
+        "memory_peak_resident": {
+          "unit": "byte",
+          "count": 3,
+          "mean": 195566250.66666666,
+          "stddev": 33359.985931252035,
+          "median": 195551232.0,
+          "min": 195543040.0,
+          "max": 195604480.0
+        },
+        "time_cpu": {
+          "unit": "second",
+          "count": 3,
+          "mean": 41.00510909333334,
+          "stddev": 2.0687789246172086,
+          "median": 39.85109876,
+          "min": 39.77074976,
+          "max": 43.39347876
+        },
+        "time_system": {
+          "unit": "second",
+          "count": 3,
+          "mean": 22.0926686,
+          "stddev": 0.9099827511898233,
+          "median": 21.6547476,
+          "min": 21.4844426,
+          "max": 23.1388156
+        },
+        "time_user": {
+          "unit": "second",
+          "count": 3,
+          "mean": 18.91244049333333,
+          "stddev": 1.1691356303330813,
+          "median": 18.36665616,
+          "min": 18.11600216,
+          "max": 20.25466316
+        },
+        "time_wall_clock": {
+          "unit": "second",
+          "count": 3,
+          "mean": 23.083526466526667,
+          "stddev": 0.3646398900625844,
+          "median": 22.93158450686,
+          "min": 22.819427629859998,
+          "max": 23.499567262859998
+        }
+      }
+    },
+    {
+      "command": "cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features 'arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python' --cargo-profile nextest --status-level fail --final-status-level flaky --test-threads 32 >> /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/test-threads.log 2>&1",
+      "name": "test-run-only --test-threads 32",
+      "measurements": [
+        {
+          "time_wall_clock": {
+            "value": 20.818612269859997,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 41.13712076,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 18.86199816,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 22.2751226,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195735552.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 20.77832125686,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 40.251059760000004,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 18.65319216,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 21.5978676,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195792896.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        },
+        {
+          "time_wall_clock": {
+            "value": 21.269506984859998,
+            "unit": "second"
+          },
+          "time_cpu": {
+            "value": 42.18822376,
+            "unit": "second"
+          },
+          "time_user": {
+            "value": 19.56298316,
+            "unit": "second"
+          },
+          "time_system": {
+            "value": 22.6252406,
+            "unit": "second"
+          },
+          "memory_peak_resident": {
+            "value": 195330048.0,
+            "unit": "byte"
+          },
+          "exit_code": 0
+        }
+      ],
+      "parameters": {
+        "threads": {
+          "value": "32"
+        }
+      },
+      "summary": {
+        "memory_peak_resident": {
+          "unit": "byte",
+          "count": 3,
+          "mean": 195619498.66666666,
+          "stddev": 252306.0639567217,
+          "median": 195735552.0,
+          "min": 195330048.0,
+          "max": 195792896.0
+        },
+        "time_cpu": {
+          "unit": "second",
+          "count": 3,
+          "mean": 41.19213476,
+          "stddev": 0.9697530592222928,
+          "median": 41.13712076,
+          "min": 40.251059760000004,
+          "max": 42.18822376
+        },
+        "time_system": {
+          "unit": "second",
+          "count": 3,
+          "mean": 22.166076933333333,
+          "stddev": 0.5222949725455277,
+          "median": 22.2751226,
+          "min": 21.5978676,
+          "max": 22.6252406
+        },
+        "time_user": {
+          "unit": "second",
+          "count": 3,
+          "mean": 19.02605782666667,
+          "stddev": 0.4765675152487154,
+          "median": 18.86199816,
+          "min": 18.65319216,
+          "max": 19.56298316
+        },
+        "time_wall_clock": {
+          "unit": "second",
+          "count": 3,
+          "mean": 20.955480170526666,
+          "stddev": 0.2727003328241415,
+          "median": 20.818612269859997,
+          "min": 20.77832125686,
+          "max": 21.269506984859998
+        }
+      }
+    }
+  ]
+}

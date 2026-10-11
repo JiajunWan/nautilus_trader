@@ -1,0 +1,326 @@
+diff --git a/crates/adapters/hyperliquid/src/execution.rs b/crates/adapters/hyperliquid/src/execution.rs
+index e576a65..62a6a01 100644
+--- a/crates/adapters/hyperliquid/src/execution.rs
++++ b/crates/adapters/hyperliquid/src/execution.rs
+@@ -2729,7 +2729,7 @@ impl HyperliquidExecutionClient {
+                                     ExecutionReport::Order(_) => None,
+                                 };
+ 
+-                                let (terminal_skipped, corrective) = handle_execution_report(
++                                let (cancel_skipped, corrective) = handle_execution_report(
+                                     report,
+                                     &dispatch_state,
+                                     &emitter,
+@@ -2768,7 +2768,7 @@ impl HyperliquidExecutionClient {
+                                 }
+ 
+                                 if let Some((parent_id, ts_event)) =
+-                                    staged_parent_terminal.filter(|_| !terminal_skipped)
++                                    staged_parent_terminal.filter(|_| !cancel_skipped)
+                                 {
+                                     let children =
+                                         staged_brackets.lock().cancel_for_parent(&parent_id);
+@@ -2802,7 +2802,7 @@ impl HyperliquidExecutionClient {
+                                 }
+ 
+                                 if let Some(client_order_id) =
+-                                    active_child_terminal.filter(|_| !terminal_skipped)
++                                    active_child_terminal.filter(|_| !cancel_skipped)
+                                 {
+                                     let sibling = staged_brackets
+                                         .lock()
+@@ -4191,8 +4191,8 @@ impl PostRejectionRoute {
+ /// dispatch module; external / untracked orders fall back to the raw report
+ /// so the engine can reconcile. Cloid-mapping cleanup is handled here so
+ /// long-running sessions do not leak mapping entries. Returns whether dispatch
+-/// skipped a cancel or non-submission rejection, so bracket handling must not react,
+-/// and any corrective reduce the dispatch queued.
++/// skipped a cancel, which then ends no order, and any corrective reduce the
++/// dispatch queued.
+ fn handle_execution_report(
+     report: ExecutionReport,
+     dispatch_state: &WsDispatchState,
+@@ -4205,17 +4205,10 @@ fn handle_execution_report(
+     match report {
+         ExecutionReport::Order(order_report) => {
+             let is_filled_marker = matches!(order_report.order_status, OrderStatus::Filled);
++            let is_cancel = order_report.order_status == OrderStatus::Canceled;
+             let is_terminal = order_report.order_status.is_closed();
+             let client_order_id = order_report.client_order_id;
+ 
+-            let skip_terminal = match order_report.order_status {
+-                OrderStatus::Canceled => true,
+-                OrderStatus::Rejected => {
+-                    !client_order_id.is_some_and(|id| dispatch_state.submission_pending(&id))
+-                }
+-                _ => false,
+-            };
+-
+             let outcome = dispatch_order_event(&order_report, dispatch_state, emitter, ts_init);
+ 
+             if outcome == DispatchOutcome::External {
+@@ -4255,10 +4248,8 @@ fn handle_execution_report(
+                     .map(|corrective| (id, corrective))
+             });
+ 
+-            (
+-                skip_terminal && outcome == DispatchOutcome::Skip,
+-                corrective,
+-            )
++            // Dispatch skips a held or superseded cancel, so bracket handling must not react
++            (is_cancel && outcome == DispatchOutcome::Skip, corrective)
+         }
+         ExecutionReport::Fill(fill_report) => {
+             let client_order_id = fill_report.client_order_id;
+@@ -5070,7 +5061,6 @@ mod tests {
+ 
+     #[rstest]
+     #[case::canceled(OrderStatus::Canceled)]
+-    #[case::rejected(OrderStatus::Rejected)]
+     fn test_handle_execution_report_skip_keeps_cloid_mapping(#[case] status: OrderStatus) {
+         // Regression guard for GH-3827: when the dispatch returns Skip (e.g.
+         // the stale cancel leg of a cancel-replace), the cloid mapping must
+diff --git a/crates/adapters/hyperliquid/src/websocket/dispatch.rs b/crates/adapters/hyperliquid/src/websocket/dispatch.rs
+index 45abbfb..3572e41 100644
+--- a/crates/adapters/hyperliquid/src/websocket/dispatch.rs
++++ b/crates/adapters/hyperliquid/src/websocket/dispatch.rs
+@@ -1432,14 +1432,6 @@ fn handle_rejected(
+         return DispatchOutcome::Skip;
+     }
+ 
+-    // A rejected replacement never became the bound order. Its original leg's
+-    // cancellation closes the order once the failed modify releases any held cancel.
+-    if let Some(bound) = state.cached_venue_order_id(&client_order_id)
+-        && bound != report.venue_order_id
+-    {
+-        return DispatchOutcome::Skip;
+-    }
+-
+     if !claim_terminal_order(client_order_id, state, report.order_status) {
+         return DispatchOutcome::Skip;
+     }
+@@ -1971,83 +1963,6 @@ mod tests {
+         assert!(!state.has_pending_modify(&cid));
+     }
+ 
+-    #[rstest]
+-    #[case::response_cancel_reject(["response", "cancel", "reject"])]
+-    #[case::response_reject_cancel(["response", "reject", "cancel"])]
+-    #[case::cancel_response_reject(["cancel", "response", "reject"])]
+-    #[case::cancel_reject_response(["cancel", "reject", "response"])]
+-    #[case::reject_response_cancel(["reject", "response", "cancel"])]
+-    #[case::reject_cancel_response(["reject", "cancel", "response"])]
+-    fn test_failed_modify_closes_original_once(
+-        #[case] sequence: [&str; 3],
+-        #[values(false, true)] filled: bool,
+-    ) {
+-        let (emitter, mut rx) = test_emitter();
+-        let state = WsDispatchState::new();
+-        let cid = ClientOrderId::new("O-MODIFY-REJECT");
+-        let original = VenueOrderId::new("100");
+-        state.register_context(make_context(cid));
+-        state.record_venue_order_id(cid, original);
+-        state.insert_accepted(cid);
+-        if filled {
+-            state.record_filled_qty(cid, Quantity::from("0.00004"));
+-        }
+-
+-        let generation = state.mark_pending_modify(cid, original, Quantity::from("0.0001"));
+-        let mut canceled = canceled_report(cid, "100");
+-        canceled.ts_last = UnixNanos::from(100);
+-        let mut rejected = canceled_report(cid, "101");
+-        rejected.order_status = OrderStatus::Rejected;
+-        rejected.ts_last = UnixNanos::from(200);
+-
+-        for action in sequence {
+-            match action {
+-                "response" => state.clear_modify_generation(&cid, generation),
+-                "cancel" => {
+-                    dispatch_order_event(&canceled, &state, &emitter, UnixNanos::default());
+-                }
+-                "reject" => {
+-                    dispatch_order_event(&rejected, &state, &emitter, UnixNanos::default());
+-                }
+-                _ => unreachable!(),
+-            }
+-
+-            for report in released_cancels(&state) {
+-                dispatch_order_event(&report, &state, &emitter, UnixNanos::default());
+-            }
+-        }
+-
+-        let canceled_replay =
+-            dispatch_order_event(&canceled, &state, &emitter, UnixNanos::default());
+-        let rejected_replay =
+-            dispatch_order_event(&rejected, &state, &emitter, UnixNanos::default());
+-        let event = rx.try_recv().unwrap();
+-
+-        let ExecutionEvent::Order(OrderEventAny::Canceled(event)) = event else {
+-            panic!("expected OrderCanceled, received {event:?}");
+-        };
+-
+-        assert_eq!(event.trader_id, emitter.trader_id());
+-        assert_eq!(event.strategy_id, StrategyId::from("S-001"));
+-        assert_eq!(
+-            event.instrument_id,
+-            InstrumentId::from("BTC-USD-PERP.HYPERLIQUID")
+-        );
+-        assert_eq!(event.client_order_id, cid);
+-        assert_eq!(event.venue_order_id, Some(original));
+-        assert_eq!(event.account_id, Some(canceled.account_id));
+-        assert_eq!(event.ts_event, canceled.ts_last);
+-        assert_eq!(event.ts_init, UnixNanos::default());
+-        assert!(!event.reconciliation);
+-        assert_eq!(event.reason, None);
+-        assert_eq!(event.causation_id, None);
+-        assert!(rx.try_recv().is_err());
+-        assert_eq!(canceled_replay, DispatchOutcome::Skip);
+-        assert_eq!(rejected_replay, DispatchOutcome::Skip);
+-        assert!(state.lookup_context(&cid).is_none());
+-        assert!(!state.has_pending_modify(&cid));
+-    }
+-
+     #[rstest]
+     fn test_promotion_drops_held_cancel() {
+         let state = WsDispatchState::new();
+diff --git a/crates/adapters/hyperliquid/tests/integration/dispatch.rs b/crates/adapters/hyperliquid/tests/integration/dispatch.rs
+index 6b51abf..5c57a08 100644
+--- a/crates/adapters/hyperliquid/tests/integration/dispatch.rs
++++ b/crates/adapters/hyperliquid/tests/integration/dispatch.rs
+@@ -48,7 +48,6 @@ use nautilus_model::{
+     identifiers::{
+         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
+     },
+-    orders::{LimitOrder, Order, OrderAny},
+     reports::{FillReport, OrderStatusReport},
+     types::{Currency, Money, Price, Quantity},
+ };
+@@ -279,17 +278,11 @@ fn test_dispatch_expired_tracked_synthesizes_accepted_then_expired() {
+ }
+ 
+ #[rstest]
+-#[case::unbound(false)]
+-#[case::bound(true)]
+-fn test_dispatch_rejected_tracked_emits_rejected_and_cleans_up(#[case] bound: bool) {
++fn test_dispatch_rejected_tracked_emits_rejected_and_cleans_up() {
+     let (emitter, mut rx) = test_emitter();
+     let state = Arc::new(WsDispatchState::new());
+     let cid = ClientOrderId::new("O-004");
+     state.register_context(context(cid, OrderType::Limit));
+-    if bound {
+-        state.record_venue_order_id(cid, VenueOrderId::new("v-400"));
+-        state.insert_accepted(cid);
+-    }
+ 
+     let mut report = make_status_report(
+         Some("O-004"),
+@@ -299,108 +292,14 @@ fn test_dispatch_rejected_tracked_emits_rejected_and_cleans_up(#[case] bound: bo
+         "0.00020",
+     );
+     report = report.with_cancel_reason("Insufficient margin".to_string());
+-    let outcome = dispatch_order_event(&report, &state, &emitter, UnixNanos::default());
++    dispatch_order_event(&report, &state, &emitter, UnixNanos::default());
+ 
+     let events = drain_events(&mut rx);
+-    assert_eq!(outcome, DispatchOutcome::Tracked);
+     assert_event_types(&events, &["Rejected"]);
+     assert!(state.lookup_context(&cid).is_none());
+-    assert_eq!(state.cached_venue_order_id(&cid), None);
+     assert!(state.filled_orders.contains(&cid));
+ }
+ 
+-#[rstest]
+-fn test_failed_modify_cancels_partially_filled_order() {
+-    let (emitter, mut rx) = test_emitter();
+-    let state = WsDispatchState::new();
+-    let cid = ClientOrderId::new("O-PARTIAL-MODIFY");
+-    let original = VenueOrderId::new("100");
+-    let spec = context(cid, OrderType::Limit);
+-
+-    let mut order = OrderAny::Limit(LimitOrder::new(
+-        emitter.trader_id(),
+-        spec.identity.strategy_id,
+-        spec.identity.instrument_id,
+-        cid,
+-        spec.identity.order_side,
+-        spec.quantity,
+-        spec.price.unwrap(),
+-        spec.time_in_force,
+-        None,
+-        false,
+-        false,
+-        false,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        None,
+-        UUID4::new(),
+-        UnixNanos::default(),
+-    ));
+-    state.register_context(spec);
+-    state.record_venue_order_id(cid, original);
+-    dispatch_order_fill(
+-        &make_fill_report(Some(cid.as_str()), "100", "T-PARTIAL", "0.00014", "56730.0"),
+-        &state,
+-        &emitter,
+-        UnixNanos::default(),
+-    );
+-
+-    for event in drain_events(&mut rx) {
+-        let ExecutionEvent::Order(event) = event else {
+-            panic!("expected order event, received {event:?}");
+-        };
+-
+-        order.apply(event).unwrap();
+-    }
+-
+-    assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+-    let generation = state.mark_pending_modify(cid, original, order.quantity());
+-    state.clear_modify_generation(&cid, generation);
+-
+-    for (venue_order_id, status) in [
+-        ("101", OrderStatus::Rejected),
+-        ("100", OrderStatus::Canceled),
+-    ] {
+-        dispatch_order_event(
+-            &make_status_report(
+-                Some(cid.as_str()),
+-                venue_order_id,
+-                status,
+-                Some("56730.0"),
+-                "0.00020",
+-            ),
+-            &state,
+-            &emitter,
+-            UnixNanos::default(),
+-        );
+-    }
+-
+-    let events = drain_events(&mut rx);
+-    assert_event_types(&events, &["Canceled"]);
+-
+-    for event in events {
+-        let ExecutionEvent::Order(event) = event else {
+-            panic!("expected order event, received {event:?}");
+-        };
+-
+-        order.apply(event).unwrap();
+-    }
+-
+-    assert_eq!(order.status(), OrderStatus::Canceled);
+-    assert_eq!(order.venue_order_id(), Some(original));
+-    assert_eq!(order.quantity(), Quantity::from("0.00020"));
+-    assert_eq!(order.filled_qty(), Quantity::from("0.00014"));
+-    assert_eq!(order.leaves_qty(), Quantity::from("0.00006"));
+-}
+-
+ #[rstest]
+ fn test_dispatch_post_only_rejection_sets_due_post_only() {
+     let (emitter, mut rx) = test_emitter();
