@@ -165,7 +165,18 @@ Peak RSS of any single process stayed at about 2.2 GiB in all adapter scenarios.
 
 ### Workspace-wide scenarios
 
-WORKSPACE_RESULTS_PLACEHOLDER
+This sandbox could not run them. That is itself a sizing data point for the other machines:
+
+| Scenario | Outcome on 4 vCPU / 15.7 GiB / ~40 GB disk |
+|---|---|
+| `test-ws-incremental`, `test-ws-sccache` | `No space left on device` while building the workspace test binaries (27 GB free at start) |
+| `debug-ws` | `No space left on device` during the first (untimed) workspace dev build |
+| `release` at `-j 4` and `-j 2` | rustc killed by the OOM killer: two concurrent fat-LTO links (`nautilus` CLI, `python-stub-gen`, about 7 GB each) exceeded the 13.4 GiB memory cgroup |
+| `release` at `-j 1` | RELEASE_J1_RESULT |
+
+Logs are in `results/cloud-4vcpu-xeon-20261011/failed-attempts/`. For the workspace scenarios,
+plan on 100 GB+ free disk. For a release build at `-j N`, plan on about 7–8 GB of RAM per
+concurrent final LTO link, on top of the normal 1–2 GB per job.
 
 ## Findings
 
@@ -191,7 +202,11 @@ WORKSPACE_RESULTS_PLACEHOLDER
    each `[[bin]]`, plus `bins = []`) takes the build part of the loop from 24–28 s to 14 s and
    `cargo build -p` from 20 s to 8 s.
 5. **Peak memory is not the constraint** for the adapter loop (about 2.2 GiB per process). Disk
-   is: `target/` reached 25 GB after the adapter scenarios.
+   is: `target/` reached 25 GB after the adapter scenarios, and a workspace-wide test or dev
+   build did not fit in 27 GB.
+6. **Fat-LTO release builds are memory-bound when run in parallel.** The final links of the
+   binaries and the Python extension take about 7 GB each. Several can run at once at `-j ≥ 2`,
+   which got the build OOM-killed on a 13.4 GiB limit.
 
 ## Recommendations for the edit → build → test loop
 

@@ -1,0 +1,88 @@
+warning: PYO3_PYTHON not set and python/.venv missing; using /usr/bin/python3
+
+==> Checking out base commit f9487c5935f1d007b0245698d54b548a7d02be23 (HEAD stays here for every timed run)
+
+==> Installing the pinned toolchain and fetching crates (untimed)
+cargo 1.99.0 (5f94df478 2026-08-27)
+
+==> Environment recorded in /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/env.txt
+label=cloud-4vcpu-xeon
+date=2026-10-11T13:56:16Z
+hostname=vm
+uname=Linux vm 6.18.44-fc-v114 #1 SMP PREEMPT_DYNAMIC @0 x86_64 x86_64 x86_64 GNU/Linux
+logical_cpus=4
+cpu=Intel(R) Xeon(R) Processor @ 2.10GHz
+lscpu_threads_per_core=1
+memory_kb=16479424
+ec2_instance_type=
+ld_lld=Ubuntu LLD 18.1.3 (compatible with GNU linkers)
+target_dir=/home/user/nt-bench/target
+target_fs=/dev/vda        252G   13G   27G  32% /
+rustc=rustc 1.99.0 (b940084d7 2026-09-28);binary: rustc;commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4;commit-date: 2026-09-28;host: x86_64-unknown-linux-gnu;release: 1.99.0;LLVM version: 23.1.1;
+cargo=cargo 1.99.0 (5f94df478 2026-08-27)
+hyperfine=hyperfine 2.0.0
+nextest=cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)
+sccache=sccache 0.18.0
+repo_base=f9487c5935f1d007b0245698d54b548a7d02be23
+change_commit=patch change.patch
+change_rs_files=3
+change_rs_lines=216
+package=nautilus-hyperliquid
+pkg_features=arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python
+features=arrow,ffi,python,high-precision,streaming,defi
+variant_patch=
+tuned_test_threads=16
+pyo3_python=/usr/bin/python3
+cmd_release=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi --release --timings -j {jobs}
+cmd_debug_ws=cargo build --locked --workspace --features arrow,ffi,python,high-precision,streaming,defi -j {jobs}
+cmd_debug_crate=cargo build --locked -p nautilus-hyperliquid --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python -j {jobs}
+cmd_test_ws=cargo nextest run --locked --workspace --lib --tests --features arrow,ffi,python,high-precision,streaming,defi --cargo-profile nextest --status-level fail --final-status-level flaky -E package(nautilus-hyperliquid) --build-jobs {jobs} --test-threads {jobs}
+cmd_test_crate=cargo nextest run --locked -p nautilus-hyperliquid --lib --tests --features arrow,examples,high-precision,nautilus-serialization,pyo3,pyo3-async-runtimes,pyo3-stub-gen,python --cargo-profile nextest --status-level fail --final-status-level flaky --build-jobs {jobs} --test-threads {jobs}
+
+==> Scenario release  (runs=1, -j in {2})  log: /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/release.log
+Error: Command '"/home/user/nautilus_trader/scripts/compile-bench/bench_nautilus.sh" _timed release 2' terminated with non-zero exit code 101 in the first benchmark run. Use the '-i'/'--ignore-failure' option if you want to ignore this. Alternatively, use the '--show-output' option to debug what went wrong.
+---- last 40 lines of /home/user/nautilus_trader/scripts/compile-bench/results/cloud-4vcpu-xeon-20261011/logs/release.log ----
+   Compiling dbn-macros v0.71.0
+   Compiling nautilus-deribit v0.66.0 (/home/user/nt-bench/crates/adapters/deribit)
+   Compiling nautilus-kraken v0.66.0 (/home/user/nt-bench/crates/adapters/kraken)
+   Compiling nautilus-coinbase v0.66.0 (/home/user/nt-bench/crates/adapters/coinbase)
+   Compiling json-writer v0.4.0
+   Compiling libmimalloc-sys v0.1.49
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling dbn v0.71.0
+   Compiling anstream v1.0.0
+   Compiling prost v0.14.4
+   Compiling nautilus-derive v0.66.0 (/home/user/nt-bench/crates/adapters/derive)
+   Compiling nautilus-lighter v0.66.0 (/home/user/nt-bench/crates/adapters/lighter)
+   Compiling clap_lex v1.1.1
+   Compiling redb v4.3.0
+   Compiling clap_builder v4.6.7
+   Compiling ibapi v5.0.0
+   Compiling databento v0.63.0
+   Compiling clap_derive v4.6.7
+   Compiling clap v4.6.7
+   Compiling nautilus-databento v0.66.0 (/home/user/nt-bench/crates/adapters/databento)
+   Compiling mimalloc v0.1.52
+   Compiling nautilus-interactive-brokers v0.66.0 (/home/user/nt-bench/crates/adapters/interactive_brokers)
+   Compiling nautilus-backtest v0.66.0 (/home/user/nt-bench/crates/backtest)
+   Compiling nautilus-sandbox v0.66.0 (/home/user/nt-bench/crates/adapters/sandbox)
+   Compiling libbz2-rs-sys v0.2.5
+   Compiling nautilus-plugin v0.66.0 (/home/user/nt-bench/crates/plugin)
+   Compiling bzip2 v0.6.1
+   Compiling nautilus-event-store v0.66.0 (/home/user/nt-bench/crates/event_store)
+   Compiling nautilus-pyo3 v0.66.0 (/home/user/nt-bench/crates/pyo3)
+   Compiling nautilus-cli v0.66.0 (/home/user/nt-bench/crates/cli)
+error: could not compile `nautilus-event-store` (bin "verify")
+
+Caused by:
+  process didn't exit successfully: `/root/.rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name verify --edition=2024 crates/event_store/src/bin/verify.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 '--warn=clippy::verbose_bit_mask' '--warn=clippy::useless_conversion' '--warn=clippy::use_self' --deny=unreachable_pub '--warn=clippy::unnested_or_patterns' '--warn=clippy::unnecessary_wraps' '--warn=clippy::unnecessary_to_owned' '--warn=clippy::unnecessary_struct_initialization' '--warn=clippy::unnecessary_sort_by' '--warn=clippy::unnecessary_semicolon' '--warn=clippy::unnecessary_self_imports' '--warn=clippy::unnecessary_safety_doc' '--warn=clippy::unnecessary_safety_comment' '--warn=clippy::unnecessary_literal_bound' '--warn=clippy::unnecessary_lazy_evaluations' '--warn=clippy::unnecessary_join' '--warn=clippy::unnecessary_filter_map' '--warn=clippy::unnecessary_debug_formatting' '--warn=clippy::unnecessary_box_returns' --allow=unknown_lints '--warn=clippy::uninlined_format_args' '--warn=clippy::unimplemented' --warn=unexpected_cfgs '--warn=clippy::unchecked_time_subtraction' '--warn=clippy::suspicious_doc_comments' '--warn=clippy::stable_sort_primitive' '--allow=clippy::single_match_else' '--warn=clippy::single_char_pattern' '--allow=clippy::similar_names' '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::return_self_not_must_use' '--warn=clippy::rest_pat_in_fully_bound_structs' '--warn=clippy::ref_as_ptr' '--warn=clippy::redundant_field_names' '--allow=clippy::redundant_else' '--warn=clippy::redundant_closure' '--warn=clippy::redundant_clone' '--warn=clippy::rc_mutex' '--warn=clippy::rc_buffer' '--warn=clippy::range_plus_one' '--warn=clippy::ptr_as_ptr' '--warn=clippy::panic_in_result_fn' '--allow=clippy::or_fun_call' '--warn=clippy::option_option' '--allow=clippy::option_if_let_else' '--warn=clippy::option_as_ref_deref' '--warn=clippy::needless_update' '--warn=clippy::needless_return' '--warn=clippy::needless_raw_strings' '--warn=clippy::needless_raw_string_hashes' '--warn=clippy::needless_range_loop' '--warn=clippy::needless_pass_by_value' '--warn=clippy::needless_pass_by_ref_mut' '--warn=clippy::needless_option_as_deref' '--warn=clippy::needless_match' '--warn=clippy::needless_lifetimes' '--warn=clippy::needless_late_init' '--warn=clippy::needless_for_each' '--warn=clippy::needless_continue' '--warn=clippy::needless_collect' '--warn=clippy::needless_borrows_for_generic_args' '--warn=clippy::needless_borrow' '--warn=clippy::needless_bool' '--warn=clippy::naive_bytecount' '--warn=clippy::mut_mut' '--warn=clippy::multiple_unsafe_ops_per_block' '--warn=clippy::mem_forget' '--warn=clippy::match_like_matches_macro' '--warn=clippy::match_bool' '--warn=clippy::map_unwrap_or' '--warn=clippy::map_identity' '--warn=clippy::map_flatten' '--warn=clippy::manual_while_let_some' '--warn=clippy::manual_strip' '--warn=clippy::manual_string_new' '--warn=clippy::manual_split_once' '--warn=clippy::manual_range_contains' '--warn=clippy::manual_map' '--allow=clippy::manual_let_else' '--warn=clippy::manual_is_variant_and' '--warn=clippy::manual_is_ascii_check' '--warn=clippy::manual_instant_elapsed' '--warn=clippy::manual_flatten' '--warn=clippy::manual_find' '--warn=clippy::manual_filter' '--warn=clippy::manual_assert' '--warn=clippy::lossy_float_literal' '--warn=clippy::let_underscore_future' '--warn=clippy::large_stack_arrays' '--warn=clippy::large_futures' '--warn=clippy::iter_nth_zero' '--warn=clippy::iter_not_returning_iterator' '--warn=clippy::iter_kv_map' '--warn=clippy::items_after_statements' '--warn=clippy::invalid_upcast_comparisons' '--warn=clippy::infallible_try_from' '--warn=clippy::inefficient_to_string' '--warn=clippy::inconsistent_struct_constructor' '--warn=clippy::implicit_clone' '--warn=clippy::ignored_unit_patterns' '--warn=clippy::if_same_then_else' '--warn=clippy::if_not_else' '--warn=clippy::if_let_mutex' '--warn=clippy::identity_op' '--warn=clippy::get_first' '--warn=clippy::float_cmp_const' '--warn=clippy::flat_map_option' '--warn=clippy::filter_map_next' '--warn=clippy::explicit_iter_loop' '--warn=clippy::explicit_into_iter_loop' '--warn=clippy::expl_impl_clone_on_copy' '--warn=clippy::exit' '--warn=clippy::equatable_if_let' '--warn=clippy::empty_drop' '--warn=clippy::disallowed_types' '--warn=clippy::disallowed_methods' '--warn=clippy::debug_assert_with_mut_call' '--warn=clippy::dbg_macro' '--warn=clippy::copy_iterator' '--warn=clippy::collapsible_if' '--warn=clippy::collapsible_else_if' '--warn=clippy::cloned_instead_of_copied' '--warn=clippy::checked_conversions' '--warn=clippy::bytes_count_to_len' '--warn=clippy::borrow_as_ptr' '--warn=clippy::bool_to_int_with_if' '--warn=clippy::await_holding_refcell_ref' '--warn=clippy::await_holding_lock' --check-cfg 'cfg(madsim)' --cfg 'feature="default"' --cfg 'feature="defi"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "defi", "live", "persistence"))' -C metadata=73e0e817a73a0b7c -C extra-filename=-486e5ae1097ac2af --out-dir /home/user/nt-bench/target/release/deps -C strip=symbols -L dependency=/home/user/nt-bench/target/release/deps --extern ahash=/home/user/nt-bench/target/release/deps/libahash-b154fd1f563213ff.rlib --extern anyhow=/home/user/nt-bench/target/release/deps/libanyhow-432c93d09f0474a5.rlib --extern blake3=/home/user/nt-bench/target/release/deps/libblake3-dac3d5a46cf7dc48.rlib --extern bytes=/home/user/nt-bench/target/release/deps/libbytes-d8dcdc0d1a3c7a2c.rlib --extern indexmap=/home/user/nt-bench/target/release/deps/libindexmap-0dbf550c46afb075.rlib --extern log=/home/user/nt-bench/target/release/deps/liblog-8410f78a86a032fb.rlib --extern nautilus_common=/home/user/nt-bench/target/release/deps/libnautilus_common-824193e18cfdf59d.rlib --extern nautilus_core=/home/user/nt-bench/target/release/deps/libnautilus_core-508364e3d8050a16.rlib --extern nautilus_event_store=/home/user/nt-bench/target/release/deps/libnautilus_event_store-20e1b0cc9fefd9a1.rlib --extern nautilus_execution=/home/user/nt-bench/target/release/deps/libnautilus_execution-33190a3e9463bbe3.rlib --extern nautilus_model=/home/user/nt-bench/target/release/deps/libnautilus_model-bcb69a41875c4a1d.rlib --extern nautilus_system=/home/user/nt-bench/target/release/deps/libnautilus_system-e3eeb9a4d5552774.rlib --extern parking_lot=/home/user/nt-bench/target/release/deps/libparking_lot-32eb6a59fe614e47.rlib --extern redb=/home/user/nt-bench/target/release/deps/libredb-9ac88773a48b28a9.rlib --extern rmp_serde=/home/user/nt-bench/target/release/deps/librmp_serde-e89ef7762f5be55c.rlib --extern serde=/home/user/nt-bench/target/release/deps/libserde-f8b2c5207194aa94.rlib --extern thiserror=/home/user/nt-bench/target/release/deps/libthiserror-ed06859d5dddfac6.rlib --extern ustr=/home/user/nt-bench/target/release/deps/libustr-552f131f9dddaa18.rlib -Dwarnings -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--as-needed -C link-arg=-Wl,-z,norelro -C relocation-model=pic -L native=/home/user/nt-bench/target/release/build/blake3-b6bac95b4eeb59d1/out -L native=/home/user/nt-bench/target/release/build/blake3-b6bac95b4eeb59d1/out -L native=/home/user/nt-bench/target/release/build/zstd-sys-3ca5fe619c403464/out -L native=/home/user/nt-bench/target/release/build/aws-lc-sys-6ca6177fc8a9e156/out -L native=/home/user/nt-bench/target/release/build/ring-eceaba4c93b12a29/out -L native=/usr/lib/x86_64-linux-gnu` (signal: 9, SIGKILL: kill)
+warning: build failed, waiting for other jobs to finish...
+      Timing report saved to /home/user/nt-bench/target/cargo-timings/cargo-timing-20261011T135617033Z-a2ce88c076574294.html
+error: scenario release failed
+exit-release 1
+disk at end: /dev/vda        252G   17G   23G  44% /
+ALL-DONE
