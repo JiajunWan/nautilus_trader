@@ -20,7 +20,9 @@
 #   test-ws-sccache         Same, configured like `make cargo-test` with sccache installed
 #                           (RUSTC_WRAPPER=sccache, CARGO_INCREMENTAL=0).
 #   test-crate-incremental  Edit -> build only $PACKAGE's lib + integration tests (incremental), run them.
-#   test-crate-sccache      Same, sccache + CARGO_INCREMENTAL=0 (what `make cargo-test-crate-<pkg>`
+#   test-crate-tuned        test-crate-incremental with --test-threads $TUNED_TEST_THREADS (default 4 x cores):
+#                           most adapter integration tests wait on timers and sockets, not CPU.
+#   test-crate-sccache      Same as test-crate-incremental, sccache + CARGO_INCREMENTAL=0 (what `make cargo-test-crate-<pkg>`
 #                           does when sccache is installed, plus the integration tests).
 #   test-crate-cold         Edit -> EMPTY target dir, sccache warm from the base commit
 #                           (fresh worktree / CI runner) -> build and run $PACKAGE's tests.
@@ -43,10 +45,13 @@
 #   PKG_FEATURES      features for the -crate scenarios (default: scripts/crate-test-features.sh $PACKAGE,
 #                     i.e. the same set `make cargo-test-crate-<pkg>` uses)
 #   FEATURES          workspace features for release / -ws scenarios, or "all" (default: Makefile base set)
-#   SCENARIOS         default: all eight above
+#   SCENARIOS         default: all nine above
 #   JOBS_LIST         -j values for release / debug-* scenarios (default: 1,<cores>)
 #   TEST_JOBS_LIST    -j values for test-* scenarios           (default: <cores>)
 #   RUNS_RELEASE, RUNS_DEBUG, RUNS_TEST                         (default: 3, 5, 5)
+#   TUNED_TEST_THREADS nextest --test-threads for test-crate-tuned       (default: 4 x cores)
+#   VARIANT_PATCH     optional patch applied as part of the BASE state (e.g. an adapter build tweak);
+#                     use a separate RESULTS_DIR / MACHINE_LABEL for each variant
 #   FREE_DISK         1 = delete target/debug and target/nextest before the release scenario (default: 1)
 #   RESULTS_DIR       where JSON/Markdown/logs go           (default: ./results/<machine>-<timestamp>)
 #   MACHINE_LABEL     name shown by compare_results.py      (default: auto-detected)
@@ -58,7 +63,7 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 HERE="$(dirname "$SELF")"
 OS="$(uname -s)"
 
-ALL_SCENARIOS="release,debug-ws,debug-crate,test-ws-incremental,test-ws-sccache,test-crate-incremental,test-crate-sccache,test-crate-cold"
+ALL_SCENARIOS="release,debug-ws,debug-crate,test-ws-incremental,test-ws-sccache,test-crate-incremental,test-crate-tuned,test-crate-sccache,test-crate-cold"
 
 log()  { printf '\n==> %s\n' "$*" >&2; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -84,10 +89,12 @@ load_config() {
   RUNS_DEBUG="${RUNS_DEBUG:-5}"
   RUNS_TEST="${RUNS_TEST:-5}"
   FREE_DISK="${FREE_DISK:-1}"
+  TUNED_TEST_THREADS="${TUNED_TEST_THREADS:-$((NCPU * 4))}"
+  VARIANT_PATCH="${VARIANT_PATCH:-}"
   SCCACHE_BENCH_DIR="${SCCACHE_BENCH_DIR:-$HOME/.cache/nautilus-bench-sccache}"
   TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_DIR/target}"
   export NCPU REPO_DIR FEATURES PACKAGE SCENARIOS JOBS_LIST TEST_JOBS_LIST RUNS_RELEASE RUNS_DEBUG \
-    RUNS_TEST FREE_DISK SCCACHE_BENCH_DIR TARGET_DIR
+    RUNS_TEST FREE_DISK TUNED_TEST_THREADS VARIANT_PATCH SCCACHE_BENCH_DIR TARGET_DIR
 }
 
 # Cargo arguments shared by every scenario, so untimed preparation builds and timed builds
@@ -147,6 +154,7 @@ reset_to_base() {
       rm -f -- "$REPO_DIR/$f"
     fi
   done < "$CHANGE_FILES"
+  if [ -n "$VARIANT_PATCH" ]; then git -C "$REPO_DIR" apply --whitespace=nowarn "$VARIANT_PATCH"; fi
 }
 
 apply_change() {
@@ -235,6 +243,7 @@ sub_timed() {  # $1 = scenario, $2 = jobs   (this is what hyperfine measures)
     debug-ws)     cargo build "${BUILD_WS[@]}" -j "$2" ;;
     debug-crate)  cargo build "${BUILD_CRATE[@]}" -j "$2" ;;
     test-ws-*)    cargo nextest run "${TEST_WS[@]}" --build-jobs "$2" --test-threads "$2" ;;
+    test-crate-tuned) cargo nextest run "${TEST_CRATE[@]}" --build-jobs "$2" --test-threads "$TUNED_TEST_THREADS" ;;
     test-crate-*) cargo nextest run "${TEST_CRATE[@]}" --build-jobs "$2" --test-threads "$2" ;;
     *)            echo "unknown scenario $1" >&2; exit 2 ;;
   esac >> "$LOG" 2>&1
@@ -308,7 +317,7 @@ preflight() {
     case ",$ALL_SCENARIOS," in *",$s,"*) ;; *) die "unknown scenario '$s'" ;; esac
   done
   for t in git cargo hyperfine jq; do have "$t" || die "$t is not installed"; done
-  if any_selected test-ws-incremental test-ws-sccache test-crate-incremental test-crate-sccache test-crate-cold; then
+  if any_selected test-ws-incremental test-ws-sccache test-crate-incremental test-crate-tuned test-crate-sccache test-crate-cold; then
     cargo nextest --version >/dev/null 2>&1 || die "cargo-nextest is not installed (cargo install cargo-nextest --locked)"
   fi
   if any_selected test-ws-sccache test-crate-sccache test-crate-cold; then
@@ -353,6 +362,12 @@ prepare_repo() {
     log "Cloning NautilusTrader into $REPO_DIR"
     git clone https://github.com/nautechsystems/nautilus_trader "$REPO_DIR"
   fi
+  if [ -n "$VARIANT_PATCH" ]; then
+    [ -f "$VARIANT_PATCH" ] || die "VARIANT_PATCH $VARIANT_PATCH not found"
+    cp "$VARIANT_PATCH" "$RESULTS_DIR/variant.patch"
+    VARIANT_PATCH="$RESULTS_DIR/variant.patch"
+    export VARIANT_PATCH
+  fi
   if [ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal)" ]; then
     die "$REPO_DIR has local changes; use a clean checkout dedicated to benchmarking"
   fi
@@ -386,7 +401,10 @@ prepare_repo() {
 
   CHANGE_FILES="$RESULTS_DIR/change.files"
   git -C "$REPO_DIR" apply --numstat "$PATCH_FILE" | cut -f3 | grep -v ' => ' > "$CHANGE_FILES" || true
-  git -C "$REPO_DIR" apply --check "$PATCH_FILE" || die "the edit does not apply cleanly on $BASE_SHA"
+  if [ -n "$VARIANT_PATCH" ]; then
+    git -C "$REPO_DIR" apply "$VARIANT_PATCH" || die "VARIANT_PATCH does not apply on $BASE_SHA"
+  fi
+  git -C "$REPO_DIR" apply --check "$PATCH_FILE" || die "the edit does not apply cleanly on $BASE_SHA (+ variant)"
   export PATCH_FILE CHANGE_FILES BASE_SHA
 
   if [ -z "${PKG_FEATURES+x}" ]; then
@@ -436,6 +454,8 @@ record_environment() {
     echo "package=$PACKAGE"
     echo "pkg_features=$PKG_FEATURES"
     echo "features=$FEATURES"
+    echo "variant_patch=${VARIANT_PATCH:+$(basename "$VARIANT_PATCH") $( (sha256sum "$VARIANT_PATCH" 2>/dev/null || shasum -a 256 "$VARIANT_PATCH") | cut -c1-12)}"
+    echo "tuned_test_threads=$TUNED_TEST_THREADS"
     echo "pyo3_python=${PYO3_PYTHON:-}"
     echo "cmd_release=cargo build ${BUILD_WS[*]} --release --timings -j {jobs}"
     echo "cmd_debug_ws=cargo build ${BUILD_WS[*]} -j {jobs}"
@@ -506,16 +526,17 @@ main() {
   prepare_repo
   cargo_arg_arrays
   record_environment
-  trap 'reset_to_base >/dev/null 2>&1 || true' EXIT
+  # On exit leave the checkout exactly at BASE_SHA (without the variant), so the next run starts clean.
+  trap 'VARIANT_PATCH="" reset_to_base >/dev/null 2>&1 || true' EXIT
 
   # Fast, per-crate scenarios first (the inner development loop), then workspace-wide ones,
   # then the clean release build. sccache-cold runs last among the tests: it empties target/nextest.
-  if any_selected test-ws-incremental test-ws-sccache test-crate-incremental test-crate-sccache test-crate-cold; then
+  if any_selected test-ws-incremental test-ws-sccache test-crate-incremental test-crate-tuned test-crate-sccache test-crate-cold; then
     sanity_test_pass
   fi
 
   local s
-  for s in test-crate-incremental debug-crate test-crate-sccache test-ws-incremental debug-ws test-ws-sccache; do
+  for s in test-crate-incremental test-crate-tuned debug-crate test-crate-sccache test-ws-incremental debug-ws test-ws-sccache; do
     scenario_selected "$s" || continue
     case "$s" in *-sccache) use_sccache ;; *) use_plain_rustc ;; esac
     case "$s" in
@@ -563,6 +584,6 @@ case "${1:-run}" in
       _timed)            sub_timed "$@" ;;
     esac
     ;;
-  -h|--help|help) sed -n '2,52p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,57p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (try: run, find-commits, help)" ;;
 esac

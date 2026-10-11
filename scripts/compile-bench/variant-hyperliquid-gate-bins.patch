@@ -1,0 +1,91 @@
+diff --git a/crates/adapters/hyperliquid/Cargo.toml b/crates/adapters/hyperliquid/Cargo.toml
+index 46fa71f..cda445a 100644
+--- a/crates/adapters/hyperliquid/Cargo.toml
++++ b/crates/adapters/hyperliquid/Cargo.toml
+@@ -20,6 +20,7 @@ name = "nautilus_hyperliquid"
+ crate-type = ["rlib"]
+ 
+ [features]
++bins = []
+ default = ["high-precision"]
+ arrow = ["dep:arrow", "nautilus-serialization"]
+ examples = ["nautilus-live/node", "nautilus-network/transport-sockudo"]
+@@ -133,48 +134,56 @@ harness = false
+ [[bin]]
+ name = "hyperliquid-http-public"
+ path = "bin/http_public.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-http-private"
+ path = "bin/http_private.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-ws-data"
+ path = "bin/ws_data.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-ws-exec"
+ path = "bin/ws_exec.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-http-exec"
+ path = "bin/http_exec.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-http-user-outcome"
+ path = "bin/http_user_outcome.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-http-outcome-order"
+ path = "bin/http_outcome_order.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-capture-test-data"
+ path = "bin/capture_test_data.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+@@ -182,18 +191,21 @@ test = false
+ [[bin]]
+ name = "hyperliquid-flatten"
+ path = "bin/flatten.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-builder-fee-approve"
+ path = "bin/builder_fee_approve.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
+ [[bin]]
+ name = "hyperliquid-builder-fee-revoke"
+ path = "bin/builder_fee_revoke.rs"
++required-features = ["bins"]
+ doc = false
+ test = false
+ 
