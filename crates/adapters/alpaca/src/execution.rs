@@ -15,6 +15,7 @@
 
 //! Alpaca Trading API execution client for US equities.
 
+mod advanced;
 mod orders;
 mod reports;
 mod updates;
@@ -64,7 +65,7 @@ use serde_json::{Map, Value, json};
 use tokio::{sync::mpsc, time::timeout};
 
 use self::{
-    orders::{order_list_request, order_request},
+    orders::{order_list_request, order_request, replacement_instructions},
     reports::{Account, BrokerOrder, FillActivity, Position},
     updates::{OrderState, TradeUpdate},
 };
@@ -165,7 +166,7 @@ impl AlpacaExecutionClient {
         let emitter = self.emitter.clone();
         let state = Arc::clone(&self.orders);
 
-        {
+        let advanced_id = {
             let mut state = self.order_state()?;
             for order in &orders {
                 self.emitter.try_emit_order_submitted(order)?;
@@ -174,17 +175,26 @@ impl AlpacaExecutionClient {
             if grouped {
                 state.begin_group();
             }
-        }
+            body.get("advanced_instructions").map(|instructions| {
+                let id = orders[0].client_order_id().to_string();
+                state.stage_advanced_instructions(id.clone(), instructions.clone());
+                id
+            })
+        };
 
         let original_orders = orders.clone();
+        let staged_id = advanced_id.clone();
         let result = self.spawn("submit_order", async move {
             let result = http.post::<BrokerOrder, _>("/v2/orders", &body).await;
             let mut state = lock_state(&state)?;
             let result = match result {
                 Ok(order) if grouped => state.bind_group(&order, &orders),
-                Ok(_) => Ok(()),
+                Ok(order) => state.remember_advanced_instructions(&order),
                 Err(error) => {
                     if let CommandFailure::VenueRejected(reason) = classify(&error) {
+                        if let Some(id) = staged_id {
+                            state.forget_advanced_request(&id);
+                        }
                         for order in &orders {
                             emitter.emit_order_rejected(order, &reason, now(), false);
                         }
@@ -199,8 +209,12 @@ impl AlpacaExecutionClient {
         });
 
         if let Err(error) = result {
+            let mut state = self.order_state()?;
+            if let Some(id) = advanced_id {
+                state.forget_advanced_request(&id);
+            }
             if grouped {
-                self.order_state()?.complete_group(&self.emitter);
+                state.complete_group(&self.emitter);
             }
             let reason = CommandFailure::not_sent(error.to_string());
             if let CommandFailure::NotSent(reason) = reason {
@@ -397,12 +411,14 @@ impl ExecutionClient for AlpacaExecutionClient {
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         let http = self.http.clone();
         let emitter = self.emitter.clone();
+        let state = Arc::clone(&self.orders);
         let venue_id = self
             .order_state()?
             .venue_for(cmd.client_order_id)
             .or(cmd.venue_order_id);
         self.spawn("query_order", async move {
             if let Some(order) = reports::order(&http, Some(cmd.client_order_id), venue_id).await? {
+                lock_state(&state)?.remember_advanced_instructions(&order)?;
                 emitter.send_order_status_report(order.to_report(
                     emitter.account_id(),
                     Some(cmd.client_order_id),
@@ -463,7 +479,25 @@ impl ExecutionClient for AlpacaExecutionClient {
             }
         };
 
+        let existing = self.order_state()?.advanced_instructions(venue_id).cloned();
+        let advanced =
+            match replacement_instructions(&order, existing.as_ref(), cmd.params.as_ref()) {
+                Ok(instructions) => instructions,
+                Err(error) => {
+                    self.emitter.emit_order_modify_denied(
+                        &order,
+                        &error.to_string(),
+                        now(),
+                        cmd.causation_id,
+                    );
+                    return Ok(());
+                }
+            };
+
         let mut payload = Map::new();
+        if let Some(instructions) = &advanced {
+            payload.insert("advanced_instructions".to_owned(), instructions.clone());
+        }
         if let Some(qty) = cmd.quantity {
             if qty.as_decimal().fract().is_zero() && !qty.is_zero() {
                 payload.insert("qty".to_string(), json!(qty.to_string()));
@@ -504,29 +538,42 @@ impl ExecutionClient for AlpacaExecutionClient {
         {
             let mut state = self.order_state()?;
             state.register(order.clone());
-            state.register_alias(replacement_client_id, order.client_order_id());
+            state.register_alias(replacement_client_id.clone(), order.client_order_id());
+            if let Some(instructions) = advanced.or(existing) {
+                state.stage_advanced_instructions(replacement_client_id.clone(), instructions);
+            }
         }
 
         let http = self.http.clone();
         let emitter = self.emitter.clone();
-        self.spawn("modify_order", async move {
-            if let Err(error) = http
+        let state = Arc::clone(&self.orders);
+        let staged_id = replacement_client_id.clone();
+        let result = self.spawn("modify_order", async move {
+            match http
                 .patch::<BrokerOrder, _>(&format!("/v2/orders/{venue_id}"), &payload)
                 .await
             {
-                if let CommandFailure::VenueRejected(reason) = classify(&error) {
-                    emitter.emit_order_modify_rejected(
-                        &order,
-                        Some(venue_id),
-                        &reason,
-                        now(),
-                        cmd.causation_id,
-                    );
+                Ok(replacement) => lock_state(&state)?.remember_advanced_instructions(&replacement),
+                Err(error) => {
+                    if let CommandFailure::VenueRejected(reason) = classify(&error) {
+                        lock_state(&state)?.forget_advanced_request(&staged_id);
+                        emitter.emit_order_modify_rejected(
+                            &order,
+                            Some(venue_id),
+                            &reason,
+                            now(),
+                            cmd.causation_id,
+                        );
+                    }
+                    Err(error)
                 }
-                return Err(error);
             }
-            Ok(())
-        })
+        });
+        if result.is_err() {
+            self.order_state()?
+                .forget_advanced_request(&replacement_client_id);
+        }
+        result
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
@@ -617,9 +664,11 @@ impl ExecutionClient for AlpacaExecutionClient {
         if !order.equity() {
             return Ok(None);
         }
+        let mut state = self.order_state()?;
+        state.remember_advanced_instructions(&order)?;
         let client_id = cmd
             .client_order_id
-            .or(self.order_state()?.broker_order_client_id(&order)?)
+            .or(state.broker_order_client_id(&order)?)
             .or(Some(order.client_id()?));
         Ok(Some(order.to_report(
             self.core.account_id,
@@ -640,11 +689,12 @@ impl ExecutionClient for AlpacaExecutionClient {
             cmd.end,
         )
         .await?;
-        let state = self.order_state()?;
+        let mut state = self.order_state()?;
         orders
             .into_iter()
             .filter(|order| order.equity() && order.replaced_by.is_none())
             .map(|order| {
+                state.remember_advanced_instructions(&order)?;
                 let client_id = state
                     .broker_order_client_id(&order)?
                     .or(Some(order.client_id()?));

@@ -27,6 +27,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::reports::{BrokerOrder, order_side, quantity, timestamp, trade_id};
 use crate::provider::instrument_id;
@@ -93,6 +94,8 @@ pub(super) struct OrderState {
     tracked: HashMap<ClientOrderId, TrackedOrder>,
     venue_client_ids: HashMap<VenueOrderId, ClientOrderId>,
     broker_client_ids: HashMap<String, ClientOrderId>,
+    advanced_instructions: HashMap<VenueOrderId, Value>,
+    pending_advanced_instructions: HashMap<String, Value>,
     pending_groups: usize,
     deferred_group_updates: Vec<TradeUpdate>,
 }
@@ -117,6 +120,51 @@ impl OrderState {
 
     pub(super) fn register_alias(&mut self, broker_id: String, client_id: ClientOrderId) {
         self.broker_client_ids.insert(broker_id, client_id);
+    }
+
+    pub(super) fn stage_advanced_instructions(
+        &mut self,
+        broker_client_id: String,
+        instructions: Value,
+    ) {
+        self.pending_advanced_instructions
+            .insert(broker_client_id, instructions);
+    }
+
+    pub(super) fn forget_advanced_request(&mut self, broker_client_id: &str) {
+        self.pending_advanced_instructions.remove(broker_client_id);
+    }
+
+    pub(super) fn advanced_instructions(&self, venue_id: VenueOrderId) -> Option<&Value> {
+        self.advanced_instructions.get(&venue_id)
+    }
+
+    pub(super) fn remember_advanced_instructions(
+        &mut self,
+        order: &BrokerOrder,
+    ) -> anyhow::Result<()> {
+        let staged = self
+            .pending_advanced_instructions
+            .remove(&order.client_order_id);
+        let reported = order
+            .advanced_instructions
+            .as_ref()
+            .filter(|instructions| instructions["algorithm"].is_string());
+        if let Some(instructions) = reported.cloned().or(staged) {
+            self.advanced_instructions
+                .insert(order.venue_id()?, instructions);
+        } else if let Some(replaces) = &order.replaces
+            && let Some(original) = self
+                .advanced_instructions
+                .get(&VenueOrderId::new_checked(replaces)?)
+                .cloned()
+        {
+            // The broker can omit preserved instructions on a replacement
+            self.advanced_instructions
+                .entry(order.venue_id()?)
+                .or_insert(original);
+        }
+        Ok(())
     }
 
     pub(super) fn venue_for(&self, client_id: ClientOrderId) -> Option<VenueOrderId> {
@@ -158,6 +206,7 @@ impl OrderState {
         order: &BrokerOrder,
         report: &nautilus_model::reports::OrderStatusReport,
     ) -> anyhow::Result<()> {
+        self.remember_advanced_instructions(order)?;
         if let Some(client_id) = report.client_order_id
             && let Some(tracked) = self.tracked.get_mut(&client_id)
         {
@@ -237,6 +286,7 @@ impl OrderState {
             return Ok(());
         }
 
+        self.remember_advanced_instructions(&update.order)?;
         let client_id = self.broker_order_client_id(&update.order)?;
         if client_id.is_none() && self.pending_groups > 0 {
             self.deferred_group_updates.push(update);
@@ -504,6 +554,67 @@ mod tests {
             .unwrap();
         assert_eq!(fill.trade_id, report.trade_id);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn advanced_replacement_keeps_metadata_scoped_to_broker_order_id() {
+        let (mut state, emitter, _) = execution_rig();
+        let client_id = ClientOrderId::from("client-id");
+        let initial = serde_json::json!({"algorithm": "VWAP", "max_percentage": "0.1"});
+        let changed = serde_json::json!({"algorithm": "VWAP", "max_percentage": "0.2"});
+        state.stage_advanced_instructions(client_id.to_string(), initial.clone());
+        state
+            .handle(update("new", "new", "venue-a", "client-id"), &emitter)
+            .unwrap();
+
+        state.register_alias("replace-alias".to_string(), client_id);
+        state.stage_advanced_instructions("replace-alias".to_string(), changed.clone());
+        let mut replacement = update("new", "new", "venue-b", "replace-alias");
+        replacement.order.replaces = Some("venue-a".to_string());
+        state.handle(replacement, &emitter).unwrap();
+
+        let mut stale = update("new", "new", "venue-a", "client-id");
+        stale.order.advanced_instructions = Some(initial.clone());
+        state.handle(stale, &emitter).unwrap();
+        assert_eq!(
+            state.advanced_instructions("venue-a".into()),
+            Some(&initial)
+        );
+        assert_eq!(
+            state.advanced_instructions("venue-b".into()),
+            Some(&changed)
+        );
+
+        let mut ordinary_replace = update("new", "new", "venue-c", "other-alias");
+        ordinary_replace.order.replaces = Some("venue-b".to_string());
+        state.handle(ordinary_replace, &emitter).unwrap();
+        assert_eq!(
+            state.advanced_instructions("venue-c".into()),
+            Some(&changed)
+        );
+    }
+
+    #[rstest]
+    fn snapshot_recovers_instructions_for_an_untracked_order() {
+        let mut state = OrderState::default();
+        let mut order = update("new", "new", "venue-a", "external-id").order;
+        let instructions = serde_json::json!({"algorithm": "DMA", "destination": "ARCA"});
+        order.advanced_instructions = Some(instructions.clone());
+        let report = order
+            .to_report(
+                AccountId::from("ALPACA-001"),
+                Some(ClientOrderId::from("external-id")),
+                UnixNanos::default(),
+            )
+            .unwrap();
+
+        state.apply_snapshot(&order, &report).unwrap();
+        order.advanced_instructions = None;
+        state.apply_snapshot(&order, &report).unwrap();
+        assert_eq!(
+            state.advanced_instructions("venue-a".into()),
+            Some(&instructions)
+        );
     }
 
     #[rstest]

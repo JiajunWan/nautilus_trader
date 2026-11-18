@@ -23,6 +23,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::orders::{parse_order_status, parse_order_type, parse_time_in_force};
 use crate::{http::AlpacaHttpClient, provider::instrument_id};
@@ -75,6 +76,7 @@ pub(super) struct BrokerOrder {
     pub replaced_by: Option<String>,
     pub replaces: Option<String>,
     pub legs: Option<Vec<BrokerOrder>>,
+    pub advanced_instructions: Option<Value>,
 }
 
 impl BrokerOrder {

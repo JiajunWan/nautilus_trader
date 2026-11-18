@@ -27,12 +27,45 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
+use super::advanced::AdvancedInstructions;
+
 pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
     ensure!(
         order.contingency_type().is_none() && order.parent_order_id().is_none(),
         "Submit Alpaca contingent orders as an order list",
     );
-    equity_request(order, extended_hours(params)?)
+    let extended = extended_hours(params)?;
+    let mut request = equity_request(order, extended)?;
+    if let Some(instructions) = AdvancedInstructions::from_params(params)? {
+        instructions.validate_order(order.order_type(), order.time_in_force(), extended)?;
+        request["order_class"] = json!("simple");
+        request["advanced_instructions"] = serde_json::to_value(instructions)?;
+    }
+    Ok(request)
+}
+
+pub(super) fn replacement_instructions(
+    order: &OrderAny,
+    existing: Option<&Value>,
+    params: Option<&Params>,
+) -> anyhow::Result<Option<Value>> {
+    let algorithm = existing
+        .and_then(|value| value.get("algorithm"))
+        .and_then(Value::as_str);
+    ensure!(
+        algorithm != Some("DMA"),
+        "Alpaca DMA orders do not support replacement",
+    );
+
+    let Some(instructions) = AdvancedInstructions::from_params(params)? else {
+        return Ok(None);
+    };
+    ensure!(
+        matches!(algorithm, Some("VWAP" | "TWAP")) && algorithm == Some(instructions.algorithm()),
+        "Alpaca replacement instructions require a known original order with the same VWAP or TWAP algorithm",
+    );
+    instructions.validate_order(order.order_type(), order.time_in_force(), false)?;
+    Ok(Some(serde_json::to_value(instructions)?))
 }
 
 pub(super) fn order_list_request(
@@ -46,6 +79,10 @@ pub(super) fn order_list_request(
     ensure!(
         !extended_hours(params)?,
         "Alpaca order groups do not support extended hours",
+    );
+    ensure!(
+        AdvancedInstructions::from_params(params)?.is_none(),
+        "Alpaca advanced instructions require a simple equity order",
     );
 
     let entry = orders.iter().find(|order| {
@@ -376,6 +413,121 @@ mod tests {
         let order = order_builder(OrderType::Market, "ORDER-1").build();
         let params = Params::new([("extended_hours".to_string(), json!(true))].into());
         assert!(order_request(&order, Some(&params)).is_err());
+    }
+
+    #[rstest]
+    #[case::moo(TimeInForce::AtTheOpen, "opg")]
+    #[case::moc(TimeInForce::AtTheClose, "cls")]
+    #[case::ioc(TimeInForce::Ioc, "ioc")]
+    fn maps_premium_market_tif(#[case] time_in_force: TimeInForce, #[case] expected: &str) {
+        let order = order_builder(OrderType::Market, "ORDER-1")
+            .time_in_force(time_in_force)
+            .build();
+        let body = order_request(&order, None).unwrap();
+        assert_eq!(body["type"], "market");
+        assert_eq!(body["time_in_force"], expected);
+        assert!(body.get("advanced_instructions").is_none());
+    }
+
+    #[rstest]
+    #[case::vwap(
+        OrderType::Market,
+        false,
+        json!({"algorithm": "VWAP", "max_percentage": "0.125"})
+    )]
+    #[case::twap(
+        OrderType::Limit,
+        false,
+        json!({"algorithm": "TWAP", "max_percentage": "0.25"})
+    )]
+    #[case::dma(
+        OrderType::Limit,
+        true,
+        json!({"algorithm": "DMA", "destination": "ARCA", "display_qty": "100"})
+    )]
+    fn attaches_elite_instructions_to_simple_order(
+        #[case] order_type: OrderType,
+        #[case] extended: bool,
+        #[case] instructions: Value,
+    ) {
+        let mut builder = order_builder(order_type, "ORDER-1");
+        builder.quantity(Quantity::from(100));
+        if order_type == OrderType::Limit {
+            builder.price(Price::from("420.12"));
+        }
+        let params = Params::new(
+            [
+                ("extended_hours".to_string(), json!(extended)),
+                ("advanced_instructions".to_string(), instructions.clone()),
+            ]
+            .into(),
+        );
+
+        let body = order_request(&builder.build(), Some(&params)).unwrap();
+        assert_eq!(body["order_class"], "simple");
+        assert_eq!(body["time_in_force"], "day");
+        assert_eq!(body["advanced_instructions"], instructions);
+    }
+
+    #[rstest]
+    fn denies_advanced_instructions_on_auction_order() {
+        let order = order_builder(OrderType::Market, "ORDER-1")
+            .time_in_force(TimeInForce::AtTheOpen)
+            .build();
+        let params =
+            Params::new([("advanced_instructions".into(), json!({"algorithm": "VWAP"}))].into());
+        assert!(order_request(&order, Some(&params)).is_err());
+    }
+
+    #[rstest]
+    #[case::vwap("VWAP")]
+    #[case::twap("TWAP")]
+    fn replaces_scheduled_instructions_with_a_complete_object(#[case] algorithm: &str) {
+        let order = order_builder(OrderType::Market, "ORDER-1").build();
+        let original = json!({"algorithm": algorithm, "max_percentage": "0.2"});
+        let replacement = json!({
+            "algorithm": algorithm,
+            "end_time": "2026-11-18T20:00:00Z",
+            "max_percentage": "0.3",
+        });
+        let params =
+            Params::new([("advanced_instructions".to_owned(), replacement.clone())].into());
+        assert_eq!(
+            replacement_instructions(&order, Some(&original), Some(&params)).unwrap(),
+            Some(replacement),
+        );
+        assert_eq!(
+            replacement_instructions(&order, Some(&original), None).unwrap(),
+            None,
+        );
+    }
+
+    #[rstest]
+    #[case::unknown(None)]
+    #[case::other_algorithm(Some(json!({"algorithm": "TWAP"})))]
+    #[case::dma(Some(json!({"algorithm": "DMA", "destination": "ARCA"})))]
+    fn cannot_add_or_switch_algorithm_on_replacement(#[case] existing: Option<Value>) {
+        let order = order_builder(OrderType::Market, "ORDER-1").build();
+        let params = Params::new(
+            [(
+                "advanced_instructions".to_owned(),
+                json!({"algorithm": "VWAP"}),
+            )]
+            .into(),
+        );
+        assert!(replacement_instructions(&order, existing.as_ref(), Some(&params)).is_err());
+    }
+
+    #[rstest]
+    fn denies_dma_price_change_even_when_advanced_instructions_are_omitted() {
+        let order = order_builder(OrderType::Market, "ORDER-1").build();
+        let existing = json!({"algorithm": "DMA", "destination": "NYSE"});
+        let error = replacement_instructions(&order, Some(&existing), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DMA orders do not support replacement")
+        );
     }
 
     #[rstest]
