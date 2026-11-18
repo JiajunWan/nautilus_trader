@@ -479,6 +479,7 @@ impl ExecutionClient for AlpacaExecutionClient {
                     now(),
                 )? {
                     state.remember_advanced_instructions(&order)?;
+                    state.confirm_replacement(&order, &emitter, report.ts_last)?;
                     emitter.send_order_status_report(report);
                 }
             }
@@ -622,7 +623,11 @@ impl ExecutionClient for AlpacaExecutionClient {
                 .patch::<BrokerOrder, _>(&format!("/v2/orders/{venue_id}"), &payload)
                 .await
             {
-                Ok(replacement) => lock_state(&state)?.remember_advanced_instructions(&replacement),
+                Ok(replacement) => {
+                    let mut state = lock_state(&state)?;
+                    state.remember_advanced_instructions(&replacement)?;
+                    state.confirm_replacement(&replacement, &emitter, now())
+                }
                 Err(error) => {
                     if let CommandFailure::VenueRejected(reason) = classify(&error) {
                         lock_state(&state)?.forget_advanced_request(&staged_id);
@@ -733,8 +738,9 @@ impl ExecutionClient for AlpacaExecutionClient {
         let mut state = self.order_state()?;
         let report =
             state.order_report(&order, self.core.account_id, cmd.client_order_id, now())?;
-        if report.is_some() {
+        if let Some(report) = &report {
             state.remember_advanced_instructions(&order)?;
+            state.confirm_replacement(&order, &self.emitter, report.ts_last)?;
         }
         Ok(report)
     }

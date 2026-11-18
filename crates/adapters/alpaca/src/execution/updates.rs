@@ -200,6 +200,53 @@ impl OrderState {
             .or_else(|| original_venue_id.and_then(|id| self.client_for(id))))
     }
 
+    pub(super) fn confirm_replacement(
+        &mut self,
+        order: &BrokerOrder,
+        emitter: &ExecutionEventEmitter,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let Some(predecessor) = order.replaces.as_deref() else {
+            return Ok(());
+        };
+        if order.replaced_by.is_some()
+            || !order.supported()
+            || !matches!(
+                order.status.as_str(),
+                "new" | "accepted" | "partially_filled" | "filled"
+            )
+        {
+            return Ok(());
+        }
+        let Some(client_id) = self.broker_order_client_id(order)? else {
+            return Ok(());
+        };
+        let Some(tracked) = self.tracked.get_mut(&client_id) else {
+            return Ok(());
+        };
+        let venue_id = order.venue_id()?;
+        if tracked.status.is_closed()
+            || tracked
+                .active_venue_id
+                .is_none_or(|active| active == venue_id || active.as_str() != predecessor)
+        {
+            return Ok(());
+        }
+        let report = order.to_report(emitter.account_id(), Some(client_id), ts_event)?;
+        tracked.active_venue_id = Some(venue_id);
+        self.venue_client_ids.insert(venue_id, client_id);
+        emitter.emit_order_updated(
+            &tracked.order,
+            venue_id,
+            report.quantity,
+            report.price,
+            report.trigger_price,
+            None,
+            ts_event,
+        );
+        Ok(())
+    }
+
     pub(super) fn combo_order(&self, order: &BrokerOrder) -> anyhow::Result<Option<&OrderAny>> {
         if !order.is_combo() {
             return Ok(None);
@@ -478,6 +525,7 @@ impl OrderState {
             return Ok(());
         };
 
+        self.confirm_replacement(&update.order, emitter, ts_event)?;
         self.venue_client_ids.insert(venue_id, client_id);
         let tracked = self
             .tracked
@@ -495,31 +543,6 @@ impl OrderState {
                 emitter.send_fill_report(fill);
             }
             return Ok(());
-        }
-
-        if let Some(original_id) = update.order.replaces.as_deref()
-            && tracked
-                .active_venue_id
-                .is_some_and(|active| active.as_str() == original_id)
-            && tracked.active_venue_id != Some(venue_id)
-            && matches!(
-                update.event.as_str(),
-                "new" | "accepted" | "fill" | "partial_fill"
-            )
-        {
-            let report = update
-                .order
-                .to_report(emitter.account_id(), Some(client_id), ts_event)?;
-            emitter.emit_order_updated(
-                &tracked.order,
-                venue_id,
-                report.quantity,
-                report.price,
-                report.trigger_price,
-                None,
-                ts_event,
-            );
-            tracked.active_venue_id = Some(venue_id);
         }
 
         if tracked
@@ -795,6 +818,58 @@ mod tests {
             state.advanced_instructions("venue-a".into()),
             Some(&instructions)
         );
+    }
+
+    #[rstest]
+    fn confirmed_rest_replacements_rebind_successive_updates_once() {
+        let (mut state, emitter, mut rx) = execution_rig();
+        let client_id = ClientOrderId::from("client-id");
+        state
+            .handle(update("new", "new", "venue-a", "client-id"), &emitter)
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Accepted(_))
+        ));
+
+        let mut quantity = update("new", "pending_new", "venue-b", "quantity-id");
+        quantity.order.replaces = Some("venue-a".to_owned());
+        quantity.order.qty = Some(Decimal::from(2));
+        state
+            .confirm_replacement(&quantity.order, &emitter, 0.into())
+            .unwrap();
+        assert_eq!(state.venue_for(client_id), Some("venue-a".into()));
+        assert!(rx.try_recv().is_err());
+
+        quantity.order.status = "new".to_owned();
+        state
+            .confirm_replacement(&quantity.order, &emitter, 0.into())
+            .unwrap();
+        assert_eq!(state.venue_for(client_id), Some("venue-b".into()));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Updated(event))
+            if event.venue_order_id == Some("venue-b".into()) && event.quantity == Quantity::from(2)
+        ));
+        state.handle(quantity, &emitter).unwrap();
+
+        let mut price = update("new", "new", "venue-c", "price-id");
+        price.order.replaces = Some("venue-b".to_owned());
+        price.order.qty = Some(Decimal::from(2));
+        price.order.limit_price = Some(Decimal::from(495));
+        state
+            .confirm_replacement(&price.order, &emitter, 0.into())
+            .unwrap();
+        assert_eq!(state.venue_for(client_id), Some("venue-c".into()));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Updated(event))
+            if event.venue_order_id == Some("venue-c".into())
+                && event.quantity == Quantity::from(2)
+                && event.price == Some(Price::from("495"))
+        ));
+        state.handle(price, &emitter).unwrap();
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
