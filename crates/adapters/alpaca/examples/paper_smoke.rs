@@ -26,6 +26,8 @@
 //! extended-hours orders.
 //! Use `-- --advanced-checks` to submit and cancel one-share stop, stop-limit,
 //! trailing-stop, and bracket orders in sequence.
+//! Use `-- --suite PRICE` for a regular limit, extended-hours round trip, and
+//! advanced checks on one connection.
 //! Use `-- --history YYYY-MM-DD` to verify bars from all four sessions of a completed
 //! New York trading day. Prefix other modes with `--iex` for IEX-only data.
 //! A separate market data entitlement can be supplied using
@@ -33,7 +35,7 @@
 //! For history-only testing, `ALPACA_HISTORY_MOCK_ASSET_PORT` can select an asset
 //! fixture server on localhost when only market data credentials are available.
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
 
 use anyhow::{Result, bail, ensure};
 use jiff::{
@@ -70,16 +72,32 @@ enum Mode {
 }
 
 impl Mode {
-    fn parse() -> Result<(Self, bool)> {
+    fn parse() -> Result<(VecDeque<Self>, bool)> {
         let mut args = std::env::args().skip(1).peekable();
         let iex_only = args.next_if(|arg| arg == "--iex").is_some();
         let args: Vec<_> = args.collect();
+        if let [mode, price] = args.as_slice()
+            && mode == "--suite"
+        {
+            return Ok((
+                [
+                    Self::Limit {
+                        price: parse_limit_price(price)?,
+                        extended_hours: false,
+                    },
+                    Self::ExtendedRoundTrip,
+                    Self::AdvancedChecks,
+                ]
+                .into(),
+                iex_only,
+            ));
+        }
         let mode = match args.as_slice() {
             [] => Self::Data,
             [mode, day] if mode == "--history" && !iex_only => Self::History(day.parse()?),
             [mode, price] if matches!(mode.as_str(), "--regular-limit" | "--extended-limit") => {
                 Self::Limit {
-                    price: price.parse().map_err(anyhow::Error::msg)?,
+                    price: parse_limit_price(price)?,
                     extended_hours: mode == "--extended-limit",
                 }
             }
@@ -95,10 +113,10 @@ impl Mode {
             [mode] if mode == "--extended-round-trip" => Self::ExtendedRoundTrip,
             [mode] if mode == "--advanced-checks" => Self::AdvancedChecks,
             _ => bail!(
-                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --extended-round-trip, --advanced-checks, or --history YYYY-MM-DD (SIP + BOATS)",
+                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --extended-round-trip, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
             ),
         };
-        Ok((mode, iex_only))
+        Ok(([mode].into(), iex_only))
     }
 }
 
@@ -115,6 +133,7 @@ struct Observation {
 struct PaperSmoke {
     core: StrategyCore,
     mode: Mode,
+    remaining_modes: VecDeque<Mode>,
     instrument_id: InstrumentId,
     bar_type: BarType,
     node: LiveNodeHandle,
@@ -272,7 +291,18 @@ impl PaperSmoke {
         self.submit(order, None)
     }
 
-    fn finish_execution(&self, result: Result<(), String>) {
+    fn finish_execution(&mut self, result: Result<(), String>) {
+        if result.is_ok() {
+            log::info!("Paper workflow complete: {:?}", self.mode);
+            if let Some(next) = self.remaining_modes.pop_front() {
+                self.mode = next;
+                self.submitted = false;
+                self.round_trip_buy_filled = false;
+                self.advanced_checked = 0;
+                log::info!("Starting paper workflow: {next:?}");
+                return;
+            }
+        }
         self.observation.borrow_mut().execution = Some(result);
         self.maybe_stop();
     }
@@ -513,6 +543,15 @@ const ADVANCED_CHECKS: [&str; 4] = [
     "BRACKET",
 ];
 
+fn parse_limit_price(price: &str) -> Result<Price> {
+    let price: Price = price.parse().map_err(anyhow::Error::msg)?;
+    ensure!(
+        price.as_decimal() > Decimal::ZERO,
+        "Paper limit price must be positive"
+    );
+    Ok(price)
+}
+
 fn fresh_prices(quote: &QuoteTick) -> Option<(Decimal, Decimal)> {
     let bid = quote.bid_price.as_decimal();
     let ask = quote.ask_price.as_decimal();
@@ -527,7 +566,9 @@ fn extended_hours_params(extended_hours: bool) -> Params {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (mode, iex_only) = Mode::parse()?;
+    let (mut modes, iex_only) = Mode::parse()?;
+    let mode = modes.pop_front().expect("At least one smoke mode");
+    let suite = !modes.is_empty();
     let history = matches!(mode, Mode::History(_));
     let proxy_url = std::env::var("ALPACA_SMOKE_PROXY_URL")
         .ok()
@@ -609,6 +650,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         }),
         mode,
+        remaining_modes: modes,
         instrument_id: InstrumentId::from("SPY.ALPACA"),
         bar_type: BarType::from("SPY.ALPACA-1-MINUTE-LAST-EXTERNAL"),
         node: handle.clone(),
@@ -620,7 +662,7 @@ async fn main() -> Result<()> {
     })?;
 
     let deadline = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(120)).await;
+        tokio::time::sleep(Duration::from_secs(if suite { 180 } else { 120 })).await;
         handle.stop();
     });
     let result = node.run().await;
@@ -645,7 +687,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Timed out waiting for the paper order workflow"))?
             .map_err(anyhow::Error::msg)?;
     }
-    if matches!(mode, Mode::AdvancedChecks) {
+    if suite || matches!(mode, Mode::AdvancedChecks) {
         ensure!(observed.quote, "No SPY quote received");
         return Ok(());
     }

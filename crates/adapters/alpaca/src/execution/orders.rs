@@ -391,6 +391,47 @@ mod tests {
     }
 
     #[rstest]
+    #[case::oto(true, "oto")]
+    #[case::oco(false, "oco")]
+    fn encodes_two_order_contingencies(#[case] has_entry: bool, #[case] expected: &str) {
+        let list_id = OrderListId::new("GROUP-2");
+        let root_id = ClientOrderId::new("ROOT");
+        let stop_id = ClientOrderId::new("STOP");
+        let root_contingency = if has_entry {
+            ContingencyType::Oto
+        } else {
+            ContingencyType::Oco
+        };
+        let root = order_builder(OrderType::Limit, "ROOT")
+            .price(Price::from("422.00"))
+            .side(if has_entry {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            })
+            .order_list_id(list_id)
+            .linked_order_ids(vec![stop_id])
+            .contingency_type(root_contingency)
+            .build();
+        let mut stop = order_builder(OrderType::StopMarket, "STOP");
+        stop.side(OrderSide::Sell)
+            .trigger_price(Price::from("420.00"))
+            .order_list_id(list_id);
+        if has_entry {
+            stop.parent_order_id(root_id);
+        } else {
+            stop.contingency_type(ContingencyType::Oco)
+                .linked_order_ids(vec![root_id]);
+        }
+
+        let body = order_list_request(&[root, stop.build()], None).unwrap();
+        assert_eq!(body["order_class"], expected);
+        assert_eq!(body["stop_loss"]["stop_price"], "420");
+        assert_eq!(body.get("take_profit").is_some(), !has_entry);
+        assert_eq!(body.get("limit_price").is_some(), has_entry);
+    }
+
+    #[rstest]
     fn encodes_bracket_as_one_request() {
         let entry_id = ClientOrderId::new("ENTRY");
         let limit_id = ClientOrderId::new("TAKE-PROFIT");

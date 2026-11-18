@@ -62,6 +62,8 @@ bars. The second requests one trading day across all four sessions. Use
 submit-and-cancel test, or `--market-round-trip` during regular hours for a
 one-share paper round trip. `--extended-round-trip` uses marketable extended
 limits, and `--advanced-checks` submits and cancels the stop, stop-limit,
-trailing-stop and bracket smoke orders. Set `ALPACA_SMOKE_PROXY_URL` when
+trailing-stop and bracket smoke orders. Use `--suite PRICE` to run the regular
+limit, extended round trip and advanced checks over one connection. Choose a
+regular-limit price below the current bid. Set `ALPACA_SMOKE_PROXY_URL` when
 the connection requires an HTTP CONNECT proxy. The example always uses the
 Paper trading endpoint for trading.
