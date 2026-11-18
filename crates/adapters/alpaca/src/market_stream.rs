@@ -109,10 +109,16 @@ impl StockStream {
         url: String,
         feed: &'static str,
         credential: AlpacaCredentials,
+        proxy_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let (handler, input) = channel_epoch_message_handler();
         let socket = WebSocketClient::epoch_builder()
-            .config(WebSocketConfig::builder().url(url).build()?)
+            .config(
+                WebSocketConfig::builder()
+                    .url(url)
+                    .maybe_proxy_url(proxy_url.map(str::to_owned))
+                    .build()?,
+            )
             .epoch_handler(handler)
             .connect()
             .await
@@ -306,19 +312,22 @@ fn dispatch(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> 
         let id = instrument_id(symbol)?;
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let data = match header.kind {
-            "q" => {
-                Data::Quote(serde_json::from_str::<StockQuote>(message.get())?.tick(id, ts_init)?)
-            }
-            "t" => {
-                Data::Trade(serde_json::from_str::<StockTrade>(message.get())?.tick(id, ts_init)?)
-            }
+            "q" => Data::Quote(
+                serde_json::from_str::<StockQuote>(message.get())?.tick(id, Some(ts_init))?,
+            ),
+            "t" => Data::Trade(
+                serde_json::from_str::<StockTrade>(message.get())?.tick(id, Some(ts_init))?,
+            ),
             "b" => {
                 let bar_type = BarType::new(
                     id,
                     BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
                     AggregationSource::External,
                 );
-                Data::Bar(serde_json::from_str::<StockBar>(message.get())?.bar(bar_type, ts_init)?)
+                Data::Bar(
+                    serde_json::from_str::<StockBar>(message.get())?
+                        .bar(bar_type, Some(ts_init))?,
+                )
             }
             _ => unreachable!(),
         };

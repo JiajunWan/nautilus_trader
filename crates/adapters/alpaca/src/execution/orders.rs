@@ -272,14 +272,14 @@ fn equity_request(order: &OrderAny, extended: bool) -> anyhow::Result<Value> {
 fn limit_price(order: &OrderAny) -> anyhow::Result<String> {
     order
         .price()
-        .map(|price| price.to_string())
+        .map(|price| price.as_decimal().normalize().to_string())
         .context("Missing Alpaca limit price")
 }
 
 fn stop_price(order: &OrderAny) -> anyhow::Result<String> {
     order
         .trigger_price()
-        .map(|price| price.to_string())
+        .map(|price| price.as_decimal().normalize().to_string())
         .context("Missing Alpaca stop price")
 }
 
@@ -357,7 +357,7 @@ mod tests {
         #[case] is_extended: bool,
     ) {
         let order = order_builder(OrderType::Limit, "ORDER-1")
-            .price(Price::from("420.12"))
+            .price(Price::from("420.1200"))
             .time_in_force(time_in_force)
             .build();
         let params = Params::new([("extended_hours".to_string(), json!(is_extended))].into());
@@ -422,8 +422,8 @@ mod tests {
         let body = order_list_request(&[entry, take_profit, stop_loss], None).unwrap();
         assert_eq!(body["client_order_id"], "ENTRY");
         assert_eq!(body["order_class"], "bracket");
-        assert_eq!(body["take_profit"]["limit_price"], "422.00");
-        assert_eq!(body["stop_loss"]["stop_price"], "420.00");
-        assert_eq!(body["stop_loss"]["limit_price"], "419.50");
+        assert_eq!(body["take_profit"]["limit_price"], "422");
+        assert_eq!(body["stop_loss"]["stop_price"], "420");
+        assert_eq!(body["stop_loss"]["limit_price"], "419.5");
     }
 }

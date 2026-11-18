@@ -18,7 +18,7 @@
 use anyhow::{Context, ensure};
 use nautilus_core::{UnixNanos, datetime::iso8601_to_unix_nanos};
 use nautilus_model::{
-    data::{Bar, BarType, QuoteTick, TradeTick},
+    data::{Bar, BarType, QuoteTick, TradeTick, bar::get_bar_interval_ns},
     enums::{AggressorSide, BarAggregation, PriceType},
     identifiers::{InstrumentId, TradeId},
     types::{Price, Quantity},
@@ -52,17 +52,22 @@ pub(crate) struct StockQuote {
 }
 
 impl StockQuote {
-    pub(crate) fn tick(&self, id: InstrumentId, ts_init: UnixNanos) -> anyhow::Result<QuoteTick> {
+    pub(crate) fn tick(
+        &self,
+        id: InstrumentId,
+        ts_init: Option<UnixNanos>,
+    ) -> anyhow::Result<QuoteTick> {
         let price_precision = self.bid.scale().max(self.ask.scale()).max(4) as u8;
         let size_precision = self.bid_size.scale().max(self.ask_size.scale()) as u8;
+        let ts_event = iso8601_to_unix_nanos(&self.time)?;
         QuoteTick::new_checked(
             id,
             Price::from_decimal_dp(self.bid, price_precision)?,
             Price::from_decimal_dp(self.ask, price_precision)?,
             Quantity::from_decimal_dp(self.bid_size, size_precision)?,
             Quantity::from_decimal_dp(self.ask_size, size_precision)?,
-            iso8601_to_unix_nanos(&self.time)?,
-            ts_init,
+            ts_event,
+            ts_init.unwrap_or(ts_event),
         )
     }
 }
@@ -82,7 +87,11 @@ pub(crate) struct StockTrade {
 }
 
 impl StockTrade {
-    pub(crate) fn tick(&self, id: InstrumentId, ts_init: UnixNanos) -> anyhow::Result<TradeTick> {
+    pub(crate) fn tick(
+        &self,
+        id: InstrumentId,
+        ts_init: Option<UnixNanos>,
+    ) -> anyhow::Result<TradeTick> {
         let ts_event = iso8601_to_unix_nanos(&self.time)?;
         let trade_id = TradeId::new_checked(format!(
             "{:x}:{:x}:{}",
@@ -97,7 +106,7 @@ impl StockTrade {
             AggressorSide::NoAggressor,
             trade_id,
             ts_event,
-            ts_init,
+            ts_init.unwrap_or(ts_event),
         )
     }
 }
@@ -119,7 +128,7 @@ pub(crate) struct StockBar {
 }
 
 impl StockBar {
-    pub(crate) fn bar(&self, bar_type: BarType, ts_init: UnixNanos) -> anyhow::Result<Bar> {
+    pub(crate) fn bar(&self, bar_type: BarType, ts_init: Option<UnixNanos>) -> anyhow::Result<Bar> {
         let precision = self
             .open
             .scale()
@@ -127,6 +136,11 @@ impl StockBar {
             .max(self.low.scale())
             .max(self.close.scale())
             .max(4) as u8;
+        let ts_event = iso8601_to_unix_nanos(&self.time)?;
+        let ts_init = match ts_init {
+            Some(received) => received,
+            None => historical_bar_close(ts_event, bar_type)?,
+        };
         Bar::new_checked(
             bar_type,
             Price::from_decimal_dp(self.open, precision)?,
@@ -134,10 +148,24 @@ impl StockBar {
             Price::from_decimal_dp(self.low, precision)?,
             Price::from_decimal_dp(self.close, precision)?,
             Quantity::from_decimal(self.volume)?,
-            iso8601_to_unix_nanos(&self.time)?,
+            ts_event,
             ts_init,
         )
     }
+}
+
+// Alpaca historical bars are timestamped at the start of their window.
+fn historical_bar_close(start: UnixNanos, bar_type: BarType) -> anyhow::Result<UnixNanos> {
+    let spec = bar_type.spec();
+    let step = i64::try_from(spec.step.get())?;
+    let span = match spec.aggregation {
+        BarAggregation::Day => jiff::Span::new().days(step),
+        BarAggregation::Week => jiff::Span::new().weeks(step),
+        BarAggregation::Month => jiff::Span::new().months(step),
+        _ => return Ok(start + get_bar_interval_ns(&bar_type)),
+    };
+    let start = jiff::Timestamp::from(start).in_tz("America/New_York")?;
+    Ok(start.checked_add(span)?.timestamp().into())
 }
 
 pub(crate) fn timeframe(bar_type: BarType) -> anyhow::Result<String> {
@@ -263,14 +291,34 @@ mod tests {
     use super::*;
 
     #[rstest]
+    #[case(
+        "SPY.ALPACA-1-MINUTE-LAST-EXTERNAL",
+        "2026-11-16T15:00:00Z",
+        "2026-11-16T15:01:00Z"
+    )]
+    #[case(
+        "SPY.ALPACA-1-DAY-LAST-EXTERNAL",
+        "2026-03-08T05:00:00Z",
+        "2026-03-09T04:00:00Z"
+    )]
+    fn historical_bar_init_is_at_the_end_of_its_window(
+        #[case] bar_type: &str,
+        #[case] start: &str,
+        #[case] end: &str,
+    ) {
+        let bar_type = BarType::from(bar_type);
+        let start = iso8601_to_unix_nanos(start).unwrap();
+        let end = iso8601_to_unix_nanos(end).unwrap();
+        assert_eq!(historical_bar_close(start, bar_type).unwrap(), end);
+    }
+
+    #[rstest]
     fn decodes_the_documented_stock_trade_without_float_conversion() {
         // Alpaca real-time stock data trade schema example.
         let body = r#"{"T":"t","i":96921,"S":"AAPL","x":"D","p":126.55,"s":1,
                        "t":"2021-02-22T15:51:44.208Z","c":["@","I"],"z":"C"}"#;
         let trade: StockTrade = serde_json::from_str(body).unwrap();
-        let tick = trade
-            .tick(InstrumentId::from("AAPL.ALPACA"), UnixNanos::default())
-            .unwrap();
+        let tick = trade.tick(InstrumentId::from("AAPL.ALPACA"), None).unwrap();
 
         assert_eq!(tick.price, Price::from("126.5500"));
         assert_eq!(tick.size, Quantity::from(1));

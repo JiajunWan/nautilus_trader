@@ -34,7 +34,8 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    Params, UUID4, UnixNanos, datetime::datetime_to_unix_nanos, time::get_atomic_clock_realtime,
+    Params, UUID4, UnixNanos, datetime::datetime_to_unix_nanos, string::secret::SecretString,
+    time::get_atomic_clock_realtime,
 };
 use nautilus_live::task::TaskGroup;
 use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
@@ -48,7 +49,7 @@ use crate::{
     http::AlpacaHttpClient,
     market_data::{HistoryKind, HistoryRequest, StockQuote, StockTrade, historical, timeframe},
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
-    provider::{load_asset, load_assets},
+    provider::{load_asset, load_assets, load_selected_assets},
 };
 
 /// Native equity quotes, trades, bars and instrument definitions from Alpaca.
@@ -77,11 +78,13 @@ impl AlpacaDataClient {
             config.trading_http_url(),
             &credentials,
             config.http_timeout_secs,
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
         )?;
         let market = AlpacaHttpClient::new(
             config.market_http_url(),
             &market_credentials,
             config.http_timeout_secs,
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
         )?;
         Ok(Self {
             client_id,
@@ -218,7 +221,11 @@ impl DataClient for AlpacaDataClient {
         }
 
         let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let assets = load_assets(&self.trading).await?;
+        let assets = load_selected_assets(&self.trading, &self.config.load_symbols)
+            .await
+            .inspect_err(|error| {
+                log::error!("Loading Alpaca equity definitions: {error:#}");
+            })?;
         for asset in assets {
             self.sender
                 .send(DataEvent::Data(asset.instrument(ts_init)?.into()))
@@ -232,18 +239,28 @@ impl DataClient for AlpacaDataClient {
             format!("{ws_origin}{}", feed.ws_path()),
             feed.as_str(),
             market_credentials.clone(),
+            self.config
+                .proxy_url
+                .as_ref()
+                .map(SecretString::expose_secret),
         )
-        .await?;
+        .await
+        .inspect_err(|error| log::error!("Connecting Alpaca daytime data: {error:#}"))?;
         let overnight = if let Some(feed) = self.config.overnight_feed {
             match StockStream::connect(
                 format!("{ws_origin}{}", feed.ws_path()),
                 feed.as_str(),
                 market_credentials,
+                self.config
+                    .proxy_url
+                    .as_ref()
+                    .map(SecretString::expose_secret),
             )
             .await
             {
                 Ok(stream) => Some(stream),
                 Err(error) => {
+                    log::error!("Connecting Alpaca overnight data: {error:#}");
                     main.socket().disconnect().await;
                     return Err(error);
                 }
@@ -488,9 +505,8 @@ impl DataClient for AlpacaDataClient {
                     feed,
                 )
                 .await?;
-                let ts_init = clock.get_time_ns();
                 for row in rows {
-                    bars.push(row.bar(bar_type, ts_init)?);
+                    bars.push(row.bar(bar_type, None)?);
                 }
             }
             bars.sort_by_key(|bar| bar.ts_event);
@@ -524,16 +540,14 @@ async fn stock_tick_history<W: DeserializeOwned, T>(
     ids: &[InstrumentId],
     kind: HistoryKind,
     spec: &HistoryRequest,
-    parse: fn(&W, InstrumentId, UnixNanos) -> anyhow::Result<T>,
+    parse: fn(&W, InstrumentId, Option<UnixNanos>) -> anyhow::Result<T>,
 ) -> anyhow::Result<Vec<T>> {
-    let clock = get_atomic_clock_realtime();
     let mut ticks = Vec::new();
     for &id in ids {
         for &feed in &spec.feeds {
             let rows = historical::<W>(http, id, kind, spec, feed).await?;
-            let ts_init = clock.get_time_ns();
             for row in rows {
-                ticks.push(parse(&row, id, ts_init)?);
+                ticks.push(parse(&row, id, None)?);
             }
         }
     }

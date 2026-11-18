@@ -13,8 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Live execution client implementation for the Coinbase Advanced Trade adapter.
-
 //! Alpaca Trading API execution client for US equities.
 
 mod orders;
@@ -24,7 +22,10 @@ mod updates;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -39,7 +40,10 @@ use nautilus_common::{
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
-use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{
+    DurationNanos, Params, UUID4, UnixNanos, string::secret::SecretString,
+    time::get_atomic_clock_realtime,
+};
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter, execution::failure::CommandFailure, task::TaskGroup,
 };
@@ -80,9 +84,11 @@ pub struct AlpacaExecutionClient {
     core: ExecutionClientCore,
     credentials: AlpacaCredentials,
     ws_url: String,
+    proxy_url: Option<SecretString>,
     http: AlpacaHttpClient,
     emitter: ExecutionEventEmitter,
     socket: Option<Arc<WebSocketClient>>,
+    ready_epoch: Arc<AtomicU64>,
     orders: Arc<Mutex<OrderState>>,
     tasks: TaskGroup,
 }
@@ -102,6 +108,7 @@ impl AlpacaExecutionClient {
             config.trading_http_url(),
             &credentials,
             config.http_timeout_secs,
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
         )?;
         let mut emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
@@ -118,9 +125,11 @@ impl AlpacaExecutionClient {
             core,
             credentials,
             ws_url: config.private_ws_url().to_string(),
+            proxy_url: config.proxy_url.clone(),
             http,
             emitter,
             socket: None,
+            ready_epoch: Arc::new(AtomicU64::new(u64::MAX)),
             orders: Arc::new(Mutex::new(OrderState::default())),
             tasks: TaskGroup::new(),
         })
@@ -144,6 +153,13 @@ impl AlpacaExecutionClient {
     }
 
     fn submit(&self, orders: Vec<OrderAny>, body: Value) -> anyhow::Result<()> {
+        if !self.is_connected() {
+            for order in &orders {
+                self.emitter
+                    .emit_order_denied(order, "Alpaca trade update stream is unavailable");
+            }
+            return Ok(());
+        }
         let grouped = orders.len() > 1;
         let http = self.http.clone();
         let emitter = self.emitter.clone();
@@ -227,10 +243,10 @@ impl AlpacaExecutionClient {
 impl ExecutionClient for AlpacaExecutionClient {
     fn is_connected(&self) -> bool {
         self.core.is_connected()
-            && self
-                .socket
-                .as_ref()
-                .is_some_and(|socket| socket.is_active())
+            && self.socket.as_ref().is_some_and(|socket| {
+                socket.is_active()
+                    && socket.connection_epoch() == self.ready_epoch.load(Ordering::Acquire)
+            })
     }
 
     fn client_id(&self) -> ClientId {
@@ -303,6 +319,11 @@ impl ExecutionClient for AlpacaExecutionClient {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let config = WebSocketConfig::builder()
             .url(self.ws_url.clone())
+            .maybe_proxy_url(
+                self.proxy_url
+                    .as_ref()
+                    .map(|url| url.expose_secret().to_owned()),
+            )
             .heartbeat_interval_secs(30)
             .build()?;
         let socket = Arc::new(
@@ -335,7 +356,9 @@ impl ExecutionClient for AlpacaExecutionClient {
             emitter: self.emitter.clone(),
             state: Arc::clone(&self.orders),
             last_seen: now(),
+            ready_epoch: Arc::clone(&self.ready_epoch),
         };
+        self.ready_epoch.store(epoch, Ordering::Release);
         if let Err(error) = self.spawn("trade_updates", task.run(rx)) {
             socket.disconnect().await;
             return Err(error);
@@ -418,6 +441,15 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let order = self.core.get_order(&cmd.client_order_id)?;
+        if !self.is_connected() {
+            self.emitter.emit_order_modify_denied(
+                &order,
+                "Alpaca trade update stream is unavailable",
+                now(),
+                cmd.causation_id,
+            );
+            return Ok(());
+        }
         let venue_id = match self.active_order_id(&order, cmd.venue_order_id) {
             Ok(venue_id) => venue_id,
             Err(error) => {
@@ -446,10 +478,16 @@ impl ExecutionClient for AlpacaExecutionClient {
             }
         }
         if let Some(price) = cmd.price {
-            payload.insert("limit_price".to_string(), json!(price.to_string()));
+            payload.insert(
+                "limit_price".to_string(),
+                json!(price.as_decimal().normalize().to_string()),
+            );
         }
         if let Some(price) = cmd.trigger_price {
-            payload.insert("stop_price".to_string(), json!(price.to_string()));
+            payload.insert(
+                "stop_price".to_string(),
+                json!(price.as_decimal().normalize().to_string()),
+            );
         }
         if payload.is_empty() {
             self.emitter.emit_order_modify_denied(
@@ -744,6 +782,7 @@ struct StreamTask {
     emitter: ExecutionEventEmitter,
     state: Arc<Mutex<OrderState>>,
     last_seen: UnixNanos,
+    ready_epoch: Arc<AtomicU64>,
 }
 
 impl StreamTask {
@@ -759,6 +798,7 @@ impl StreamTask {
                     self.socket.disconnect().await;
                     return Err(error);
                 }
+                self.ready_epoch.store(epoch, Ordering::Release);
                 continue;
             }
             if frame.is_control() || epoch != self.socket.connection_epoch() {
@@ -781,6 +821,7 @@ impl StreamTask {
                 Err(error) => log::error!("Invalid Alpaca private WebSocket frame: {error}"),
             }
         }
+        self.ready_epoch.store(u64::MAX, Ordering::Release);
         anyhow::bail!("Alpaca private WebSocket message stream closed")
     }
 

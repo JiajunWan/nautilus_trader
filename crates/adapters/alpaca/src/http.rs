@@ -46,6 +46,7 @@ impl AlpacaHttpClient {
         base_url: &str,
         credentials: &AlpacaCredentials,
         timeout_secs: u64,
+        proxy_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let mut headers: std::collections::HashMap<_, _> =
             create_standard_nautilus_headers().into_iter().collect();
@@ -60,6 +61,7 @@ impl AlpacaHttpClient {
         let client = HttpClient::builder()
             .headers(headers)
             .timeout_secs(timeout_secs)
+            .maybe_proxy_url(proxy_url.map(str::to_owned))
             .redirect_policy(HttpRedirectPolicy::Reject)
             .build()?;
         Ok(Self {

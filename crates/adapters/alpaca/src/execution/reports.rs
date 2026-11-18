@@ -13,8 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Live execution client implementation for the Coinbase Advanced Trade adapter.
-
 use anyhow::{Context, ensure};
 use nautilus_core::UnixNanos;
 use nautilus_model::{

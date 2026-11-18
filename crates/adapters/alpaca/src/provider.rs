@@ -96,6 +96,20 @@ pub(crate) async fn load_asset(
     Ok(asset)
 }
 
+pub(crate) async fn load_selected_assets(
+    http: &AlpacaHttpClient,
+    symbols: &[String],
+) -> anyhow::Result<Vec<AlpacaAsset>> {
+    if symbols.is_empty() {
+        return load_assets(http).await;
+    }
+    let ids = symbols
+        .iter()
+        .map(|symbol| instrument_id(symbol))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    futures_util::future::try_join_all(ids.into_iter().map(|id| load_asset(http, id))).await
+}
+
 pub(crate) async fn load_assets(http: &AlpacaHttpClient) -> anyhow::Result<Vec<AlpacaAsset>> {
     http.get(
         "/v2/assets",

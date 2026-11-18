@@ -13,8 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Live execution client implementation for the Coinbase Advanced Trade adapter.
-
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, ensure};

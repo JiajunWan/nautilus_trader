@@ -46,6 +46,9 @@ pub struct AlpacaDataClientConfig {
     pub market_data_api_key: Option<SecretString>,
     /// Market data secret override.
     pub market_data_api_secret: Option<SecretString>,
+    /// Stock symbols to load at startup. An empty list loads all active equities.
+    #[builder(default)]
+    pub load_symbols: Vec<String>,
     /// Daytime market data feed.
     #[builder(default)]
     pub stock_feed: AlpacaStockFeed,
@@ -57,6 +60,8 @@ pub struct AlpacaDataClientConfig {
     pub base_url_http_trading: Option<String>,
     /// Public market data WebSocket origin override.
     pub base_url_ws_public: Option<String>,
+    /// Optional proxy for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
     /// HTTP request timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
@@ -138,6 +143,8 @@ pub struct AlpacaExecutionClientConfig {
     pub base_url_http: Option<String>,
     /// Private order update WebSocket URL override.
     pub base_url_ws_private: Option<String>,
+    /// Optional proxy for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
     /// HTTP request timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
