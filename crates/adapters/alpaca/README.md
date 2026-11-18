@@ -157,9 +157,23 @@ submit-and-cancel test. During regular hours, use `--market-round-trip` or
 `--limit-round-trip` for a one-share buy and sell using DAY orders. Run
 `--extended-round-trip` (DAY) or `--extended-gtc-round-trip` (GTC) in the
 pre-market, after-hours, or overnight session to test marketable limit orders
-with extended hours enabled on both legs. Begin each
-round trip with a flat SPY position and verify the terminal fills and flat
-position in Paper afterward.
+with extended hours enabled on both legs. These extended-hours modes use SPY
+by default. Prefix the mode with `--symbol SYMBOL` to select another equity.
+Begin each round trip with a flat position in that equity and verify both
+terminal fills and the final position in Paper.
+
+For an Elite DMA submit-and-cancel check, use `--extended-dma-limit NASDAQ|ARCA PRICE`.
+Choose a limit price below the current bid. The strategy submits a one-share DAY
+buy with extended hours enabled, logs the destination and client order ID, and
+requests cancellation on acceptance. For example, after building
+`alpaca-paper-smoke`, the following commands select QQQ. Set `LIMIT_PRICE` to
+your chosen resting price before running the DMA check.
+
+```sh
+target/debug/examples/alpaca-paper-smoke --symbol QQQ --extended-round-trip
+target/debug/examples/alpaca-paper-smoke --symbol QQQ --extended-gtc-round-trip
+target/debug/examples/alpaca-paper-smoke --symbol QQQ --extended-dma-limit NASDAQ "$LIMIT_PRICE"
+```
 
 To check carryover, use `--hold-limit DAY PRICE` during the overnight session
 or `--hold-limit GTC PRICE` on the first trading date. Choose a resting buy

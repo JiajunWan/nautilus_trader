@@ -24,6 +24,8 @@
 //! or `-- --limit-round-trip` to buy and sell one paper share.
 //! Use `-- --extended-round-trip` (DAY) or `-- --extended-gtc-round-trip` (GTC)
 //! to buy and sell one paper share with price-capped extended-hours orders.
+//! Prefix extended limit and round-trip modes with `--symbol SYMBOL` to select an equity.
+//! Use `--extended-dma-limit NASDAQ|ARCA PRICE` to submit and cancel a routed DAY limit.
 //! Use `-- --hold-limit DAY|GTC PRICE` to leave one nonmarketable, extended-hours
 //! order open. Verify and cancel it using `-- --verify-carryover DAY|GTC UUID`, or
 //! cancel it directly using `-- --cancel-carryover UUID`.
@@ -48,7 +50,10 @@ use jiff::{
     civil::{Date, time},
 };
 use nautilus_alpaca::{
-    common::enums::{AlpacaEnvironment, AlpacaOvernightFeed, AlpacaStockFeed},
+    common::{
+        ALPACA_VENUE,
+        enums::{AlpacaEnvironment, AlpacaOvernightFeed, AlpacaStockFeed},
+    },
     config::{AlpacaDataClientConfig, AlpacaExecutionClientConfig},
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
 };
@@ -59,7 +64,7 @@ use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType},
     events::{OrderAccepted, OrderCanceled, OrderDenied, OrderFilled, OrderRejected},
-    identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
+    identifiers::{ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId},
     orders::{Order, OrderAny},
     types::{Price, Quantity},
 };
@@ -72,12 +77,40 @@ mod auction;
 mod carryover;
 
 #[derive(Debug, Clone, Copy)]
+enum LimitRoute {
+    Regular,
+    Extended,
+    Dma(&'static str),
+}
+
+impl LimitRoute {
+    fn params(self) -> Params {
+        match self {
+            Self::Regular => extended_hours_params(false),
+            Self::Extended => extended_hours_params(true),
+            Self::Dma(destination) => Params::new(
+                [
+                    ("extended_hours".into(), true.into()),
+                    (
+                        "advanced_instructions".into(),
+                        serde_json::json!({
+                            "algorithm": "DMA", "destination": destination,
+                        }),
+                    ),
+                ]
+                .into(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 enum Mode {
     Data,
     History(Date),
     Limit {
         price: Price,
-        extended_hours: bool,
+        route: LimitRoute,
     },
     MarketRoundTrip,
     LimitRoundTrip {
@@ -92,7 +125,7 @@ enum Mode {
 }
 
 impl Mode {
-    fn parse(args: Vec<String>) -> Result<(VecDeque<Self>, bool)> {
+    fn parse(args: Vec<String>) -> Result<(VecDeque<Self>, bool, Symbol)> {
         let mut args = args.into_iter().peekable();
         let iex_only = args.next_if(|arg| arg == "--iex").is_some();
         let args: Vec<_> = args.collect();
@@ -103,7 +136,7 @@ impl Mode {
                 [
                     Self::Limit {
                         price: parse_limit_price(price)?,
-                        extended_hours: false,
+                        route: LimitRoute::Regular,
                     },
                     Self::LimitRoundTrip {
                         extended_hours: true,
@@ -113,15 +146,37 @@ impl Mode {
                 ]
                 .into(),
                 iex_only,
+                Symbol::from("SPY"),
             ));
         }
-        let mode = match args.as_slice() {
+        let (symbol, args) = match args.as_slice() {
+            [flag, value, tail @ ..] if flag == "--symbol" => {
+                (Some(Symbol::new_checked(value)?), tail)
+            }
+            args => (None, args),
+        };
+        let mode = match args {
             [] => Self::Data,
             [mode, day] if mode == "--history" && !iex_only => Self::History(day.parse()?),
             [mode, price] if matches!(mode.as_str(), "--regular-limit" | "--extended-limit") => {
                 Self::Limit {
                     price: parse_limit_price(price)?,
-                    extended_hours: mode == "--extended-limit",
+                    route: if mode == "--extended-limit" {
+                        LimitRoute::Extended
+                    } else {
+                        LimitRoute::Regular
+                    },
+                }
+            }
+            [mode, destination, price] if mode == "--extended-dma-limit" => {
+                let destination = match destination.as_str() {
+                    "NASDAQ" => "NASDAQ",
+                    "ARCA" => "ARCA",
+                    _ => bail!("Extended-hours DMA destination must be NASDAQ or ARCA"),
+                };
+                Self::Limit {
+                    price: parse_limit_price(price)?,
+                    route: LimitRoute::Dma(destination),
                 }
             }
             [mode] if matches!(mode.as_str(), "--market-round-trip" | "--limit-round-trip") => {
@@ -166,10 +221,28 @@ impl Mode {
             }
             [mode] if mode == "--advanced-checks" => Self::AdvancedChecks,
             _ => bail!(
-                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --limit-round-trip, --extended-round-trip, --extended-gtc-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
+                "Expected [--iex] [--symbol SYMBOL] and --regular-limit PRICE, --extended-limit PRICE, --extended-dma-limit NASDAQ|ARCA PRICE, --market-round-trip, --limit-round-trip, --extended-round-trip, --extended-gtc-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
             ),
         };
-        Ok(([mode].into(), iex_only))
+        ensure!(
+            symbol.is_none()
+                || matches!(
+                    mode,
+                    Self::Limit {
+                        route: LimitRoute::Extended | LimitRoute::Dma(_),
+                        ..
+                    } | Self::LimitRoundTrip {
+                        extended_hours: true,
+                        ..
+                    }
+                ),
+            "--symbol requires an extended limit or extended round-trip mode",
+        );
+        Ok((
+            [mode].into(),
+            iex_only,
+            symbol.unwrap_or_else(|| Symbol::from("SPY")),
+        ))
     }
 }
 
@@ -560,12 +633,15 @@ impl DataActor for PaperSmoke {
                     time_in_force,
                 } => self.submit_limit_round_trip(quote, extended_hours, time_in_force),
                 Mode::AdvancedChecks => self.submit_advanced_check(quote),
-                Mode::Limit {
-                    price,
-                    extended_hours,
-                } if price < quote.bid_price => {
+                Mode::Limit { price, route } if price < quote.bid_price => {
                     let order = self.limit_order(OrderSide::Buy, price, TimeInForce::Day, None);
-                    self.submit(order, Some(extended_hours_params(extended_hours)))
+                    if let LimitRoute::Dma(destination) = route {
+                        log::info!(
+                            "Paper DMA submitting {destination} {}",
+                            order.client_order_id()
+                        );
+                    }
+                    self.submit(order, Some(route.params()))
                 }
                 Mode::Carryover {
                     price,
@@ -736,19 +812,18 @@ async fn main() -> Result<()> {
             Ok((target.duration_since(now) + SignedDuration::from_mins(4)).try_into()?)
         })
         .transpose()?;
-    let (mut modes, iex_only) = if auction.is_some() {
-        (VecDeque::new(), false)
+    let (mut modes, iex_only, symbol) = if auction.is_some() {
+        (
+            VecDeque::new(),
+            false,
+            Symbol::from(auction::INSTRUMENT_SYMBOL),
+        )
     } else {
         Mode::parse(args)?
     };
     let mode = modes.pop_front();
     let suite = !modes.is_empty();
     let history = matches!(mode, Some(Mode::History(_)));
-    let symbol = if auction.is_some() {
-        auction::INSTRUMENT_SYMBOL
-    } else {
-        "SPY"
-    };
     let relay_port = std::env::var("ALPACA_SMOKE_WS_PORT")
         .ok()
         .map(|port| port.parse::<u16>())
@@ -831,6 +906,7 @@ async fn main() -> Result<()> {
     }
 
     let mode = mode.expect("At least one smoke mode");
+    let instrument_id = InstrumentId::new(symbol, *ALPACA_VENUE);
     let observation = Rc::new(RefCell::new(Observation::default()));
     node.add_strategy(PaperSmoke {
         core: StrategyCore::new(StrategyConfig {
@@ -839,8 +915,8 @@ async fn main() -> Result<()> {
         }),
         mode,
         remaining_modes: modes,
-        instrument_id: InstrumentId::from("SPY.ALPACA"),
-        bar_type: BarType::from("SPY.ALPACA-1-MINUTE-LAST-EXTERNAL"),
+        instrument_id,
+        bar_type: format!("{instrument_id}-1-MINUTE-LAST-EXTERNAL").parse()?,
         node: node.handle(),
         observation: Rc::clone(&observation),
         active_order: None,
@@ -879,7 +955,7 @@ async fn main() -> Result<()> {
     }
     ensure!(
         observed.quote && observed.trade && observed.bar,
-        "Incomplete SPY data: quote={}, trade={}, bar={}",
+        "Incomplete {symbol} data: quote={}, trade={}, bar={}",
         observed.quote,
         observed.trade,
         observed.bar,
@@ -894,14 +970,59 @@ mod tests {
     use super::*;
 
     #[rstest]
-    #[case("--extended-round-trip", TimeInForce::Day)]
-    #[case("--extended-gtc-round-trip", TimeInForce::Gtc)]
-    fn extended_round_trip_time_in_force(#[case] flag: &str, #[case] expected: TimeInForce) {
-        let (modes, _) = Mode::parse(vec![flag.into()]).unwrap();
+    #[case(&["--extended-round-trip"], "SPY", TimeInForce::Day)]
+    #[case(&["--extended-gtc-round-trip"], "SPY", TimeInForce::Gtc)]
+    #[case(&["--symbol", "QQQ", "--extended-round-trip"], "QQQ", TimeInForce::Day)]
+    #[case(&["--symbol", "QQQ", "--extended-gtc-round-trip"], "QQQ", TimeInForce::Gtc)]
+    fn extended_round_trip_time_in_force(
+        #[case] args: &[&str],
+        #[case] ticker: &str,
+        #[case] expected: TimeInForce,
+    ) {
+        let (modes, _, symbol) =
+            Mode::parse(args.iter().map(|arg| (*arg).to_owned()).collect()).unwrap();
+        assert_eq!(symbol.as_str(), ticker);
         assert!(matches!(
             modes.front(),
             Some(Mode::LimitRoundTrip { extended_hours: true, time_in_force })
                 if *time_in_force == expected
         ));
+    }
+
+    #[rstest]
+    #[case("NASDAQ")]
+    #[case("ARCA")]
+    fn extended_dma_limit_uses_selected_destination(#[case] destination: &str) {
+        let args = [
+            "--iex",
+            "--symbol",
+            "QQQ",
+            "--extended-dma-limit",
+            destination,
+            "100",
+        ];
+        let (modes, iex_only, symbol) = Mode::parse(args.map(String::from).into()).unwrap();
+        assert!(iex_only);
+        assert_eq!(symbol.as_str(), "QQQ");
+        let Some(Mode::Limit { price, route }) = modes.front() else {
+            panic!("expected limit mode")
+        };
+        assert_eq!(*price, Price::from("100"));
+        assert_eq!(
+            serde_json::to_value(route.params()).unwrap(),
+            serde_json::json!({
+                "extended_hours": true,
+                "advanced_instructions": { "algorithm": "DMA", "destination": destination }
+            })
+        );
+    }
+
+    #[rstest]
+    #[case(&["--extended-dma-limit", "NYSE", "100"])]
+    #[case(&["--symbol", "QQQ", "--hold-limit", "GTC", "100"])]
+    #[case(&["--symbol", "QQQ", "--auction-check", "open"])]
+    #[case(&["--symbol", "QQQ", "--suite", "100"])]
+    fn rejects_unsupported_paper_modes(#[case] args: &[&str]) {
+        assert!(Mode::parse(args.iter().map(|arg| (*arg).to_owned()).collect()).is_err());
     }
 }
