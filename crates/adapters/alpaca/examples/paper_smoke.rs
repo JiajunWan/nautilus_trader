@@ -21,9 +21,12 @@
 //!
 //! Add `-- --regular-limit PRICE` or `-- --extended-limit PRICE` to submit and cancel
 //! a one-share limit buy below the bid. During regular hours, add `-- --market-round-trip`
-//! to buy and sell one paper share.
+//! or `-- --limit-round-trip` to buy and sell one paper share.
 //! Use `-- --extended-round-trip` to buy and sell one paper share with price-capped
 //! extended-hours orders.
+//! Use `-- --hold-limit DAY|GTC PRICE` to leave one nonmarketable, extended-hours
+//! order open. Verify and cancel it using `-- --verify-carryover DAY|GTC UUID`, or
+//! cancel it directly using `-- --cancel-carryover UUID`.
 //! Use `-- --advanced-checks` to submit and cancel one-share stop, stop-limit,
 //! trailing-stop, and bracket orders in sequence.
 //! Use `-- --suite PRICE` for a regular limit, extended-hours round trip, and
@@ -52,7 +55,7 @@ use nautilus_core::{Params, string::secret::SecretString};
 use nautilus_live::node::{LiveNode, LiveNodeHandle};
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
-    enums::{OrderSide, OrderType, TimeInForce, TrailingOffsetType},
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType},
     events::{OrderAccepted, OrderCanceled, OrderDenied, OrderFilled, OrderRejected},
     identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::{Order, OrderAny},
@@ -61,19 +64,31 @@ use nautilus_model::{
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use rust_decimal::{Decimal, RoundingStrategy};
 
+#[path = "paper_smoke/carryover.rs"]
+mod carryover;
+
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Data,
     History(Date),
-    Limit { price: Price, extended_hours: bool },
+    Limit {
+        price: Price,
+        extended_hours: bool,
+    },
     MarketRoundTrip,
-    ExtendedRoundTrip,
+    LimitRoundTrip {
+        extended_hours: bool,
+    },
+    Carryover {
+        price: Price,
+        time_in_force: TimeInForce,
+    },
     AdvancedChecks,
 }
 
 impl Mode {
-    fn parse() -> Result<(VecDeque<Self>, bool)> {
-        let mut args = std::env::args().skip(1).peekable();
+    fn parse(args: Vec<String>) -> Result<(VecDeque<Self>, bool)> {
+        let mut args = args.into_iter().peekable();
         let iex_only = args.next_if(|arg| arg == "--iex").is_some();
         let args: Vec<_> = args.collect();
         if let [mode, price] = args.as_slice()
@@ -85,7 +100,9 @@ impl Mode {
                         price: parse_limit_price(price)?,
                         extended_hours: false,
                     },
-                    Self::ExtendedRoundTrip,
+                    Self::LimitRoundTrip {
+                        extended_hours: true,
+                    },
                     Self::AdvancedChecks,
                 ]
                 .into(),
@@ -101,19 +118,43 @@ impl Mode {
                     extended_hours: mode == "--extended-limit",
                 }
             }
-            [mode] if mode == "--market-round-trip" => {
+            [mode] if matches!(mode.as_str(), "--market-round-trip" | "--limit-round-trip") => {
                 let now = Timestamp::now().in_tz(NEW_YORK)?;
                 ensure!(
                     now.weekday().to_monday_one_offset() <= 5
                         && (time(9, 30, 0, 0)..time(16, 0, 0, 0)).contains(&now.time()),
-                    "The market round trip requires regular US equity trading hours",
+                    "The regular-session round trip requires regular US equity trading hours",
                 );
-                Self::MarketRoundTrip
+                if mode == "--market-round-trip" {
+                    Self::MarketRoundTrip
+                } else {
+                    Self::LimitRoundTrip {
+                        extended_hours: false,
+                    }
+                }
             }
-            [mode] if mode == "--extended-round-trip" => Self::ExtendedRoundTrip,
+            [mode] if mode == "--extended-round-trip" => Self::LimitRoundTrip {
+                extended_hours: true,
+            },
+            [mode, tif, price] if mode == "--hold-limit" => {
+                let time_in_force = carryover_tif(tif)?;
+                if time_in_force == TimeInForce::Day {
+                    let now = Timestamp::now().in_tz(NEW_YORK)?;
+                    let weekday = now.weekday().to_monday_one_offset();
+                    ensure!(
+                        (weekday <= 5 && now.time() < time(4, 0, 0, 0))
+                            || (matches!(weekday, 1..=4 | 7) && now.time() >= time(20, 0, 0, 0)),
+                        "The DAY carryover order must start in the overnight session",
+                    );
+                }
+                Self::Carryover {
+                    price: parse_limit_price(price)?,
+                    time_in_force,
+                }
+            }
             [mode] if mode == "--advanced-checks" => Self::AdvancedChecks,
             _ => bail!(
-                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --extended-round-trip, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
+                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --limit-round-trip, --extended-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
             ),
         };
         Ok(([mode].into(), iex_only))
@@ -165,13 +206,19 @@ impl PaperSmoke {
         )
     }
 
-    fn limit_order(&self, side: OrderSide, price: Price) -> OrderAny {
+    fn limit_order(
+        &self,
+        side: OrderSide,
+        price: Price,
+        time_in_force: TimeInForce,
+        client_order_id: Option<ClientOrderId>,
+    ) -> OrderAny {
         self.order().limit(
             self.instrument_id,
             side,
             Quantity::from(1),
             price,
-            Some(TimeInForce::Day),
+            Some(time_in_force),
             None,
             None,
             None,
@@ -182,11 +229,11 @@ impl PaperSmoke {
             None,
             None,
             None,
-            None,
+            client_order_id,
         )
     }
 
-    fn submit_extended_round_trip(&mut self, quote: &QuoteTick) -> Result<()> {
+    fn submit_limit_round_trip(&mut self, quote: &QuoteTick, extended_hours: bool) -> Result<()> {
         let Some((bid, ask)) = fresh_prices(quote) else {
             self.submitted = false;
             return Ok(());
@@ -200,8 +247,13 @@ impl PaperSmoke {
             let price = ask.round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity) + cent;
             (OrderSide::Buy, price)
         };
-        let order = self.limit_order(side, Price::from_decimal_dp(price, 2)?);
-        self.submit(order, Some(extended_hours_params(true)))
+        let order = self.limit_order(
+            side,
+            Price::from_decimal_dp(price, 2)?,
+            TimeInForce::Day,
+            None,
+        );
+        self.submit(order, Some(extended_hours_params(extended_hours)))
     }
 
     fn submit_advanced_check(&mut self, quote: &QuoteTick) -> Result<()> {
@@ -310,7 +362,8 @@ impl PaperSmoke {
     fn maybe_stop(&self) {
         let observed = self.observation.borrow();
         let data_complete = observed.quote
-            && (matches!(self.mode, Mode::AdvancedChecks) || (observed.trade && observed.bar));
+            && (matches!(self.mode, Mode::AdvancedChecks | Mode::Carryover { .. })
+                || (observed.trade && observed.bar));
         let execution_complete = matches!(self.mode, Mode::Data) || observed.execution.is_some();
         if (data_complete && execution_complete) || matches!(&observed.execution, Some(Err(_))) {
             self.node.stop();
@@ -321,6 +374,15 @@ impl PaperSmoke {
 nautilus_strategy!(PaperSmoke, {
     fn on_order_accepted(&mut self, event: OrderAccepted) {
         if self.active_order != Some(event.client_order_id) {
+            return;
+        }
+
+        if let Mode::Carryover { time_in_force, .. } = self.mode {
+            log::info!(
+                "Paper {time_in_force} order left open as {}",
+                event.venue_order_id
+            );
+            self.finish_execution(Ok(()));
             return;
         }
 
@@ -363,8 +425,13 @@ nautilus_strategy!(PaperSmoke, {
                     self.submitted = false;
                 }
             }
-            Mode::MarketRoundTrip | Mode::ExtendedRoundTrip => {
+            Mode::MarketRoundTrip | Mode::LimitRoundTrip { .. } => {
                 self.finish_execution(Err("Paper round-trip order canceled before fill".into()));
+            }
+            Mode::Carryover { .. } => {
+                self.finish_execution(Err(
+                    "Paper carryover order canceled before observation".into()
+                ));
             }
             Mode::Data | Mode::History(_) => {}
         }
@@ -386,6 +453,16 @@ nautilus_strategy!(PaperSmoke, {
         if self.active_order != Some(event.client_order_id) {
             return;
         }
+        if matches!(
+            self.mode,
+            Mode::MarketRoundTrip | Mode::LimitRoundTrip { .. }
+        ) && self
+            .cache()
+            .order(&event.client_order_id)
+            .is_some_and(|order| order.status() == OrderStatus::PartiallyFilled)
+        {
+            return;
+        }
 
         self.active_order = None;
         log::info!(
@@ -400,12 +477,12 @@ nautilus_strategy!(PaperSmoke, {
                     self.finish_execution(Err(e.to_string()));
                 }
             }
-            Mode::ExtendedRoundTrip if !self.round_trip_buy_filled => {
+            Mode::LimitRoundTrip { .. } if !self.round_trip_buy_filled => {
                 self.round_trip_buy_filled = true;
                 self.submitted = false;
             }
-            Mode::MarketRoundTrip | Mode::ExtendedRoundTrip => self.finish_execution(Ok(())),
-            Mode::Limit { .. } | Mode::AdvancedChecks => {
+            Mode::MarketRoundTrip | Mode::LimitRoundTrip { .. } => self.finish_execution(Ok(())),
+            Mode::Limit { .. } | Mode::Carryover { .. } | Mode::AdvancedChecks => {
                 self.finish_execution(Err("Paper smoke order filled before cancellation".into()));
             }
             Mode::Data | Mode::History(_) => {}
@@ -432,7 +509,10 @@ impl DataActor for PaperSmoke {
     }
 
     fn on_stop(&mut self) -> Result<()> {
-        if let Some(order_id) = self.active_order
+        let leave_open = matches!(self.mode, Mode::Carryover { .. })
+            && matches!(self.observation.borrow().execution, Some(Ok(())));
+        if !leave_open
+            && let Some(order_id) = self.active_order
             && self
                 .cache()
                 .order(&order_id)
@@ -456,16 +536,45 @@ impl DataActor for PaperSmoke {
             self.submitted = true;
             let result = match self.mode {
                 Mode::Data | Mode::History(_) => Ok(()),
-                Mode::MarketRoundTrip => self.submit(self.market_order(OrderSide::Buy), None),
-                Mode::ExtendedRoundTrip => self.submit_extended_round_trip(quote),
+                Mode::MarketRoundTrip if fresh_prices(quote).is_some() => {
+                    self.submit(self.market_order(OrderSide::Buy), None)
+                }
+                Mode::MarketRoundTrip => {
+                    self.submitted = false;
+                    Ok(())
+                }
+                Mode::LimitRoundTrip { extended_hours } => {
+                    self.submit_limit_round_trip(quote, extended_hours)
+                }
                 Mode::AdvancedChecks => self.submit_advanced_check(quote),
                 Mode::Limit {
                     price,
                     extended_hours,
                 } if price < quote.bid_price => {
-                    let order = self.limit_order(OrderSide::Buy, price);
+                    let order = self.limit_order(OrderSide::Buy, price, TimeInForce::Day, None);
                     self.submit(order, Some(extended_hours_params(extended_hours)))
                 }
+                Mode::Carryover {
+                    price,
+                    time_in_force,
+                } => match fresh_prices(quote) {
+                    Some((bid, _)) if price.as_decimal() < bid => {
+                        let order = self.limit_order(
+                            OrderSide::Buy,
+                            price,
+                            time_in_force,
+                            Some(carryover::client_order_id()),
+                        );
+                        self.submit(order, Some(extended_hours_params(true)))
+                    }
+                    Some((bid, _)) => {
+                        Err(anyhow::anyhow!("Paper limit must be below the bid {bid}"))
+                    }
+                    None => {
+                        self.submitted = false;
+                        Ok(())
+                    }
+                },
                 Mode::Limit { .. } => Err(anyhow::anyhow!(
                     "Paper limit must be below the bid {}",
                     quote.bid_price
@@ -552,6 +661,14 @@ fn parse_limit_price(price: &str) -> Result<Price> {
     Ok(price)
 }
 
+fn carryover_tif(value: &str) -> Result<TimeInForce> {
+    match value.to_ascii_lowercase().as_str() {
+        "day" => Ok(TimeInForce::Day),
+        "gtc" => Ok(TimeInForce::Gtc),
+        _ => bail!("Paper carryover requires DAY or GTC time in force"),
+    }
+}
+
 fn fresh_prices(quote: &QuoteTick) -> Option<(Decimal, Decimal)> {
     let bid = quote.bid_price.as_decimal();
     let ask = quote.ask_price.as_decimal();
@@ -566,13 +683,28 @@ fn extended_hours_params(extended_hours: bool) -> Params {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (mut modes, iex_only) = Mode::parse()?;
-    let mode = modes.pop_front().expect("At least one smoke mode");
-    let suite = !modes.is_empty();
-    let history = matches!(mode, Mode::History(_));
     let proxy_url = std::env::var("ALPACA_SMOKE_PROXY_URL")
         .ok()
         .map(SecretString::from);
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [mode, tif, id] if mode == "--verify-carryover" => {
+            return carryover::verify_and_cancel(
+                id.parse()?,
+                carryover_tif(tif)?,
+                proxy_url.as_ref(),
+            )
+            .await;
+        }
+        [mode, id] if mode == "--cancel-carryover" => {
+            return carryover::cancel(id.parse()?, proxy_url.as_ref()).await;
+        }
+        _ => {}
+    }
+    let (mut modes, iex_only) = Mode::parse(args)?;
+    let mode = modes.pop_front().expect("At least one smoke mode");
+    let suite = !modes.is_empty();
+    let history = matches!(mode, Mode::History(_));
     let relay_port = std::env::var("ALPACA_SMOKE_WS_PORT")
         .ok()
         .map(|port| port.parse::<u16>())
@@ -687,7 +819,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Timed out waiting for the paper order workflow"))?
             .map_err(anyhow::Error::msg)?;
     }
-    if suite || matches!(mode, Mode::AdvancedChecks) {
+    if suite || matches!(mode, Mode::AdvancedChecks | Mode::Carryover { .. }) {
         ensure!(observed.quote, "No SPY quote received");
         return Ok(());
     }

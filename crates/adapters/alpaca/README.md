@@ -111,11 +111,23 @@ cargo run -p nautilus-alpaca --features examples --example alpaca-paper-smoke --
 The first command checks account connection and streams SPY quotes, trades and
 bars. The second requests one trading day across all four sessions. Use
 `--regular-limit PRICE` or `--extended-limit PRICE` for a one-share
-submit-and-cancel test, or `--market-round-trip` during regular hours for a
-one-share paper round trip. `--extended-round-trip` uses marketable extended
-limits, and `--advanced-checks` submits and cancels the stop, stop-limit,
-trailing-stop and bracket smoke orders. Use `--suite PRICE` to run the regular
-limit, extended round trip and advanced checks over one connection. Choose a
-regular-limit price below the current bid. Set `ALPACA_SMOKE_PROXY_URL` when
-the connection requires an HTTP CONNECT proxy. The example always uses the
-Paper trading endpoint for trading.
+submit-and-cancel test. During regular hours, use `--market-round-trip` or
+`--limit-round-trip` for a one-share buy and sell using DAY orders. Run
+`--extended-round-trip` in the pre-market, after-hours, or overnight session
+to test marketable DAY limit orders with extended hours enabled. Begin each
+round trip with a flat SPY position and verify the terminal fills and flat
+position in Paper afterward.
+
+To check carryover, use `--hold-limit DAY PRICE` during the overnight session
+or `--hold-limit GTC PRICE` on the first trading date. Choose a resting buy
+price below the current bid. The smoke strategy leaves one share open after
+acceptance and prints the broker order UUID. Run `--verify-carryover DAY UUID`
+in the following pre-market or `--verify-carryover GTC UUID` on a later trading
+date. This checks the same unfilled order and confirms it cancels. Use
+`--cancel-carryover UUID` to cancel the test order early.
+
+`--advanced-checks` submits and cancels the stop, stop-limit, trailing-stop
+and bracket smoke orders. `--suite PRICE` runs the regular limit, extended
+round trip and advanced checks over one connection. Set `ALPACA_SMOKE_PROXY_URL`
+when the connection requires an HTTP CONNECT proxy. The example uses the
+Paper trading endpoint for all order operations.
