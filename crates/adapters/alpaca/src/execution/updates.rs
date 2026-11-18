@@ -111,8 +111,8 @@ impl OrderState {
         let client_id = order.client_order_id();
         self.broker_client_ids
             .insert(client_id.to_string(), client_id);
-        if let Some(venue_id) = order.venue_order_id() {
-            self.venue_client_ids.insert(venue_id, client_id);
+        for venue_id in order.venue_order_ids() {
+            self.bind_venue_id(*venue_id, client_id);
         }
         self.tracked
             .entry(client_id)
@@ -120,9 +120,13 @@ impl OrderState {
                 status: order.status(),
                 active_venue_id: order.venue_order_id(),
                 last_combo_update: order.ts_last(),
+                fills: order.trade_ids().into_iter().copied().collect(),
                 order,
-                fills: HashSet::new(),
             });
+    }
+
+    pub(super) fn bind_venue_id(&mut self, venue_id: VenueOrderId, client_id: ClientOrderId) {
+        self.venue_client_ids.insert(venue_id, client_id);
     }
 
     pub(super) fn register_alias(&mut self, broker_id: String, client_id: ClientOrderId) {
@@ -400,12 +404,16 @@ impl OrderState {
         report: &nautilus_model::reports::OrderStatusReport,
     ) -> anyhow::Result<()> {
         self.remember_advanced_instructions(order)?;
-        if let Some(client_id) = report.client_order_id
-            && let Some(tracked) = self.tracked.get_mut(&client_id)
-        {
-            self.venue_client_ids.insert(order.venue_id()?, client_id);
-            tracked.active_venue_id = Some(report.venue_order_id);
-            tracked.status = report.order_status;
+        if let Some(client_id) = report.client_order_id {
+            self.bind_venue_id(report.venue_order_id, client_id);
+            if let Some(tracked) = self.tracked.get_mut(&client_id)
+                && !tracked.status.is_closed()
+                && report.ts_last >= tracked.last_combo_update
+            {
+                tracked.active_venue_id = Some(report.venue_order_id);
+                tracked.last_combo_update = report.ts_last;
+                tracked.status = report.order_status;
+            }
         }
         Ok(())
     }
@@ -504,7 +512,7 @@ impl OrderState {
 
         let venue_id = update.order.venue_id()?;
         let ts_event = update.ts_event()?;
-        let Some(client_id) = client_id else {
+        let Some(client_id) = client_id.filter(|id| self.tracked.contains_key(id)) else {
             if matches!(
                 update.event.as_str(),
                 "pending_new" | "pending_cancel" | "pending_replace" | "replaced"
@@ -513,7 +521,7 @@ impl OrderState {
             }
             let report = update.order.to_report(
                 emitter.account_id(),
-                Some(update.order.client_id()?),
+                client_id.or(Some(update.order.client_id()?)),
                 get_atomic_clock_realtime().get_time_ns(),
             )?;
             if update.is_fill() {

@@ -20,11 +20,12 @@ mod advanced;
 mod combo_tests;
 mod combos;
 mod orders;
+mod reconciliation;
 mod reports;
 mod updates;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -54,10 +55,12 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AssetClass, OmsType},
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
+    },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance},
 };
 use nautilus_network::{
@@ -332,6 +335,20 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.core.cache().account_owned(&self.core.account_id)
+    }
+
+    fn register_external_order(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        _instrument_id: InstrumentId,
+        _strategy_id: StrategyId,
+        _ts_init: UnixNanos,
+    ) {
+        match self.order_state() {
+            Ok(mut state) => state.bind_venue_id(venue_order_id, client_order_id),
+            Err(e) => log::error!("Cannot register Alpaca external order {client_order_id}: {e}"),
+        }
     }
 
     fn requires_authoritative_fills(&self) -> bool {
@@ -815,6 +832,37 @@ impl ExecutionClient for AlpacaExecutionClient {
         Ok(result)
     }
 
+    async fn generate_mass_status(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        let ts_init = now();
+        let start = lookback_mins
+            .map(DurationNanos::try_from_mins)
+            .transpose()?
+            .map(|duration| ts_init.saturating_sub(duration));
+        let snapshot = reconciliation::snapshot(&self.http, &self.orders, start, true).await?;
+        let positions: Vec<Position> = self.http.get("/v2/positions", &()).await?;
+        let account_id = self.core.account_id;
+        let mut status =
+            ExecutionMassStatus::new(self.core.client_id, account_id, *ALPACA, ts_init, None);
+        status.set_report_window(start, start.is_some() && snapshot.complete);
+        let mut state = self.order_state()?;
+        let (orders, fills) = snapshot.mass_reports(&mut state, account_id, start, ts_init)?;
+        status.add_order_reports(orders);
+        status.add_fill_reports(fills);
+        status.add_position_reports(
+            positions
+                .into_iter()
+                .filter(|position| {
+                    matches!(position.asset_class.as_str(), "us_equity" | "us_option")
+                })
+                .map(|position| position.to_report(account_id, ts_init))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
+        Ok(Some(status))
+    }
+
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
@@ -930,7 +978,7 @@ impl StreamTask {
             if frame.as_text() == Some(RECONNECTED) {
                 let result = async {
                     authenticate(&self.socket, &mut rx, &self.credentials, epoch).await?;
-                    self.reconcile().await
+                    Box::pin(self.reconcile()).await
                 }
                 .await;
                 if let Err(error) = result {
@@ -992,22 +1040,14 @@ impl StreamTask {
 
     async fn reconcile(&self) -> anyhow::Result<()> {
         let start = self.last_seen.saturating_sub(DurationNanos::from_secs(1));
-        let (mut orders, fills, account): (_, _, Account) = tokio::try_join!(
-            reports::orders(&self.http, None, false, Some(start), None),
-            supported_fills(&self.http, &self.state, None, None, Some(start), None),
+        let (snapshot, account): (_, Account) = tokio::try_join!(
+            reconciliation::snapshot(&self.http, &self.state, Some(start), false),
             self.http.get("/v2/account", &()),
         )?;
-        let active_orders = lock_state(&self.state)?.active_orders();
-        let mut reported: HashSet<_> = orders.iter().map(|order| order.id.clone()).collect();
-        for (client_id, venue_id) in active_orders {
-            if let Some(order) = reports::order(&self.http, Some(client_id), venue_id).await?
-                && reported.insert(order.id.clone())
-            {
-                orders.push(order);
-            }
-        }
+        let fills = snapshot.simple_fills();
+        let orders = &snapshot.orders;
 
-        for order in orders.iter().filter(|order| order.is_combo()) {
+        for order in orders.values().filter(|order| order.is_combo()) {
             self.apply_combo(
                 order,
                 reports::timestamp(order.updated_at.as_deref().unwrap_or(&order.created_at))?,
@@ -1025,14 +1065,15 @@ impl StreamTask {
         }
 
         for order in orders
-            .into_iter()
+            .values()
             .filter(|order| order.supported() && order.replaced_by.is_none())
         {
             let client_id = state
-                .broker_order_client_id(&order)?
+                .broker_order_client_id(order)?
                 .or(Some(order.client_id()?));
             let report = order.to_report(self.emitter.account_id(), client_id, now())?;
-            state.apply_snapshot(&order, &report)?;
+            state.confirm_replacement(order, &self.emitter, report.ts_last)?;
+            state.apply_snapshot(order, &report)?;
             let mut fills = fills_by_order
                 .remove(&report.venue_order_id)
                 .unwrap_or_default();

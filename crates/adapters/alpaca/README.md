@@ -188,6 +188,31 @@ Combo replacement and spread quote subscriptions are outside this initial
 support. See [Alpaca multi-leg orders](https://docs.alpaca.markets/us/docs/options-level-3-trading)
 and [index options](https://docs.alpaca.markets/us/docs/index-options).
 
+## Execution reconciliation
+
+Enable LiveNode startup reconciliation to restore Alpaca orders, executions,
+and positions. The historical lookback bounds activity collection. Startup
+also queries all working orders, including orders submitted before the lookback,
+and retrieves missing order records for fills inside the window.
+
+The execution client reauthenticates the private stream and catches up on order
+updates and fills after a reconnect. WebSocket and REST fills share a trade
+identifier derived from the broker order ID and cumulative filled quantity.
+
+An order placed outside Nautilus is imported by the execution engine as an
+external order. To claim external orders at startup, configure
+`StrategyConfig.external_order_instrument_ids`. Native Rust strategies return
+the list from the `Strategy::external_order_instrument_ids` hook. Set
+`filter_unclaimed_external_orders` to omit orders without a strategy claim.
+Ownership of previously cached Nautilus orders is preserved.
+
+Reload the original Nautilus order cache to recover a native multi-leg parent
+after a restart. The parent uses the broker's net execution price and quantity.
+Startup recovers leg positions from the broker's position snapshots. Individual
+combo leg executions are not imported as independent orders. Without the
+original Nautilus combo identity, an external multi-leg parent is left
+unmanaged, while its exposure remains visible in the leg position snapshots.
+
 ## Elite Smart Router
 
 Select Elite Smart Router for your Alpaca trading account before using
