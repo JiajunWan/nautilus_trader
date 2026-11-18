@@ -40,14 +40,62 @@ pre-market, after-hours and eligible overnight execution.
 
 The adapter maps native StopMarket, StopLimit, TrailingStopMarket, and
 supported OTO/OCO/bracket order lists. Trailing offsets can use absolute
-price or basis points. Auction and immediate-fill instructions use the
-Nautilus AtTheOpen, AtTheClose, IOC and FOK time-in-force values subject to
-Alpaca account eligibility. Alpaca documents Algo Trader Plus as a data
-subscription. The Elite Smart Router is a separate product.
+price or basis points. Opening auction orders (MOO and LOO) use a Market or
+Limit order with `AtTheOpen` (`opg`). Closing auction orders (MOC and LOC)
+use `AtTheClose` (`cls`). Immediate-fill orders use `Ioc` or `Fok`.
+These time-in-force values depend on Alpaca account eligibility.
 
 See [order types and time-in-force](https://docs.alpaca.markets/us/docs/orders-at-alpaca)
 and [24/5 Trading](https://docs.alpaca.markets/us/docs/245-trading-for-trading-api)
 for the broker's order and session restrictions.
+
+## Elite Smart Router
+
+Select Elite Smart Router for your Alpaca trading account before using
+VWAP, TWAP, or direct market access (DMA). Alpaca routes DMA orders through
+DASH Financial Technologies to the specified exchange. See
+[Alpaca Elite](https://alpaca.markets/elite) and the
+[advanced orders guide](https://docs.alpaca.markets/us/docs/alpaca-elite-smart-router).
+
+Pass `params["advanced_instructions"]` on a single whole-share US equity
+Market or Limit order with DAY time in force. For example, submit an
+existing DAY Limit order from a Python strategy with a VWAP participation
+cap of 12.3%.
+
+```python
+self.submit_order(
+    order,
+    params={"advanced_instructions": {"algorithm": "VWAP", "max_percentage": "0.123"}},
+)
+```
+
+- For VWAP and TWAP, set `algorithm` to `"VWAP"` or `"TWAP"`. Optional
+  `start_time` and `end_time` are RFC 3339 timestamps within the same
+  regular session. Set `max_percentage` to a decimal fraction between
+  0 and 1, exclusive, with at most three decimal places.
+- For DMA, set `algorithm` to `"DMA"` and `destination` to `"NYSE"`,
+  `"NASDAQ"`, or `"ARCA"`. Pass optional `display_qty` inside
+  `advanced_instructions` in increments of 100 shares. NASDAQ and ARCA
+  accept the separate `extended_hours: true` parameter on DAY Limit orders
+  for their pre-market and post-market sessions.
+
+For VWAP or TWAP modifications, pass the complete instruction object to
+`modify_order` together with a quantity or limit-price change. Omit the
+object to preserve the existing instructions during a replacement. To
+change a DMA order, cancel it and submit a new order.
+
+Paper accepts the instruction field for submission and rejection checks.
+Verification of algorithmic fills and exchange routing requires live execution.
+Alpaca lists PVOL and Midpoint Peg as upcoming on its
+[Elite feature table](https://alpaca.markets/elite).
+
+An explicit VWAP or TWAP replacement must match the recorded original
+algorithm. For restored orders, that record can be recovered from the
+instruction object in the broker response when available.
+
+The adapter reports zero commission on fills. Use broker-recorded fees
+when calculating net P&L for Elite live trades. See
+[Alpaca account activities](https://docs.alpaca.markets/us/docs/account-activities).
 
 ## Paper smoke test
 
