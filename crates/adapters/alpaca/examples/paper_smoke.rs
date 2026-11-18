@@ -29,6 +29,8 @@
 //! cancel it directly using `-- --cancel-carryover UUID`.
 //! Use `-- --advanced-checks` to submit and cancel one-share stop, stop-limit,
 //! trailing-stop, and bracket orders in sequence.
+//! Use `paper_auction_check.py open|close` to verify AAPL auction orders and reconcile
+//! the resulting Paper position.
 //! Use `-- --suite PRICE` for a regular limit, extended-hours round trip, and
 //! advanced checks on one connection.
 //! Use `-- --history YYYY-MM-DD` to verify bars from all four sessions of a completed
@@ -42,7 +44,7 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
 
 use anyhow::{Result, bail, ensure};
 use jiff::{
-    Timestamp, ToSpan,
+    SignedDuration, Timestamp, ToSpan,
     civil::{Date, time},
 };
 use nautilus_alpaca::{
@@ -64,6 +66,8 @@ use nautilus_model::{
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use rust_decimal::{Decimal, RoundingStrategy};
 
+#[path = "paper_smoke/auction.rs"]
+mod auction;
 #[path = "paper_smoke/carryover.rs"]
 mod carryover;
 
@@ -681,6 +685,17 @@ fn extended_hours_params(extended_hours: bool) -> Params {
     Params::new([("extended_hours".into(), extended_hours.into())].into())
 }
 
+async fn run_node(node: &mut LiveNode, timeout: Duration) -> Result<()> {
+    let handle = node.handle();
+    let deadline = tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        handle.stop();
+    });
+    let result = node.run().await;
+    deadline.abort();
+    result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let proxy_url = std::env::var("ALPACA_SMOKE_PROXY_URL")
@@ -701,10 +716,30 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    let (mut modes, iex_only) = Mode::parse(args)?;
-    let mode = modes.pop_front().expect("At least one smoke mode");
+    let auction = match args.as_slice() {
+        [mode, kind] if mode == "--auction-check" => Some(auction::Auction::parse(kind)?),
+        _ => None,
+    };
+    let now = Timestamp::now();
+    let auction_timeout = auction
+        .map(|kind| -> Result<Duration> {
+            let target = auction::target_time(kind, now)?;
+            Ok((target.duration_since(now) + SignedDuration::from_mins(4)).try_into()?)
+        })
+        .transpose()?;
+    let (mut modes, iex_only) = if auction.is_some() {
+        (VecDeque::new(), false)
+    } else {
+        Mode::parse(args)?
+    };
+    let mode = modes.pop_front();
     let suite = !modes.is_empty();
-    let history = matches!(mode, Mode::History(_));
+    let history = matches!(mode, Some(Mode::History(_)));
+    let symbol = if auction.is_some() {
+        auction::INSTRUMENT_SYMBOL
+    } else {
+        "SPY"
+    };
     let relay_port = std::env::var("ALPACA_SMOKE_WS_PORT")
         .ok()
         .map(|port| port.parse::<u16>())
@@ -735,7 +770,7 @@ async fn main() -> Result<()> {
         .maybe_api_secret(mock_credential)
         .maybe_base_url_http_trading(asset_base_url)
         .maybe_base_url_ws_public(relay_port.map(|port| format!("ws://127.0.0.1:{port}")))
-        .load_symbols(vec!["SPY".to_string()])
+        .load_symbols(vec![symbol.to_string()])
         .http_timeout_secs(30)
         .maybe_proxy_url(proxy_url.clone())
         .maybe_market_data_api_key(market_key.map(SecretString::from))
@@ -745,9 +780,16 @@ async fn main() -> Result<()> {
         } else {
             AlpacaStockFeed::Sip
         })
-        .maybe_overnight_feed((!iex_only).then_some(AlpacaOvernightFeed::Boats))
+        .maybe_overnight_feed(
+            (!iex_only && auction.is_none()).then_some(AlpacaOvernightFeed::Boats),
+        )
         .build();
-    let mut builder = LiveNode::builder(TraderId::from("PAPER-SMOKE-001"), Environment::Live)?
+    let trader = if auction.is_some() {
+        "PAPER-AUCTION-001"
+    } else {
+        "PAPER-SMOKE-001"
+    };
+    let mut builder = LiveNode::builder(TraderId::from(trader), Environment::Live)?
         .with_load_state(false)
         .with_save_state(false)
         .with_reconciliation(!history)
@@ -773,9 +815,14 @@ async fn main() -> Result<()> {
         )?;
     }
     let mut node = builder.build()?;
+    if let Some((kind, timeout)) = auction.zip(auction_timeout) {
+        let observation = auction::add_strategy(&mut node, kind, now)?;
+        run_node(&mut node, timeout).await?;
+        return observation.verify();
+    }
 
+    let mode = mode.expect("At least one smoke mode");
     let observation = Rc::new(RefCell::new(Observation::default()));
-    let handle = node.handle();
     node.add_strategy(PaperSmoke {
         core: StrategyCore::new(StrategyConfig {
             strategy_id: Some(StrategyId::from("PAPER-SMOKE-001")),
@@ -785,7 +832,7 @@ async fn main() -> Result<()> {
         remaining_modes: modes,
         instrument_id: InstrumentId::from("SPY.ALPACA"),
         bar_type: BarType::from("SPY.ALPACA-1-MINUTE-LAST-EXTERNAL"),
-        node: handle.clone(),
+        node: node.handle(),
         observation: Rc::clone(&observation),
         active_order: None,
         submitted: false,
@@ -793,13 +840,11 @@ async fn main() -> Result<()> {
         advanced_checked: 0,
     })?;
 
-    let deadline = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(if suite { 180 } else { 120 })).await;
-        handle.stop();
-    });
-    let result = node.run().await;
-    deadline.abort();
-    result?;
+    run_node(
+        &mut node,
+        Duration::from_secs(if suite { 180 } else { 120 }),
+    )
+    .await?;
 
     let mut observed = observation.borrow_mut();
     if history {

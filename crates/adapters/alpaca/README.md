@@ -131,3 +131,21 @@ and bracket smoke orders. `--suite PRICE` runs the regular limit, extended
 round trip and advanced checks over one connection. Set `ALPACA_SMOKE_PROXY_URL`
 when the connection requires an HTTP CONNECT proxy. The example uses the
 Paper trading endpoint for all order operations.
+
+### Paper auction checks
+
+Build the same example, then run the check for the corresponding auction during
+the 30 minutes before it, with time to spare before Alpaca's 09:28 ET opening
+cutoff or 15:50 ET closing cutoff. The runner checks the Alpaca calendar and
+requires a full trading day and a flat AAPL position with no AAPL orders.
+
+```sh
+cargo build -p nautilus-alpaca --features examples --example alpaca-paper-smoke
+python3 crates/adapters/alpaca/examples/paper_auction_check.py open
+python3 crates/adapters/alpaca/examples/paper_auction_check.py close
+```
+
+Each run submits one-share AAPL market, marketable limit and resting limit orders
+through the native strategy. It checks the native terminal events and Paper order
+records, then closes the test fills. A manual cancellation does not pass the
+resting-order check. Both phases use Paper execution and verify simulated fills.
