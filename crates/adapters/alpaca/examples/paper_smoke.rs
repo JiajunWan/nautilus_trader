@@ -24,7 +24,7 @@
 //! or `-- --limit-round-trip` to buy and sell one paper share.
 //! Use `-- --extended-round-trip` (DAY) or `-- --extended-gtc-round-trip` (GTC)
 //! to buy and sell one paper share with price-capped extended-hours orders.
-//! Prefix extended limit and round-trip modes with `--symbol SYMBOL` to select an equity.
+//! Prefix round-trip or extended limit modes with `--symbol SYMBOL` to select an equity.
 //! Use `--extended-dma-limit NASDAQ|ARCA PRICE` to submit and cancel a routed DAY limit.
 //! Use `-- --hold-limit DAY|GTC PRICE` to leave one nonmarketable, extended-hours
 //! order open. Verify and cancel it using `-- --verify-carryover DAY|GTC UUID`, or
@@ -231,12 +231,9 @@ impl Mode {
                     Self::Limit {
                         route: LimitRoute::Extended | LimitRoute::Dma(_),
                         ..
-                    } | Self::LimitRoundTrip {
-                        extended_hours: true,
-                        ..
-                    }
+                    } | Self::LimitRoundTrip { .. } | Self::MarketRoundTrip
                 ),
-            "--symbol requires an extended limit or extended round-trip mode",
+            "--symbol requires a round trip or an extended limit mode",
         );
         Ok((
             [mode].into(),
