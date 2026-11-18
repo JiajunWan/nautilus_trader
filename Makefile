@@ -285,7 +285,7 @@ CORE_CRATES := nautilus-analysis nautilus-backtest nautilus-common nautilus-core
     nautilus-system nautilus-testkit nautilus-trading
 
 # Crates tested in the workspace-compiled adapter lane
-ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
+ADAPTER_CRATES := nautilus-alpaca nautilus-architect-ax nautilus-betfair nautilus-binance \
     nautilus-blockchain nautilus-bybit nautilus-cli \
     nautilus-coinapi nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
     nautilus-dydx nautilus-finfeed nautilus-hyperliquid nautilus-interactive-brokers nautilus-kalshi \

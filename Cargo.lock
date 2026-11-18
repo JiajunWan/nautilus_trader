@@ -5570,6 +5570,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 
 [[package]]
+name = "nautilus-alpaca"
+version = "0.69.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bon",
+ "futures-util",
+ "jiff",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "nautilus-trading",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "url",
+ "ustr",
+ "uuid",
+]
+
+[[package]]
 name = "nautilus-analysis"
 version = "0.69.0"
 dependencies = [
