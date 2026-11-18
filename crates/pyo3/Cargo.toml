@@ -23,6 +23,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["adapters"]
 adapters = [
+  "dep:nautilus-alpaca",
   "dep:nautilus-architect-ax",
   "dep:nautilus-betfair",
   "dep:nautilus-binance",
@@ -60,6 +61,7 @@ defi = [
   "nautilus-persistence/defi",
 ]
 extension-module = [
+  "nautilus-alpaca?/extension-module",
   "nautilus-analysis/extension-module",
   "nautilus-architect-ax?/extension-module",
   "nautilus-backtest/extension-module",
@@ -103,6 +105,7 @@ high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization/high-precision",
   "nautilus-testkit/high-precision",
+  "nautilus-alpaca?/high-precision",
   "nautilus-betfair?/high-precision",
   "nautilus-binance?/high-precision",
   "nautilus-coinbase?/high-precision",
@@ -161,6 +164,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 nautilus-trading = { workspace = true, features = ["python"] }
 
 # Adapters
+nautilus-alpaca = { workspace = true, optional = true, features = ["python"] }
 nautilus-architect-ax = { workspace = true, optional = true, features = [
   "python",
 ] }

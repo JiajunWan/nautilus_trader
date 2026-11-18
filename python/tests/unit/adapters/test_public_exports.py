@@ -36,6 +36,7 @@ ADAPTERS = sorted(p.name for p in ADAPTERS_ROOT.iterdir() if (p / "__init__.py")
 # Data providers (coinapi, databento, finfeed, tardis), the blockchain data client, the sandbox exec
 # client, and the multi-venue interactive_brokers broker intentionally omit them.
 VENUE_ADAPTERS = {
+    "alpaca": "ALPACA",
     "architect_ax": "AX",
     "betfair": "BETFAIR",
     "binance": "BINANCE",
@@ -228,6 +229,7 @@ def test_known_adapter_set_is_complete() -> None:
     """
     # Guards against a new adapter landing without a deliberate facade decision.
     expected = {
+        "alpaca",
         "architect_ax",
         "betfair",
         "binance",

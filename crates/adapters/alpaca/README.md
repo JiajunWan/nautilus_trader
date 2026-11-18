@@ -5,6 +5,10 @@ Register the two native factories with a `LiveNode`. Data and execution
 configs default to the Alpaca Paper environment. Set `AlpacaEnvironment::Live`
 explicitly and provide the matching credentials for a live deployment.
 
+The Python wheel exposes the same native factories, configs and environment
+enum from `nautilus_trader.adapters.alpaca`. Python uses
+`AlpacaEnvironment.PAPER` and `AlpacaEnvironment.LIVE`.
+
 | Mode | API key | API secret |
 | --- | --- | --- |
 | Paper | `ALPACA_PAPER_API_KEY` | `ALPACA_PAPER_API_SECRET` |

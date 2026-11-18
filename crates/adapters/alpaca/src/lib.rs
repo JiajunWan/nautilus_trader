@@ -24,3 +24,5 @@ pub(crate) mod http;
 mod market_data;
 mod market_stream;
 pub(crate) mod provider;
+#[cfg(feature = "python")]
+pub mod python;

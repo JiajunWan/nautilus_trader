@@ -47,6 +47,7 @@ fn test_embedded_module_shares_host_types_and_selects_adapters() {
         assert_eq!(instrument_id, InstrumentId::from("ETHUSDT.BINANCE"));
 
         for name in [
+            "alpaca",
             "architect_ax",
             "betfair",
             "binance",
@@ -73,6 +74,20 @@ fn test_embedded_module_shares_host_types_and_selects_adapters() {
                 cfg!(feature = "adapters"),
                 "{name}"
             );
+        }
+
+        #[cfg(feature = "adapters")]
+        {
+            let alpaca = py.import("nautilus_trader.adapters.alpaca").unwrap();
+            let paper = alpaca
+                .getattr("AlpacaEnvironment")
+                .unwrap()
+                .getattr("PAPER")
+                .unwrap();
+            for config in ["AlpacaDataClientConfig", "AlpacaExecutionClientConfig"] {
+                let config = alpaca.getattr(config).unwrap().call0().unwrap();
+                assert!(config.getattr("environment").unwrap().eq(&paper).unwrap());
+            }
         }
     });
 }
