@@ -25,6 +25,7 @@ high-precision = ["nautilus-model/high-precision"]
 python = [
   "dep:nautilus-system",
   "dep:pyo3",
+  "dep:pyo3-async-runtimes",
   "dep:pyo3-stub-gen",
   "nautilus-core/python",
   "nautilus-model/python",
@@ -61,6 +62,7 @@ ustr = { workspace = true }
 uuid = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]

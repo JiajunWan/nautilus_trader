@@ -18,6 +18,7 @@ __all__ = [
     "AlpacaOptionFeed",
     "AlpacaOvernightFeed",
     "AlpacaStockFeed",
+    "request_option_catalog",
 ]
 
 ALPACA: str
@@ -121,3 +122,11 @@ class AlpacaOvernightFeed(enum.Enum):
 class AlpacaStockFeed(enum.Enum):
     SIP = ...
     IEX = ...
+
+def request_option_catalog(
+    config: AlpacaDataClientConfig,
+    underlying: str,
+    root: str | None = None,
+    expiration_date_gte: str | None = None,
+    expiration_date_lte: str | None = None,
+) -> typing.Awaitable[list[dict[str, typing.Any]]]: ...

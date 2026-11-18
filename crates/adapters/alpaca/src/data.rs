@@ -77,14 +77,8 @@ impl AlpacaDataClient {
     ///
     /// Returns an error if Alpaca credentials or HTTP transport cannot be configured.
     pub fn new(client_id: ClientId, config: &AlpacaDataClientConfig) -> anyhow::Result<Self> {
-        let credentials = config.credentials()?;
+        let trading = AlpacaHttpClient::for_trading_data(config)?;
         let market_credentials = config.market_credentials()?;
-        let trading = AlpacaHttpClient::new(
-            config.trading_http_url(),
-            &credentials,
-            config.http_timeout_secs,
-            config.proxy_url.as_ref().map(SecretString::expose_secret),
-        )?;
         let market = AlpacaHttpClient::new(
             config.market_http_url(),
             &market_credentials,
@@ -436,7 +430,7 @@ impl DataClient for AlpacaDataClient {
                     let underlying = params
                         .get_str("option_underlying")
                         .context("Alpaca option_underlying must be a string")?;
-                    let expiration_bound = |key: &str| {
+                    let string_param = |key: &str| {
                         params
                             .get(key)
                             .map(|value| {
@@ -449,8 +443,9 @@ impl DataClient for AlpacaDataClient {
                     load_option_chain(
                         &http,
                         underlying,
-                        expiration_bound("expiration_date_gte")?,
-                        expiration_bound("expiration_date_lte")?,
+                        string_param("root_symbol")?,
+                        string_param("expiration_date_gte")?,
+                        string_param("expiration_date_lte")?,
                         ts_init,
                     )
                     .await?

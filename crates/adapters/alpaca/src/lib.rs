@@ -21,9 +21,11 @@ pub mod data;
 pub mod execution;
 pub mod factories;
 pub(crate) mod http;
+pub use http::request_option_catalog;
 mod market_data;
 mod market_stream;
 mod option_provider;
+pub use option_provider::OptionCatalogEntry;
 pub(crate) mod provider;
 #[cfg(feature = "python")]
 pub mod python;

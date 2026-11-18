@@ -40,25 +40,61 @@ trades. OPRA requires an Alpaca data entitlement and its signed agreement.
 use their own connection and the complete OCC symbol with venue `ALPACA`.
 Set `load_option_symbols` to publish selected contracts at startup.
 
-Call `request_instrument` for one contract or `request_instruments` with
-`params["option_underlying"]` for a paginated chain. When a catalog is
-configured, set `params["force_instrument_update"]` to `true` to route
-the request to Alpaca. Set
-`expiration_date_gte` and `expiration_date_lte` as `YYYY-MM-DD` strings to
-bound discovery. Alpaca limits the default discovery window to the upcoming
-weekend. Use `SPX` to discover the SPX, SPXO, and SPXW series. Pass `SPXO`
-or `SPXW` to select that root. On the Trading API the SPXO filter is
-`underlying_symbols=SPX&root_symbol=SPXO`. For OPRA chain snapshots queried
-directly from the Market Data API, use `/v1beta1/options/snapshots/SPXO`.
-Discovery covers standard 100-share equity and ETF contracts and these
-100-multiplier index contracts.
+Query the Trading API contract directory by underlying to discover every active
+root Alpaca returns for a date range. Each row retains the broker's OCC symbol,
+underlying and root. The following Python request includes newly listed roots
+and requires only trading credentials.
 
-All three series use the SPX underlying and European cash settlement.
-SPX and SPXO have AM settlement and SPXW has PM settlement. Alpaca supplies an
-expiration date, so Nautilus uses 09:30 or 16:00 New York time as a
-nominal expiry timestamp. Consult the broker calendar and
-contract rules for the actual last tradable time and settlement, including
-early closes. SPX index spot data requires a separate provider.
+```python
+from nautilus_trader.adapters.alpaca import AlpacaDataClientConfig, request_option_catalog
+
+rows = await request_option_catalog(
+    AlpacaDataClientConfig(),
+    "SPX",
+    expiration_date_gte="2026-11-18",
+    expiration_date_lte="2026-12-18",
+)
+for root, session, status in sorted({
+    (row["root_symbol"], row["expiration_session"] or "—", row["instrument_status"])
+    for row in rows
+}):
+    print(root, session, status)
+```
+
+Supply `root="SPXO"` to filter this directory to one root. Without an explicit
+expiry window, Alpaca limits the default query to the upcoming weekend. To see
+per-root counts from Rust with the same Paper credentials:
+
+```sh
+cargo run -p nautilus-alpaca --features examples --example alpaca-option-data -- --catalog SPX 2026-12-16 2026-12-16
+```
+
+For strategy instruments, use `request_instrument` with an exact OCC contract ID
+or `request_instruments` with `params["option_underlying"]`. Both the directory
+and the instrument chain accept explicit expiry bounds. The chain also accepts
+`params["root_symbol"]`. Existing `option_underlying="SPXO"` and `"SPXW"` calls
+continue to select those roots. Set `params["force_instrument_update"]` to
+`true` when a Nautilus catalog is configured and fresh broker definitions are needed.
+
+The instrument chain includes standard equity and ETF contracts and index
+contracts with verified specifications. A newly observed index root remains
+visible in the directory with its broker fields and a null expiration session
+until its settlement rules are known. A standard index contract without a
+verified series is marked `unknown_series`. Contracts outside the supported
+specifications are marked `unsupported_contract`. A `ready` row has a supported
+instrument definition; the broker's `tradable` field is reported separately.
+Group chain rows by underlying and root, keeping the complete OCC symbol for
+subscriptions and broker reconciliation. For SPX, the directory exposes
+`asset_class="index"`, `underlying_symbol="SPX"` and the optional display name
+`underlying_name="S&P 500 Index"`.
+
+For example, SPX, SPXO and SPXW share the index underlying `SPX`. SPX and
+SPXO use AM settlement and SPXW uses PM settlement. The adapter uses 09:30
+or 16:00 New York time as the nominal expiry for these known series. The
+broker calendar and series rules determine the actual last trading time and
+settlement, including early closes. SPX index spot data requires a separate
+provider. For direct OPRA chain snapshots of SPXO, use
+`/v1beta1/options/snapshots/SPXO`.
 
 The option adapter currently provides definitions and streaming quote and
 trade ticks. Equity order workflows, auction instructions, overnight

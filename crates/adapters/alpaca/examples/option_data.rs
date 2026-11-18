@@ -14,6 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Read-only check of Alpaca Paper option definitions and OPRA market data.
+//!
+//! Use `--catalog UNDERLYING DATE_GTE DATE_LTE [ROOT]` to summarize the
+//! contract directory without opening a WebSocket. Pass full OCC symbols to
+//! load their instrument definitions and subscribe to OPRA data.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -25,6 +29,7 @@ use nautilus_alpaca::{
     },
     config::AlpacaDataClientConfig,
     data::AlpacaDataClient,
+    request_option_catalog,
 };
 use nautilus_common::{
     clients::DataClient,
@@ -41,15 +46,49 @@ use tokio::{sync::mpsc::unbounded_channel, time::timeout};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let symbols: Vec<_> = std::env::args().skip(1).collect();
+    let proxy_url = std::env::var("ALPACA_SMOKE_PROXY_URL").ok();
+    if symbols.first().is_some_and(|arg| arg == "--catalog") {
+        let [_, underlying, start, end, root @ ..] = symbols.as_slice() else {
+            anyhow::bail!("Expected --catalog UNDERLYING DATE_GTE DATE_LTE [ROOT]");
+        };
+        ensure!(root.len() <= 1, "Expected at most one catalog root filter");
+        let config = AlpacaDataClientConfig::builder()
+            .maybe_proxy_url(proxy_url.map(Into::into))
+            .build();
+        let entries = request_option_catalog(
+            &config,
+            underlying,
+            root.first().map(String::as_str),
+            Some(start),
+            Some(end),
+        )
+        .await?;
+
+        let mut counts = BTreeMap::new();
+        for entry in &entries {
+            let group = (
+                entry.underlying_symbol(),
+                entry.root_symbol(),
+                entry.expiration_session().unwrap_or("-"),
+                entry.instrument_status(),
+            );
+            *counts.entry(group).or_insert(0_usize) += 1;
+        }
+        println!("underlying\troot\tsession\tinstrument_status\tcontracts");
+        for ((underlying, root, session, status), count) in counts {
+            println!("{underlying}\t{root}\t{session}\t{status}\t{count}");
+        }
+        println!("Total contracts: {}", entries.len());
+        return Ok(());
+    }
     ensure!(
         !symbols.is_empty(),
-        "Provide one or more Alpaca OCC symbols"
+        "Provide Alpaca OCC symbols or --catalog UNDERLYING DATE_GTE DATE_LTE [ROOT]"
     );
     let ids: Vec<_> = symbols
         .iter()
         .map(|symbol| InstrumentId::from(format!("{symbol}.ALPACA").as_str()))
         .collect();
-    let proxy_url = std::env::var("ALPACA_SMOKE_PROXY_URL").ok();
     let relay_port = std::env::var("ALPACA_SMOKE_WS_PORT")
         .ok()
         .map(|port| port.parse::<u16>())

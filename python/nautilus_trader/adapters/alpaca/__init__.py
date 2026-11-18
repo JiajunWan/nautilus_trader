@@ -32,6 +32,7 @@ __all__ = [
     "AlpacaOptionFeed",
     "AlpacaOvernightFeed",
     "AlpacaStockFeed",
+    "request_option_catalog",
 ]
 
 fixup_module_names(globals(), __name__)

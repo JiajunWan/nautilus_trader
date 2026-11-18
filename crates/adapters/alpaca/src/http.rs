@@ -14,12 +14,43 @@
 // -------------------------------------------------------------------------------------------------
 
 use anyhow::Context;
+use nautilus_core::string::secret::SecretString;
 use nautilus_network::http::{
     HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::common::credential::AlpacaCredentials;
+use crate::{
+    common::credential::AlpacaCredentials,
+    config::AlpacaDataClientConfig,
+    option_provider::{OptionCatalogEntry, load_option_catalog},
+};
+
+/// Discovers active option contracts for an exact underlying, including unrecognized series.
+///
+/// Pass explicit expiry bounds to cover dates beyond Alpaca's default near-term window.
+/// This read-only operation needs trading API credentials and no market-data connection.
+///
+/// # Errors
+///
+/// Returns an error for invalid filters, credentials, HTTP responses or catalog data.
+pub async fn request_option_catalog(
+    config: &AlpacaDataClientConfig,
+    underlying: &str,
+    root: Option<&str>,
+    expiration_date_gte: Option<&str>,
+    expiration_date_lte: Option<&str>,
+) -> anyhow::Result<Vec<OptionCatalogEntry>> {
+    let http = AlpacaHttpClient::for_trading_data(config)?;
+    load_option_catalog(
+        &http,
+        underlying,
+        root,
+        expiration_date_gte,
+        expiration_date_lte,
+    )
+    .await
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("Alpaca HTTP {status}: {message}")]
@@ -42,6 +73,15 @@ pub(crate) struct AlpacaHttpClient {
 }
 
 impl AlpacaHttpClient {
+    pub(crate) fn for_trading_data(config: &AlpacaDataClientConfig) -> anyhow::Result<Self> {
+        Self::new(
+            config.trading_http_url(),
+            &config.credentials()?,
+            config.http_timeout_secs,
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
+        )
+    }
+
     pub(crate) fn new(
         base_url: &str,
         credentials: &AlpacaCredentials,
