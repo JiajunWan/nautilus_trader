@@ -15,6 +15,11 @@
 
 //! Alpaca stock market-data messages and historical paging.
 
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, binary_heap::PeekMut},
+};
+
 use anyhow::{Context, ensure};
 use nautilus_core::{UnixNanos, datetime::iso8601_to_unix_nanos};
 use nautilus_model::{
@@ -211,13 +216,13 @@ impl HistoryKind {
         }
     }
 
-    fn rows<T>(self, page: HistoricalPage<T>) -> Vec<T> {
-        match self {
+    fn rows<T>(self, page: HistoricalPage<T>) -> (Vec<T>, Option<String>) {
+        let rows = match self {
             Self::Quotes => page.quotes,
             Self::Trades => page.trades,
             Self::Bars => page.bars,
-        }
-        .unwrap_or_default()
+        };
+        (rows.unwrap_or_default(), page.next_page_token)
     }
 }
 
@@ -269,8 +274,8 @@ pub(crate) async fn historical<T: DeserializeOwned>(
             .get(&path, &query)
             .await
             .with_context(|| format!("Fetching Alpaca {} for {id} ({feed})", kind.path()))?;
-        let next_token = page.next_page_token.clone();
-        data.extend(kind.rows(page));
+        let (rows, next_token) = kind.rows(page);
+        data.extend(rows);
         ensure!(
             next_token.is_none() || next_token != token,
             "Alpaca returned a repeated pagination token for {id}",
@@ -283,12 +288,81 @@ pub(crate) async fn historical<T: DeserializeOwned>(
     Ok(data)
 }
 
+pub(crate) fn merge_history<T, K: Ord>(
+    mut runs: Vec<Vec<T>>,
+    limit: Option<usize>,
+    key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    runs.retain(|run| !run.is_empty());
+    for run in &mut runs {
+        if !run.is_sorted_by_key(&key) {
+            run.sort_by_key(&key);
+        }
+    }
+    if runs.len() <= 1 {
+        let mut output = runs.pop().unwrap_or_default();
+        output.truncate(limit.unwrap_or(output.len()));
+        return output;
+    }
+
+    let total = runs.iter().map(Vec::len).sum::<usize>();
+    let limit = limit.unwrap_or(total).min(total);
+    let mut inputs: Vec<_> = runs
+        .into_iter()
+        .map(|run| run.into_iter().peekable())
+        .collect();
+    // The run index preserves ties in symbol/feed request order.
+    let mut queue = BinaryHeap::from(
+        inputs
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, run)| Some(Reverse((key(run.peek()?), index))))
+            .collect::<Vec<_>>(),
+    );
+    let mut output = Vec::with_capacity(limit);
+    while output.len() < limit {
+        let Some(mut head) = queue.peek_mut() else {
+            break;
+        };
+        let index = head.0.1;
+        let input = &mut inputs[index];
+        output.extend(input.next());
+        if let Some(next) = input.peek() {
+            *head = Reverse((key(next), index));
+        } else {
+            PeekMut::pop(head);
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_model::identifiers::InstrumentId;
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(0))]
+    #[case(Some(3))]
+    #[case(Some(40))]
+    fn historical_merge_preserves_stable_order_and_applies_global_limit(
+        #[case] limit: Option<usize>,
+    ) {
+        let runs = vec![
+            vec![(1, "AAA", 10), (4, "AAA", 11), (4, "AAA", 12)],
+            Vec::new(),
+            vec![(4, "BBB", 13), (1, "BBB", 14)],
+            vec![(0, "AAA", 15), (4, "AAA", 16)],
+        ];
+        let key = |&(time, symbol, _): &(i32, &'static str, i32)| (time, symbol);
+        let mut expected: Vec<_> = runs.iter().flatten().copied().collect();
+        expected.sort_by_key(key);
+        expected.truncate(limit.unwrap_or(expected.len()));
+        assert_eq!(merge_history(runs, limit, key), expected);
+    }
 
     #[rstest]
     #[case(

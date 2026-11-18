@@ -18,6 +18,7 @@
 use std::{future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use anyhow::{Context, ensure};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use jiff::Timestamp;
 use nautilus_common::{
     clients::DataClient,
@@ -50,7 +51,10 @@ use crate::{
     common::ALPACA,
     config::AlpacaDataClientConfig,
     http::AlpacaHttpClient,
-    market_data::{HistoryKind, HistoryRequest, StockQuote, StockTrade, historical, timeframe},
+    market_data::{
+        HistoryKind, HistoryRequest, StockBar, StockQuote, StockTrade, historical, merge_history,
+        timeframe,
+    },
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
     option_provider::{is_option_symbol, load_option_chain, load_option_contract},
     option_spread,
@@ -116,8 +120,8 @@ impl AlpacaDataClient {
         );
         let (options, stocks): (Vec<_>, Vec<_>) = ids
             .iter()
-            .map(|id| id.symbol.as_str())
-            .partition(|symbol| is_option_symbol(symbol));
+            .map(|id| id.symbol)
+            .partition(|symbol| is_option_symbol(symbol.as_str()));
         if !options.is_empty() {
             ensure!(
                 !matches!(channel, StockChannel::Bars),
@@ -127,14 +131,13 @@ impl AlpacaDataClient {
                 !subscribe || self.config.option_feed.is_some(),
                 "Configure an Alpaca option feed to subscribe to option data",
             );
-            self.option_subscriptions.send_modify(|subscriptions| {
-                subscriptions.change(channel, options, subscribe);
+            self.option_subscriptions.send_if_modified(|subscriptions| {
+                subscriptions.change(channel, options, subscribe)
             });
         }
         if !stocks.is_empty() {
-            self.subscriptions.send_modify(|subscriptions| {
-                subscriptions.change(channel, stocks, subscribe);
-            });
+            self.subscriptions
+                .send_if_modified(|subscriptions| subscriptions.change(channel, stocks, subscribe));
         }
         Ok(())
     }
@@ -511,16 +514,15 @@ impl DataClient for AlpacaDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
-            let mut quotes = stock_tick_history(
+            let quotes = stock_history(
                 &http,
                 &request.instrument_ids,
                 HistoryKind::Quotes,
                 &spec,
-                StockQuote::tick,
+                |row: &StockQuote, id| row.tick(id, None),
+                |quote| (quote.ts_event, quote.instrument_id),
             )
             .await?;
-            quotes.sort_by_key(|quote| (quote.ts_event, quote.instrument_id));
-            quotes.truncate(spec.limit.unwrap_or(quotes.len()));
             Ok(DataResponse::Quotes(QuotesResponse::new(
                 request.request_id,
                 client_id,
@@ -546,16 +548,15 @@ impl DataClient for AlpacaDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
-            let mut trades = stock_tick_history(
+            let trades = stock_history(
                 &http,
                 &request.instrument_ids,
                 HistoryKind::Trades,
                 &spec,
-                StockTrade::tick,
+                |row: &StockTrade, id| row.tick(id, None),
+                |trade| (trade.ts_event, trade.instrument_id),
             )
             .await?;
-            trades.sort_by_key(|trade| (trade.ts_event, trade.instrument_id));
-            trades.truncate(spec.limit.unwrap_or(trades.len()));
             Ok(DataResponse::Trades(TradesResponse::new(
                 request.request_id,
                 client_id,
@@ -583,23 +584,15 @@ impl DataClient for AlpacaDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
-            let clock = get_atomic_clock_realtime();
-            let mut bars = Vec::new();
-            for &feed in &spec.feeds {
-                let rows = historical::<crate::market_data::StockBar>(
-                    &http,
-                    id,
-                    HistoryKind::Bars,
-                    &spec,
-                    feed,
-                )
-                .await?;
-                for row in rows {
-                    bars.push(row.bar(bar_type, None)?);
-                }
-            }
-            bars.sort_by_key(|bar| bar.ts_event);
-            bars.truncate(spec.limit.unwrap_or(bars.len()));
+            let bars = stock_history(
+                &http,
+                &[id],
+                HistoryKind::Bars,
+                &spec,
+                |row: &StockBar, _| row.bar(bar_type, None),
+                |bar| bar.ts_event,
+            )
+            .await?;
             Ok(DataResponse::Bars(BarsResponse::new(
                 request.request_id,
                 client_id,
@@ -607,7 +600,7 @@ impl DataClient for AlpacaDataClient {
                 bars,
                 datetime_to_unix_nanos(request.start),
                 datetime_to_unix_nanos(request.end),
-                clock.get_time_ns(),
+                get_atomic_clock_realtime().get_time_ns(),
                 request.params,
             )))
         })
@@ -650,21 +643,33 @@ fn validate_instruments(ids: &[InstrumentId]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn stock_tick_history<W: DeserializeOwned, T>(
+async fn stock_history<W: DeserializeOwned, T, K: Ord>(
     http: &AlpacaHttpClient,
     ids: &[InstrumentId],
     kind: HistoryKind,
     spec: &HistoryRequest,
-    parse: fn(&W, InstrumentId, Option<UnixNanos>) -> anyhow::Result<T>,
+    parse: impl Fn(&W, InstrumentId) -> anyhow::Result<T> + Copy,
+    key: impl Fn(&T) -> K,
 ) -> anyhow::Result<Vec<T>> {
-    let mut ticks = Vec::new();
-    for &id in ids {
-        for &feed in &spec.feeds {
-            let rows = historical::<W>(http, id, kind, spec, feed).await?;
-            for row in rows {
-                ticks.push(parse(&row, id, None)?);
-            }
-        }
+    const MAX_HISTORY_REQUESTS: usize = 4;
+    struct Source {
+        id: InstrumentId,
+        feed: &'static str,
     }
-    Ok(ticks)
+    let mut requests = Vec::with_capacity(ids.len() * spec.feeds.len());
+    for &id in ids {
+        requests.extend(spec.feeds.iter().map(|&feed| Source { id, feed }));
+    }
+    let runs = stream::iter(requests)
+        .map(|Source { id, feed }| async move {
+            historical::<W>(http, id, kind, spec, feed)
+                .await?
+                .iter()
+                .map(|row| parse(row, id))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .buffered(MAX_HISTORY_REQUESTS)
+        .try_collect()
+        .await?;
+    Ok(merge_history(runs, spec.limit, key))
 }

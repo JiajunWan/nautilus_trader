@@ -15,8 +15,6 @@
 
 //! Defines Alpaca option spreads from their qualified leg instruments.
 
-use std::collections::HashSet;
-
 use anyhow::{Context, ensure};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -46,10 +44,10 @@ pub(crate) fn legs(id: InstrumentId) -> anyhow::Result<Vec<(InstrumentId, i64)>>
         id.venue == *ALPACA && (2..=4).contains(&legs.len()),
         "Alpaca option spreads require two to four Alpaca option legs",
     );
-    let mut seen = HashSet::new();
-    for (id, ratio) in &legs {
+    for (index, (id, ratio)) in legs.iter().enumerate() {
         ensure!(
-            is_option_symbol(id.symbol.as_str()) && seen.insert(*id),
+            is_option_symbol(id.symbol.as_str())
+                && !legs[..index].iter().any(|(earlier, _)| earlier == id),
             "Alpaca option spread legs must have distinct OCC symbols",
         );
         ensure!(

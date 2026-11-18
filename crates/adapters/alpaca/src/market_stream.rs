@@ -26,6 +26,7 @@ use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     data::{BarSpecification, BarType, Data},
     enums::{AggregationSource, BarAggregation, PriceType},
+    identifiers::Symbol,
 };
 use nautilus_network::{
     RECONNECTED,
@@ -33,7 +34,7 @@ use nautilus_network::{
 };
 use option_wire::OptionMessage;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json, value::RawValue};
+use serde_json::value::RawValue;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -51,34 +52,62 @@ pub(crate) enum StockChannel {
     Bars,
 }
 
-impl StockChannel {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Quotes => "quotes",
-            Self::Trades => "trades",
-            Self::Bars => "bars",
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StockSubscriptions([BTreeSet<Symbol>; 3]);
+
+impl StockSubscriptions {
+    pub(crate) fn change(
+        &mut self,
+        channel: StockChannel,
+        symbols: impl IntoIterator<Item = Symbol>,
+        subscribe: bool,
+    ) -> bool {
+        let set = &mut self.0[channel as usize];
+        let mut changed = false;
+        for symbol in symbols {
+            changed |= if subscribe {
+                set.insert(symbol)
+            } else {
+                set.remove(&symbol)
+            };
         }
+        changed
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StockSubscriptions([BTreeSet<String>; 3]);
+#[derive(Serialize)]
+struct SubscriptionRequest<'a> {
+    action: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    quotes: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    trades: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bars: Vec<&'a str>,
+}
 
-impl StockSubscriptions {
-    pub(crate) fn change<'a>(
-        &mut self,
-        channel: StockChannel,
-        symbols: impl IntoIterator<Item = &'a str>,
-        subscribe: bool,
-    ) {
-        let set = &mut self.0[channel as usize];
-        for symbol in symbols {
-            if subscribe {
-                set.insert(symbol.to_owned());
-            } else {
-                set.remove(symbol);
-            }
+impl<'a> SubscriptionRequest<'a> {
+    fn delta(
+        action: &'static str,
+        before: &'a StockSubscriptions,
+        after: &'a StockSubscriptions,
+    ) -> Self {
+        let [quotes, trades, bars] = std::array::from_fn(|i| {
+            after.0[i]
+                .difference(&before.0[i])
+                .map(Symbol::as_str)
+                .collect()
+        });
+        Self {
+            action,
+            quotes,
+            trades,
+            bars,
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.quotes.is_empty() && self.trades.is_empty() && self.bars.is_empty()
     }
 }
 
@@ -337,26 +366,13 @@ async fn update_subscriptions(
     applied: &StockSubscriptions,
     desired: &StockSubscriptions,
 ) -> anyhow::Result<()> {
-    let channels = [
-        StockChannel::Quotes,
-        StockChannel::Trades,
-        StockChannel::Bars,
-    ];
     for (action, before, after) in [
-        ("unsubscribe", &desired.0, &applied.0),
-        ("subscribe", &applied.0, &desired.0),
+        ("unsubscribe", desired, applied),
+        ("subscribe", applied, desired),
     ] {
-        let mut request = serde_json::Map::new();
-        for channel in channels {
-            let idx = channel as usize;
-            let symbols: Vec<_> = after[idx].difference(&before[idx]).collect();
-            if !symbols.is_empty() {
-                request.insert(channel.name().to_owned(), json!(symbols));
-            }
-        }
+        let request = SubscriptionRequest::delta(action, before, after);
         if !request.is_empty() {
-            request.insert("action".to_owned(), json!(action));
-            format.send(socket, epoch, &Value::Object(request)).await?;
+            format.send(socket, epoch, &request).await?;
         }
     }
     Ok(())
@@ -428,4 +444,39 @@ pub(crate) fn validate_live_bar(bar_type: BarType) -> anyhow::Result<()> {
         "Alpaca live bars require 1-MINUTE-LAST-EXTERNAL: {bar_type}",
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_changes_preserve_both_wire_formats() {
+        let mut before = StockSubscriptions::default();
+        let qqq = Symbol::from("QQQ");
+        let option = Symbol::from("NVDA261120C00157500");
+        assert!(before.change(StockChannel::Quotes, [qqq], true));
+        assert!(!before.change(StockChannel::Quotes, [qqq], true));
+        assert!(!before.change(StockChannel::Trades, [qqq], false));
+
+        let mut after = before.clone();
+        assert!(after.change(StockChannel::Quotes, [qqq], false));
+        assert!(after.change(StockChannel::Trades, [option], true));
+        for (request, expected) in [
+            (
+                SubscriptionRequest::delta("unsubscribe", &after, &before),
+                serde_json::json!({"action": "unsubscribe", "quotes": ["QQQ"]}),
+            ),
+            (
+                SubscriptionRequest::delta("subscribe", &before, &after),
+                serde_json::json!({"action": "subscribe", "trades": ["NVDA261120C00157500"]}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&request).unwrap(), expected);
+            let msgpack = rmp_serde::to_vec_named(&request).unwrap();
+            let decoded: serde_json::Value = rmp_serde::from_slice(&msgpack).unwrap();
+            assert_eq!(decoded, expected);
+        }
+        assert!(SubscriptionRequest::delta("subscribe", &after, &after).is_empty());
+    }
 }
