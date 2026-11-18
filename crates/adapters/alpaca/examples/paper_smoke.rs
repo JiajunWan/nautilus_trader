@@ -22,8 +22,8 @@
 //! Add `-- --regular-limit PRICE` or `-- --extended-limit PRICE` to submit and cancel
 //! a one-share limit buy below the bid. During regular hours, add `-- --market-round-trip`
 //! or `-- --limit-round-trip` to buy and sell one paper share.
-//! Use `-- --extended-round-trip` to buy and sell one paper share with price-capped
-//! extended-hours orders.
+//! Use `-- --extended-round-trip` (DAY) or `-- --extended-gtc-round-trip` (GTC)
+//! to buy and sell one paper share with price-capped extended-hours orders.
 //! Use `-- --hold-limit DAY|GTC PRICE` to leave one nonmarketable, extended-hours
 //! order open. Verify and cancel it using `-- --verify-carryover DAY|GTC UUID`, or
 //! cancel it directly using `-- --cancel-carryover UUID`.
@@ -82,6 +82,7 @@ enum Mode {
     MarketRoundTrip,
     LimitRoundTrip {
         extended_hours: bool,
+        time_in_force: TimeInForce,
     },
     Carryover {
         price: Price,
@@ -106,6 +107,7 @@ impl Mode {
                     },
                     Self::LimitRoundTrip {
                         extended_hours: true,
+                        time_in_force: TimeInForce::Day,
                     },
                     Self::AdvancedChecks,
                 ]
@@ -134,11 +136,17 @@ impl Mode {
                 } else {
                     Self::LimitRoundTrip {
                         extended_hours: false,
+                        time_in_force: TimeInForce::Day,
                     }
                 }
             }
             [mode] if mode == "--extended-round-trip" => Self::LimitRoundTrip {
                 extended_hours: true,
+                time_in_force: TimeInForce::Day,
+            },
+            [mode] if mode == "--extended-gtc-round-trip" => Self::LimitRoundTrip {
+                extended_hours: true,
+                time_in_force: TimeInForce::Gtc,
             },
             [mode, tif, price] if mode == "--hold-limit" => {
                 let time_in_force = carryover_tif(tif)?;
@@ -158,7 +166,7 @@ impl Mode {
             }
             [mode] if mode == "--advanced-checks" => Self::AdvancedChecks,
             _ => bail!(
-                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --limit-round-trip, --extended-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
+                "Expected [--iex] and --regular-limit PRICE, --extended-limit PRICE, --market-round-trip, --limit-round-trip, --extended-round-trip, --extended-gtc-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
             ),
         };
         Ok(([mode].into(), iex_only))
@@ -237,7 +245,12 @@ impl PaperSmoke {
         )
     }
 
-    fn submit_limit_round_trip(&mut self, quote: &QuoteTick, extended_hours: bool) -> Result<()> {
+    fn submit_limit_round_trip(
+        &mut self,
+        quote: &QuoteTick,
+        extended_hours: bool,
+        time_in_force: TimeInForce,
+    ) -> Result<()> {
         let Some((bid, ask)) = fresh_prices(quote) else {
             self.submitted = false;
             return Ok(());
@@ -251,12 +264,7 @@ impl PaperSmoke {
             let price = ask.round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity) + cent;
             (OrderSide::Buy, price)
         };
-        let order = self.limit_order(
-            side,
-            Price::from_decimal_dp(price, 2)?,
-            TimeInForce::Day,
-            None,
-        );
+        let order = self.limit_order(side, Price::from_decimal_dp(price, 2)?, time_in_force, None);
         self.submit(order, Some(extended_hours_params(extended_hours)))
     }
 
@@ -547,9 +555,10 @@ impl DataActor for PaperSmoke {
                     self.submitted = false;
                     Ok(())
                 }
-                Mode::LimitRoundTrip { extended_hours } => {
-                    self.submit_limit_round_trip(quote, extended_hours)
-                }
+                Mode::LimitRoundTrip {
+                    extended_hours,
+                    time_in_force,
+                } => self.submit_limit_round_trip(quote, extended_hours, time_in_force),
                 Mode::AdvancedChecks => self.submit_advanced_check(quote),
                 Mode::Limit {
                     price,
@@ -876,4 +885,23 @@ async fn main() -> Result<()> {
         observed.bar,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case("--extended-round-trip", TimeInForce::Day)]
+    #[case("--extended-gtc-round-trip", TimeInForce::Gtc)]
+    fn extended_round_trip_time_in_force(#[case] flag: &str, #[case] expected: TimeInForce) {
+        let (modes, _) = Mode::parse(vec![flag.into()]).unwrap();
+        assert!(matches!(
+            modes.front(),
+            Some(Mode::LimitRoundTrip { extended_hours: true, time_in_force })
+                if *time_in_force == expected
+        ));
+    }
 }

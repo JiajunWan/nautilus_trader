@@ -155,8 +155,9 @@ bars. The second requests one trading day across all four sessions. Use
 `--regular-limit PRICE` or `--extended-limit PRICE` for a one-share
 submit-and-cancel test. During regular hours, use `--market-round-trip` or
 `--limit-round-trip` for a one-share buy and sell using DAY orders. Run
-`--extended-round-trip` in the pre-market, after-hours, or overnight session
-to test marketable DAY limit orders with extended hours enabled. Begin each
+`--extended-round-trip` (DAY) or `--extended-gtc-round-trip` (GTC) in the
+pre-market, after-hours, or overnight session to test marketable limit orders
+with extended hours enabled on both legs. Begin each
 round trip with a flat SPY position and verify the terminal fills and flat
 position in Paper afterward.
 
