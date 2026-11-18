@@ -17,4 +17,8 @@
 
 pub mod common;
 pub mod config;
+pub mod data;
 pub(crate) mod http;
+mod market_data;
+mod market_stream;
+pub(crate) mod provider;

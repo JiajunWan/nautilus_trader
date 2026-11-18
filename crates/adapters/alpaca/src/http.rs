@@ -139,7 +139,10 @@ impl AlpacaHttpClient {
         Err(AlpacaApiError {
             status: response.status.as_u16(),
             code: details.as_ref().and_then(|error| error.code),
-            message: details.map_or_else(|| response.status.to_string(), |error| error.message),
+            message: details.map_or_else(
+                || format!("HTTP {}", response.status.as_u16()),
+                |error| error.message,
+            ),
         }
         .into())
     }
