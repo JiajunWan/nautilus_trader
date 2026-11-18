@@ -46,13 +46,15 @@ configured, set `params["force_instrument_update"]` to `true` to route
 the request to Alpaca. Set
 `expiration_date_gte` and `expiration_date_lte` as `YYYY-MM-DD` strings to
 bound discovery. Alpaca limits the default discovery window to the upcoming
-weekend. Use `SPX` as the underlying to discover both SPX and SPXW contracts
-or pass `SPXW` to select just that root. Discovery covers standard
-100-share equity and ETF contracts and 100-multiplier SPX and SPXW index
-contracts.
+weekend. Use `SPX` to discover the SPX, SPXO, and SPXW series. Pass `SPXO`
+or `SPXW` to select that root. On the Trading API the SPXO filter is
+`underlying_symbols=SPX&root_symbol=SPXO`. For OPRA chain snapshots queried
+directly from the Market Data API, use `/v1beta1/options/snapshots/SPXO`.
+Discovery covers standard 100-share equity and ETF contracts and these
+100-multiplier index contracts.
 
-SPX and SPXW both use the SPX underlying and European cash settlement.
-SPX has AM settlement and SPXW has PM settlement. Alpaca supplies an
+All three series use the SPX underlying and European cash settlement.
+SPX and SPXO have AM settlement and SPXW has PM settlement. Alpaca supplies an
 expiration date, so Nautilus uses 09:30 or 16:00 New York time as a
 nominal expiry timestamp. Consult the broker calendar and
 contract rules for the actual last tradable time and settlement, including

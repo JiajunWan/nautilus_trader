@@ -100,7 +100,7 @@ impl AlpacaOptionContract {
             }
 
             return match self.root_symbol.as_str() {
-                "SPX" => Some(ContractKind::SpxAm),
+                "SPX" | "SPXO" => Some(ContractKind::SpxAm),
                 "SPXW" => Some(ContractKind::SpxPm),
                 _ => None,
             };
@@ -266,6 +266,13 @@ pub(crate) async fn load_option_contract(
     contract.instrument(kind, ts_init)
 }
 
+fn underlying_and_root(symbol: &str) -> (&str, Option<&str>) {
+    match symbol {
+        "SPXW" | "SPXO" => ("SPX", Some(symbol)),
+        _ => (symbol, None),
+    }
+}
+
 pub(crate) async fn load_option_chain(
     http: &AlpacaHttpClient,
     underlying: &str,
@@ -286,11 +293,7 @@ pub(crate) async fn load_option_chain(
         );
     }
 
-    let (underlying, root_filter) = if underlying == "SPXW" {
-        ("SPX", Some("SPXW"))
-    } else {
-        (underlying, None)
-    };
+    let (underlying, root_filter) = underlying_and_root(underlying);
     let mut query = vec![
         ("underlying_symbols", underlying),
         ("show_deliverables", "true"),
@@ -473,22 +476,36 @@ mod tests {
     }
 
     #[rstest]
-    #[case("SPX", ContractKind::SpxAm, "2026-11-20T14:30:00Z")]
-    #[case("SPXW", ContractKind::SpxPm, "2026-11-20T21:00:00Z")]
+    #[case("SPX", "SPX", None)]
+    #[case("SPXO", "SPX", Some("SPXO"))]
+    #[case("SPXW", "SPX", Some("SPXW"))]
+    #[case("SPY", "SPY", None)]
+    fn test_chain_underlying_and_root(
+        #[case] symbol: &str,
+        #[case] underlying: &str,
+        #[case] root: Option<&str>,
+    ) {
+        assert_eq!(underlying_and_root(symbol), (underlying, root));
+    }
+
+    #[rstest]
+    #[case("SPX", "SPX261120P07350000", "AM", "2026-11-20T14:30:00Z")]
+    #[case("SPXO", "SPXO261216P07350000", "AM", "2026-12-16T14:30:00Z")]
+    #[case("SPXW", "SPXW261216P07350000", "PM", "2026-12-16T21:00:00Z")]
     fn test_spx_uses_index_metadata(
         #[case] root: &str,
-        #[case] kind: ContractKind,
+        #[case] symbol: &str,
+        #[case] session: &str,
         #[case] expiration_utc: &str,
     ) {
-        let symbol = format!("{root}261120P06000000");
         let contract: AlpacaOptionContract = serde_json::from_value(json!({
             "symbol": symbol,
             "root_symbol": root,
             "underlying_symbol": "SPX",
-            "expiration_date": "2026-11-20",
+            "expiration_date": expiration_utc.split_once('T').unwrap().0,
             "type": "put",
             "style": "european",
-            "strike_price": "6000",
+            "strike_price": "7350",
             "multiplier": "100",
             "status": "active",
             "tradable": true,
@@ -504,14 +521,17 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert_eq!(contract.supported_kind(), Some(kind));
+        let kind = contract.supported_kind().unwrap();
 
         let InstrumentAny::OptionContract(option) =
             contract.instrument(kind, UnixNanos::default()).unwrap()
         else {
             panic!("Expected a Nautilus option contract");
         };
-        assert_eq!(option.id, instrument_id(&symbol).unwrap());
+        assert_eq!(option.id, instrument_id(symbol).unwrap());
+        let info = option.info.as_ref().unwrap();
+        assert_eq!(info.get_str("root_symbol"), Some(root));
+        assert_eq!(info.get_str("expiration_session"), Some(session));
         assert_eq!(option.underlying.as_str(), "SPX");
         assert_eq!(option.underlying_instrument_id, None);
         assert_eq!(option.asset_class, AssetClass::Index);
