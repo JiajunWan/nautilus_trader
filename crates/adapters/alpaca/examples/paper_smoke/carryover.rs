@@ -29,7 +29,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use uuid::Uuid;
 
-const PAPER_API_URL: &str = "https://paper-api.alpaca.markets";
+pub(super) const PAPER_API_URL: &str = "https://paper-api.alpaca.markets";
 const NEW_YORK: &str = "America/New_York";
 const CLIENT_ORDER_PREFIX: &str = "PAPER-CARRY-";
 
@@ -113,7 +113,7 @@ pub(super) async fn cancel(order_id: Uuid, proxy_url: Option<&SecretString>) -> 
     Ok(())
 }
 
-fn paper_client(proxy_url: Option<&SecretString>) -> Result<HttpClient> {
+pub(super) fn paper_client(proxy_url: Option<&SecretString>) -> Result<HttpClient> {
     let mut headers: HashMap<_, _> = create_standard_nautilus_headers().into_iter().collect();
     headers.insert(
         "APCA-API-KEY-ID".into(),
@@ -201,7 +201,11 @@ fn trade_date(timestamp: &Zoned) -> Result<Date> {
     Ok(timestamp.date())
 }
 
-async fn verify_trading_dates(client: &HttpClient, start: Date, end: Date) -> Result<()> {
+pub(super) async fn verify_trading_dates(
+    client: &HttpClient,
+    start: Date,
+    end: Date,
+) -> Result<()> {
     let response = client
         .request_with_params(
             Method::GET,

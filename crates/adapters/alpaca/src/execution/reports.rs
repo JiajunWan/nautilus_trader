@@ -18,6 +18,7 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, PositionSide, TrailingOffsetType, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+    orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::orders::{parse_order_status, parse_order_type, parse_time_in_force};
-use crate::{http::AlpacaHttpClient, provider::instrument_id};
+use crate::{http::AlpacaHttpClient, option_provider::is_option_symbol, provider::instrument_id};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct Account {
@@ -56,15 +57,21 @@ impl Account {
 pub(super) struct BrokerOrder {
     pub id: String,
     pub client_order_id: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
     pub symbol: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
     pub asset_class: String,
+    pub order_class: Option<String>,
+    pub position_intent: Option<String>,
     pub status: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
     pub side: String,
     #[serde(rename = "type")]
     pub order_type: String,
     pub time_in_force: String,
     pub qty: Option<Decimal>,
     pub filled_qty: Decimal,
+    pub filled_at: Option<String>,
     pub filled_avg_price: Option<Decimal>,
     pub limit_price: Option<Decimal>,
     pub stop_price: Option<Decimal>,
@@ -75,41 +82,79 @@ pub(super) struct BrokerOrder {
     pub submitted_at: Option<String>,
     pub replaced_by: Option<String>,
     pub replaces: Option<String>,
-    pub legs: Option<Vec<BrokerOrder>>,
+    pub legs: Option<Vec<Self>>,
     pub advanced_instructions: Option<Value>,
 }
 
 impl BrokerOrder {
+    pub(super) fn is_combo(&self) -> bool {
+        self.order_class.as_deref() == Some("mleg") && self.symbol.is_empty()
+    }
+
+    pub(super) fn fill_timestamp(&self) -> anyhow::Result<UnixNanos> {
+        timestamp(
+            self.filled_at
+                .as_deref()
+                .context("Alpaca order missing fill timestamp")?,
+        )
+    }
+
     pub(super) fn to_report(
         &self,
         account_id: AccountId,
         client_order_id: Option<ClientOrderId>,
         ts_init: UnixNanos,
     ) -> anyhow::Result<OrderStatusReport> {
+        self.to_report_for(account_id, client_order_id, ts_init, None)
+    }
+
+    pub(super) fn to_report_for(
+        &self,
+        account_id: AccountId,
+        client_order_id: Option<ClientOrderId>,
+        ts_init: UnixNanos,
+        combo: Option<&OrderAny>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        let (instrument, side) = match combo {
+            Some(order) => (order.instrument_id(), order.order_side()),
+            None => (instrument_id(&self.symbol)?, order_side(&self.side)?),
+        };
+        let native_price = |value| {
+            if combo.is_some() {
+                super::combos::cash_price(value, side)
+            } else {
+                value
+            }
+        };
         let ts_accepted = timestamp(self.submitted_at.as_deref().unwrap_or(&self.created_at))?;
         let ts_last = timestamp(self.updated_at.as_deref().unwrap_or(&self.created_at))?;
         let mut report = OrderStatusReport::new(
             account_id,
-            instrument_id(&self.symbol)?,
+            instrument,
             client_order_id,
             VenueOrderId::new_checked(&self.id)?,
-            Some(order_side(&self.side)?),
+            Some(side),
             parse_order_type(&self.order_type)?,
             parse_time_in_force(&self.time_in_force)?,
             parse_order_status(&self.status)?,
-            quantity(
-                self.qty
-                    .context("Alpaca equity order missing share quantity")?,
-            )?,
+            quantity(self.qty.context("Alpaca order missing base quantity")?)?,
             quantity(self.filled_qty)?,
             ts_accepted,
             ts_last,
             ts_init,
             None,
+        )
+        .with_reduce_only(
+            combo.is_some_and(Order::is_reduce_only)
+                || self.asset_class == "us_option"
+                    && matches!(
+                        self.position_intent.as_deref(),
+                        Some("buy_to_close" | "sell_to_close")
+                    ),
         );
 
-        if let Some(price) = self.limit_price {
-            report = report.with_price(Price::from_decimal(price.normalize())?);
+        if let Some(limit) = self.limit_price {
+            report = report.with_price(Price::from_decimal(native_price(limit).normalize())?);
         }
         if let Some(price) = self.stop_price {
             report = report
@@ -117,7 +162,7 @@ impl BrokerOrder {
                 .with_trigger_type(TriggerType::LastPrice);
         }
         if let Some(price) = self.filled_avg_price {
-            report = report.with_avg_px(price);
+            report = report.with_avg_px(native_price(price));
         }
         if let Some(offset) = self.trail_price {
             report = report
@@ -140,9 +185,26 @@ impl BrokerOrder {
         Ok(VenueOrderId::new_checked(&self.id)?)
     }
 
-    pub(super) fn equity(&self) -> bool {
-        self.asset_class == "us_equity"
+    pub(super) fn supported(&self) -> bool {
+        match self.asset_class.as_str() {
+            "us_equity" => self.order_class.as_deref() != Some("mleg"),
+            "us_option" => {
+                self.order_class
+                    .as_deref()
+                    .is_none_or(|class| matches!(class, "" | "simple"))
+                    && is_option_symbol(&self.symbol)
+                    && matches!(self.side.as_str(), "buy" | "sell")
+            }
+            _ => false,
+        }
     }
+}
+
+fn string_or_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,7 +293,7 @@ pub(super) fn quantity(value: Decimal) -> anyhow::Result<Quantity> {
 pub(super) fn order_side(side: &str) -> anyhow::Result<OrderSide> {
     match side {
         "buy" => Ok(OrderSide::Buy),
-        "sell" => Ok(OrderSide::Sell),
+        "sell" | "sell_short" => Ok(OrderSide::Sell),
         _ => anyhow::bail!("Unknown Alpaca order side {side}"),
     }
 }
@@ -265,14 +327,24 @@ pub(super) async fn orders(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<BrokerOrder>> {
+    let combo = instrument.is_some_and(crate::option_spread::is_spread);
+    let option = combo || instrument.is_some_and(|id| is_option_symbol(id.symbol.as_str()));
     let mut query = OrdersQuery {
         status: if open_only { "open" } else { "all" },
-        asset_class: "us_equity",
+        asset_class: match (instrument, option) {
+            (None, _) => "us_equity,us_option",
+            (Some(_), true) => "us_option",
+            _ => "us_equity",
+        },
         limit: 500,
         direction: "asc",
         after: start.map(|ts| ts.to_datetime_utc().to_string()),
         until: end.map(|ts| ts.to_datetime_utc().to_string()),
-        symbols: instrument.map(|id| id.symbol.to_string()),
+        // The options endpoint may interpret symbols as underliers. Match the
+        // complete contract symbol after pagination.
+        symbols: instrument
+            .filter(|_| !option)
+            .map(|id| id.symbol.to_string()),
     };
     let mut result = Vec::new();
     loop {
@@ -289,7 +361,13 @@ pub(super) async fn orders(
             );
             query.after = Some(cursor);
         }
-        result.append(&mut page);
+        result.extend(page.drain(..).filter(|order| {
+            if combo {
+                order.is_combo()
+            } else {
+                instrument.is_none_or(|id| order.symbol == id.symbol.as_str())
+            }
+        }));
         if !full {
             return Ok(result);
         }
@@ -347,7 +425,8 @@ pub(super) async fn exact_order(
     http: &AlpacaHttpClient,
     venue_id: VenueOrderId,
 ) -> anyhow::Result<BrokerOrder> {
-    http.get(&format!("/v2/orders/{venue_id}"), &()).await
+    http.get(&format!("/v2/orders/{venue_id}"), &[("nested", "true")])
+        .await
 }
 
 pub(super) async fn order(
@@ -360,7 +439,10 @@ pub(super) async fn order(
     } else if let Some(client_order_id) = client_order_id {
         http.get(
             "/v2/orders:by_client_order_id",
-            &[("client_order_id", client_order_id.to_string())],
+            &[
+                ("client_order_id", client_order_id.to_string()),
+                ("nested", "true".to_owned()),
+            ],
         )
         .await
     } else {

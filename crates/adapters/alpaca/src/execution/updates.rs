@@ -20,17 +20,22 @@ use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus},
-    identifiers::{ClientOrderId, TradeId, VenueOrderId},
+    events::OrderEventAny,
+    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     orders::{Order, OrderAny},
-    reports::FillReport,
+    reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Price},
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::reports::{BrokerOrder, order_side, quantity, timestamp, trade_id};
-use crate::provider::instrument_id;
+use super::{
+    combos,
+    orders::parse_order_status,
+    reports::{BrokerOrder, order_side, quantity, timestamp, trade_id},
+};
+use crate::{option_spread, provider::instrument_id};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TradeUpdate {
@@ -51,7 +56,7 @@ impl TradeUpdate {
         )
     }
 
-    fn is_fill(&self) -> bool {
+    pub(super) fn is_fill(&self) -> bool {
         matches!(self.event.as_str(), "fill" | "partial_fill")
     }
 
@@ -86,6 +91,7 @@ struct TrackedOrder {
     order: OrderAny,
     active_venue_id: Option<VenueOrderId>,
     status: OrderStatus,
+    last_combo_update: UnixNanos,
     fills: HashSet<TradeId>,
 }
 
@@ -113,6 +119,7 @@ impl OrderState {
             .or_insert_with(|| TrackedOrder {
                 status: order.status(),
                 active_venue_id: order.venue_order_id(),
+                last_combo_update: order.ts_last(),
                 order,
                 fills: HashSet::new(),
             });
@@ -191,6 +198,145 @@ impl OrderState {
             .client_for(current_venue_id)
             .or_else(|| self.broker_client_ids.get(&order.client_order_id).copied())
             .or_else(|| original_venue_id.and_then(|id| self.client_for(id))))
+    }
+
+    pub(super) fn combo_order(&self, order: &BrokerOrder) -> anyhow::Result<Option<&OrderAny>> {
+        if !order.is_combo() {
+            return Ok(None);
+        }
+        Ok(self
+            .broker_order_client_id(order)?
+            .and_then(|id| self.tracked.get(&id))
+            .map(|tracked| &tracked.order)
+            .filter(|order| option_spread::is_spread(order.instrument_id())))
+    }
+
+    pub(super) fn combo_orders(
+        &self,
+        instrument: Option<InstrumentId>,
+        venue_id: Option<VenueOrderId>,
+        start: Option<UnixNanos>,
+    ) -> Vec<(ClientOrderId, Option<VenueOrderId>)> {
+        self.tracked
+            .iter()
+            .filter(|(_, tracked)| {
+                let id = tracked.order.instrument_id();
+                option_spread::is_spread(id)
+                    && instrument.is_none_or(|instrument| instrument == id)
+                    && venue_id.is_none_or(|venue_id| tracked.active_venue_id == Some(venue_id))
+                    && start.is_none_or(|ts| {
+                        tracked.last_combo_update >= ts || !tracked.status.is_closed()
+                    })
+            })
+            .map(|(&id, tracked)| (id, tracked.active_venue_id))
+            .collect()
+    }
+
+    pub(super) fn order_report(
+        &self,
+        order: &BrokerOrder,
+        account_id: AccountId,
+        client_id: Option<ClientOrderId>,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let combo = self.combo_order(order)?;
+        if !order.supported() && combo.is_none() {
+            return Ok(None);
+        }
+        let client_id = client_id
+            .or(self.broker_order_client_id(order)?)
+            .or(Some(order.client_id()?));
+        Ok(Some(
+            order.to_report_for(account_id, client_id, ts_init, combo)?,
+        ))
+    }
+
+    pub(super) fn handle_combo(
+        &mut self,
+        snapshot: &BrokerOrder,
+        emitter: &ExecutionEventEmitter,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let Some(order) = self.combo_order(snapshot)? else {
+            return Ok(());
+        };
+        let client_id = order.client_order_id();
+        let venue_id = snapshot.venue_id()?;
+        let status = parse_order_status(&snapshot.status)?;
+        let tracked = self
+            .tracked
+            .get_mut(&client_id)
+            .context("Missing Alpaca combo order")?;
+        ensure!(
+            tracked.active_venue_id.is_none_or(|id| id == venue_id),
+            "Alpaca combo broker order ID changed unexpectedly",
+        );
+        if tracked.status.is_closed() {
+            return Ok(());
+        }
+        let order = &tracked.order;
+        let filled = if status == OrderStatus::Filled {
+            let ts_init = get_atomic_clock_realtime().get_time_ns();
+            let parent = combos::parent_fill(snapshot, order, emitter.account_id(), ts_init)?;
+            let legs = combos::leg_fills(snapshot, order, emitter.account_id(), ts_init)?;
+            Some((parent, legs))
+        } else {
+            None
+        };
+
+        self.venue_client_ids.insert(venue_id, client_id);
+        tracked.active_venue_id = Some(venue_id);
+        tracked.last_combo_update = tracked.last_combo_update.max(ts_event);
+        if matches!(
+            tracked.status,
+            OrderStatus::Initialized | OrderStatus::Submitted
+        ) && matches!(
+            status,
+            OrderStatus::Accepted | OrderStatus::PendingCancel | OrderStatus::Filled
+        ) {
+            emitter.emit_order_accepted(order, venue_id, ts_event);
+            tracked.status = OrderStatus::Accepted;
+        }
+        match status {
+            OrderStatus::Filled => {
+                let (parent, legs) = filled.context("Missing Alpaca combo fill")?;
+                for leg in legs {
+                    emitter.try_send_order_event(OrderEventAny::Filled(leg))?;
+                }
+                emitter.emit_order_filled(
+                    order,
+                    venue_id,
+                    None,
+                    parent.trade_id,
+                    parent.last_qty,
+                    parent.last_px,
+                    Currency::USD(),
+                    Some(parent.commission),
+                    LiquiditySide::NoLiquiditySide,
+                    parent.ts_event,
+                );
+                tracked.status = OrderStatus::Filled;
+            }
+            OrderStatus::Canceled => {
+                emitter.emit_order_canceled(order, Some(venue_id), ts_event);
+                tracked.status = status;
+            }
+            OrderStatus::Expired => {
+                emitter.emit_order_expired(order, Some(venue_id), ts_event);
+                tracked.status = status;
+            }
+            OrderStatus::Rejected => {
+                emitter.emit_order_rejected(
+                    order,
+                    "Alpaca rejected the option combo",
+                    ts_event,
+                    false,
+                );
+                tracked.status = status;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub(super) fn active_orders(&self) -> Vec<(ClientOrderId, Option<VenueOrderId>)> {
@@ -282,7 +428,23 @@ impl OrderState {
         update: TradeUpdate,
         emitter: &ExecutionEventEmitter,
     ) -> anyhow::Result<()> {
-        if !update.order.equity() {
+        if update.order.is_combo() {
+            let ts_event = update.ts_event()?;
+            if update.event == "order_cancel_rejected" {
+                if let Some(order) = self.combo_order(&update.order)? {
+                    emitter.emit_order_cancel_rejected(
+                        order,
+                        Some(update.order.venue_id()?),
+                        "Alpaca trade stream rejected the combo cancel",
+                        ts_event,
+                        None,
+                    );
+                }
+                return Ok(());
+            }
+            return self.handle_combo(&update.order, emitter, ts_event);
+        }
+        if !update.order.supported() {
             return Ok(());
         }
 
@@ -470,6 +632,16 @@ mod tests {
         ExecutionEventEmitter,
         mpsc::UnboundedReceiver<ExecutionEvent>,
     ) {
+        execution_rig_for("SPY")
+    }
+
+    fn execution_rig_for(
+        symbol: &str,
+    ) -> (
+        OrderState,
+        ExecutionEventEmitter,
+        mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
@@ -482,7 +654,7 @@ mod tests {
 
         let mut builder = OrderTestBuilder::new(OrderType::Limit);
         builder
-            .instrument_id(instrument_id("SPY").unwrap())
+            .instrument_id(instrument_id(symbol).unwrap())
             .client_order_id(ClientOrderId::from("client-id"))
             .side(OrderSide::Buy)
             .quantity(Quantity::from(1))
@@ -517,17 +689,22 @@ mod tests {
     }
 
     #[rstest]
-    fn emits_acceptance_before_early_fill_and_deduplicates_replay() {
-        let (mut state, emitter, mut rx) = execution_rig();
-        state
-            .handle(update("fill", "filled", "venue-a", "client-id"), &emitter)
-            .unwrap();
-        state
-            .handle(update("new", "new", "venue-a", "client-id"), &emitter)
-            .unwrap();
-        state
-            .handle(update("fill", "filled", "venue-a", "client-id"), &emitter)
-            .unwrap();
+    #[case("SPY", "us_equity")]
+    #[case("SPY261120C00745000", "us_option")]
+    fn emits_acceptance_before_early_fill_and_deduplicates_replay(
+        #[case] symbol: &str,
+        #[case] asset_class: &str,
+    ) {
+        let (mut state, emitter, mut rx) = execution_rig_for(symbol);
+        let update = |event, status| {
+            let mut item = update(event, status, "venue-a", "client-id");
+            item.order.symbol = symbol.to_string();
+            item.order.asset_class = asset_class.to_string();
+            item
+        };
+        state.handle(update("fill", "filled"), &emitter).unwrap();
+        state.handle(update("new", "new"), &emitter).unwrap();
+        state.handle(update("fill", "filled"), &emitter).unwrap();
 
         assert!(
             matches!(rx.try_recv().unwrap(), ExecutionEvent::Order(OrderEventAny::Accepted(event))
@@ -541,7 +718,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "id": "example-activity-id",
                 "order_id": "venue-a",
-                "symbol": "SPY",
+                "symbol": symbol,
                 "side": "buy",
                 "qty": "1",
                 "cum_qty": "1.000",
@@ -553,6 +730,9 @@ mod tests {
             .to_report(emitter.account_id(), None, UnixNanos::default())
             .unwrap();
         assert_eq!(fill.trade_id, report.trade_id);
+        assert_eq!(fill.instrument_id, report.instrument_id);
+        assert_eq!(fill.last_qty, report.last_qty);
+        assert_eq!(fill.last_px, report.last_px);
         assert!(rx.try_recv().is_err());
     }
 

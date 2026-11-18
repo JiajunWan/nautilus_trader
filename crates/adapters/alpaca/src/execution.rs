@@ -13,9 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Alpaca Trading API execution client for US equities.
+//! Alpaca Trading API execution client for US equities and options.
 
 mod advanced;
+#[cfg(test)]
+mod combo_tests;
+mod combos;
 mod orders;
 mod reports;
 mod updates;
@@ -50,8 +53,9 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    enums::OmsType,
+    enums::{AssetClass, OmsType},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance},
@@ -65,7 +69,10 @@ use serde_json::{Map, Value, json};
 use tokio::{sync::mpsc, time::timeout};
 
 use self::{
-    orders::{order_list_request, order_request, replacement_instructions},
+    orders::{
+        extended_hours, option_order_request, order_list_request, order_request,
+        replacement_instructions,
+    },
     reports::{Account, BrokerOrder, FillActivity, Position},
     updates::{OrderState, TradeUpdate},
 };
@@ -73,6 +80,8 @@ use crate::{
     common::{ALPACA, credential::AlpacaCredentials},
     config::AlpacaExecutionClientConfig,
     http::{AlpacaApiError, AlpacaHttpClient},
+    option_provider::is_option_symbol,
+    option_spread,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -162,6 +171,7 @@ impl AlpacaExecutionClient {
             return Ok(());
         }
         let grouped = orders.len() > 1;
+        let combo = body["order_class"] == "mleg";
         let http = self.http.clone();
         let emitter = self.emitter.clone();
         let state = Arc::clone(&self.orders);
@@ -189,6 +199,7 @@ impl AlpacaExecutionClient {
             let mut state = lock_state(&state)?;
             let result = match result {
                 Ok(order) if grouped => state.bind_group(&order, &orders),
+                Ok(order) if combo => state.handle_combo(&order, &emitter, now()),
                 Ok(order) => state.remember_advanced_instructions(&order),
                 Err(error) => {
                     if let CommandFailure::VenueRejected(reason) = classify(&error) {
@@ -226,6 +237,46 @@ impl AlpacaExecutionClient {
             return Err(error);
         }
         Ok(())
+    }
+
+    fn submit_request(&self, order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
+        let id = order.instrument_id();
+        if option_spread::is_spread(id) {
+            let cache = self.core.cache();
+            ensure!(
+                matches!(cache.instrument(&id), Some(InstrumentAny::OptionSpread(_))),
+                "Load the Alpaca spread instrument before submitting its order: {id}",
+            );
+            let legs = option_spread::legs(id)?;
+            let instruments = legs
+                .iter()
+                .map(|(id, _)| {
+                    cache
+                        .instrument(id)
+                        .with_context(|| format!("Load Alpaca option leg {id} before submitting"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            option_spread::definition(id, &instruments, now())?;
+            return combos::request(order, params);
+        }
+        if is_option_symbol(id.symbol.as_str()) {
+            let cache = self.core.cache();
+            let Some(InstrumentAny::OptionContract(instrument)) = cache.instrument(&id) else {
+                anyhow::bail!(
+                    "Load the Alpaca option instrument before submitting its order: {id}"
+                );
+            };
+            match instrument.asset_class() {
+                AssetClass::Equity => {}
+                AssetClass::Index => ensure!(
+                    !extended_hours(params)?,
+                    "Alpaca index options require regular hours",
+                ),
+                _ => anyhow::bail!("Unsupported Alpaca option asset class for {id}"),
+            }
+            return option_order_request(order, params);
+        }
+        order_request(order, params)
     }
 
     fn active_order_id(
@@ -319,14 +370,16 @@ impl ExecutionClient for AlpacaExecutionClient {
         {
             let cache = self.core.cache();
             let mut state = self.order_state()?;
-            for order in cache.orders_open_refs(
+            for order in cache.orders_refs(
                 Some(&*ALPACA),
                 None,
                 None,
                 Some(&self.core.account_id),
                 None,
             ) {
-                state.register(order.as_ref().clone());
+                if !order.is_closed() || option_spread::is_spread(order.instrument_id()) {
+                    state.register(order.as_ref().clone());
+                }
             }
         }
 
@@ -418,12 +471,16 @@ impl ExecutionClient for AlpacaExecutionClient {
             .or(cmd.venue_order_id);
         self.spawn("query_order", async move {
             if let Some(order) = reports::order(&http, Some(cmd.client_order_id), venue_id).await? {
-                lock_state(&state)?.remember_advanced_instructions(&order)?;
-                emitter.send_order_status_report(order.to_report(
+                let mut state = lock_state(&state)?;
+                if let Some(report) = state.order_report(
+                    &order,
                     emitter.account_id(),
                     Some(cmd.client_order_id),
                     now(),
-                )?);
+                )? {
+                    state.remember_advanced_instructions(&order)?;
+                    emitter.send_order_status_report(report);
+                }
             }
             Ok(())
         })
@@ -431,7 +488,8 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         let order = self.core.get_order(&cmd.client_order_id)?;
-        let body = match order_request(&order, cmd.params.as_ref()) {
+        let request = self.submit_request(&order, cmd.params.as_ref());
+        let body = match request {
             Ok(body) => body,
             Err(error) => {
                 self.emitter.emit_order_denied(&order, &error.to_string());
@@ -457,6 +515,17 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let order = self.core.get_order(&cmd.client_order_id)?;
+        if is_option_symbol(order.instrument_id().symbol.as_str())
+            || option_spread::is_spread(order.instrument_id())
+        {
+            self.emitter.emit_order_modify_denied(
+                &order,
+                "Alpaca option modification is not supported",
+                now(),
+                cmd.causation_id,
+            );
+            return Ok(());
+        }
         if !self.is_connected() {
             self.emitter.emit_order_modify_denied(
                 &order,
@@ -661,20 +730,13 @@ impl ExecutionClient for AlpacaExecutionClient {
         let Some(order) = reports::order(&self.http, cmd.client_order_id, venue_id).await? else {
             return Ok(None);
         };
-        if !order.equity() {
-            return Ok(None);
-        }
         let mut state = self.order_state()?;
-        state.remember_advanced_instructions(&order)?;
-        let client_id = cmd
-            .client_order_id
-            .or(state.broker_order_client_id(&order)?)
-            .or(Some(order.client_id()?));
-        Ok(Some(order.to_report(
-            self.core.account_id,
-            client_id,
-            now(),
-        )?))
+        let report =
+            state.order_report(&order, self.core.account_id, cmd.client_order_id, now())?;
+        if report.is_some() {
+            state.remember_advanced_instructions(&order)?;
+        }
+        Ok(report)
     }
 
     async fn generate_order_status_reports(
@@ -690,40 +752,61 @@ impl ExecutionClient for AlpacaExecutionClient {
         )
         .await?;
         let mut state = self.order_state()?;
-        orders
+        let mut result = Vec::new();
+        for order in orders
             .into_iter()
-            .filter(|order| order.equity() && order.replaced_by.is_none())
-            .map(|order| {
+            .filter(|order| order.replaced_by.is_none())
+        {
+            if let Some(report) = state.order_report(&order, self.core.account_id, None, now())?
+                && cmd
+                    .instrument_id
+                    .is_none_or(|id| id == report.instrument_id)
+            {
                 state.remember_advanced_instructions(&order)?;
-                let client_id = state
-                    .broker_order_client_id(&order)?
-                    .or(Some(order.client_id()?));
-                order.to_report(self.core.account_id, client_id, now())
-            })
-            .collect()
+                result.push(report);
+            }
+        }
+        Ok(result)
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let fills = equity_fills(
-            &self.http,
-            &self.orders,
-            cmd.instrument_id,
-            cmd.venue_order_id,
-            cmd.start,
-            cmd.end,
-        )
-        .await?;
-        let state = self.order_state()?;
-        fills
-            .into_iter()
-            .map(|fill| {
+        let mut result = Vec::new();
+        if !cmd.instrument_id.is_some_and(option_spread::is_spread) {
+            let fills = supported_fills(
+                &self.http,
+                &self.orders,
+                cmd.instrument_id,
+                cmd.venue_order_id,
+                cmd.start,
+                cmd.end,
+            )
+            .await?;
+            let state = self.order_state()?;
+            for fill in fills {
                 let client_id = state.client_for(VenueOrderId::new_checked(&fill.order_id)?);
-                fill.to_report(self.core.account_id, client_id, now())
-            })
-            .collect()
+                result.push(fill.to_report(self.core.account_id, client_id, now())?);
+            }
+        }
+        let combos =
+            self.order_state()?
+                .combo_orders(cmd.instrument_id, cmd.venue_order_id, cmd.start);
+        for (client_id, venue_id) in combos {
+            if let Some(snapshot) = reports::order(&self.http, Some(client_id), venue_id).await?
+                && snapshot.status == "filled"
+                && let Some(order) = self.order_state()?.combo_order(&snapshot)?
+            {
+                let fill = combos::parent_fill(&snapshot, order, self.core.account_id, now())?;
+                if cmd.start.is_none_or(|start| fill.ts_event >= start)
+                    && cmd.end.is_none_or(|end| fill.ts_event <= end)
+                {
+                    result.push(fill);
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn generate_position_status_reports(
@@ -733,7 +816,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         let positions: Vec<Position> = self.http.get("/v2/positions", &()).await?;
         positions
             .into_iter()
-            .filter(|position| position.asset_class == "us_equity")
+            .filter(|position| matches!(position.asset_class.as_str(), "us_equity" | "us_option"))
             .filter(|position| {
                 cmd.instrument_id
                     .is_none_or(|id| id.symbol.as_str() == position.symbol)
@@ -856,17 +939,23 @@ impl StreamTask {
             }
             match serde_json::from_slice::<PrivateMessage>(frame.as_bytes()) {
                 Ok(PrivateMessage::TradeUpdates(update)) => {
-                    let result = update.ts_event().and_then(|timestamp| {
-                        lock_state(&self.state)?.handle(*update, &self.emitter)?;
+                    let result = async {
+                        let timestamp = update.ts_event()?;
+                        if update.order.is_combo() && update.is_fill() {
+                            self.apply_combo(&update.order, timestamp).await?;
+                        } else {
+                            lock_state(&self.state)?.handle(*update, &self.emitter)?;
+                        }
                         self.last_seen = self.last_seen.max(timestamp);
-                        Ok(())
-                    });
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
                     if let Err(error) = result {
                         log::error!("Invalid Alpaca trade update: {error:#}");
                     }
                 }
                 Ok(message) => {
-                    log::warn!("Unexpected Alpaca private WebSocket message: {message:?}")
+                    log::warn!("Unexpected Alpaca private WebSocket message: {message:?}");
                 }
                 Err(error) => log::error!("Invalid Alpaca private WebSocket frame: {error}"),
             }
@@ -875,11 +964,31 @@ impl StreamTask {
         anyhow::bail!("Alpaca private WebSocket message stream closed")
     }
 
+    async fn apply_combo(&self, snapshot: &BrokerOrder, ts_event: UnixNanos) -> anyhow::Result<()> {
+        let result = lock_state(&self.state)?.handle_combo(snapshot, &self.emitter, ts_event);
+        if result.is_ok() || snapshot.status != "filled" {
+            return result;
+        }
+        // The fill notification can precede the last leg snapshot on the parent
+        let venue_id = snapshot.venue_id()?;
+        for _ in 0..3 {
+            let order = reports::exact_order(&self.http, venue_id).await?;
+            if order.status == "filled" {
+                let result = lock_state(&self.state)?.handle_combo(&order, &self.emitter, ts_event);
+                if result.is_ok() {
+                    return result;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        result
+    }
+
     async fn reconcile(&self) -> anyhow::Result<()> {
         let start = self.last_seen.saturating_sub(DurationNanos::from_secs(1));
         let (mut orders, fills, account): (_, _, Account) = tokio::try_join!(
             reports::orders(&self.http, None, false, Some(start), None),
-            equity_fills(&self.http, &self.state, None, None, Some(start), None),
+            supported_fills(&self.http, &self.state, None, None, Some(start), None),
             self.http.get("/v2/account", &()),
         )?;
         let active_orders = lock_state(&self.state)?.active_orders();
@@ -890,6 +999,14 @@ impl StreamTask {
             {
                 orders.push(order);
             }
+        }
+
+        for order in orders.iter().filter(|order| order.is_combo()) {
+            self.apply_combo(
+                order,
+                reports::timestamp(order.updated_at.as_deref().unwrap_or(&order.created_at))?,
+            )
+            .await?;
         }
 
         let mut state = lock_state(&self.state)?;
@@ -903,7 +1020,7 @@ impl StreamTask {
 
         for order in orders
             .into_iter()
-            .filter(|order| order.equity() && order.replaced_by.is_none())
+            .filter(|order| order.supported() && order.replaced_by.is_none())
         {
             let client_id = state
                 .broker_order_client_id(&order)?
@@ -935,7 +1052,7 @@ impl StreamTask {
     }
 }
 
-async fn equity_fills(
+async fn supported_fills(
     http: &AlpacaHttpClient,
     state: &Mutex<OrderState>,
     instrument: Option<InstrumentId>,
@@ -944,7 +1061,7 @@ async fn equity_fills(
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<FillActivity>> {
     let fills = reports::fills(http, start, end).await?;
-    let mut equity_by_order = HashMap::new();
+    let mut supported_by_order = HashMap::new();
     let mut result = Vec::new();
     for fill in fills
         .into_iter()
@@ -953,16 +1070,16 @@ async fn equity_fills(
     {
         let venue_id = VenueOrderId::new_checked(&fill.order_id)?;
         let owned = lock_state(state)?.client_for(venue_id).is_some();
-        let is_equity = if owned {
+        let supported = if owned {
             true
-        } else if let Some(equity) = equity_by_order.get(&venue_id) {
-            *equity
+        } else if let Some(supported) = supported_by_order.get(&venue_id) {
+            *supported
         } else {
-            let is_equity = reports::exact_order(http, venue_id).await?.equity();
-            equity_by_order.insert(venue_id, is_equity);
-            is_equity
+            let supported = reports::exact_order(http, venue_id).await?.supported();
+            supported_by_order.insert(venue_id, supported);
+            supported
         };
-        if is_equity {
+        if supported {
             result.push(fill);
         }
     }

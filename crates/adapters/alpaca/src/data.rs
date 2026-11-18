@@ -53,6 +53,7 @@ use crate::{
     market_data::{HistoryKind, HistoryRequest, StockQuote, StockTrade, historical, timeframe},
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
     option_provider::{is_option_symbol, load_option_chain, load_option_contract},
+    option_spread,
     provider::{instrument_id, load_asset, load_assets, load_selected_assets},
 };
 
@@ -105,6 +106,10 @@ impl AlpacaDataClient {
         subscribe: bool,
     ) -> anyhow::Result<()> {
         validate_instruments(ids)?;
+        ensure!(
+            !ids.iter().copied().any(option_spread::is_spread),
+            "Alpaca spread quotes must be constructed from the leg quotes",
+        );
         ensure!(
             !subscribe || (self.tasks.is_open() && !self.sockets.is_empty()),
             "Alpaca market data client has not connected",
@@ -254,7 +259,11 @@ impl DataClient for AlpacaDataClient {
         }
         for symbol in &self.config.load_option_symbols {
             let id = instrument_id(symbol)?;
-            let instrument = load_option_contract(&self.trading, id, ts_init).await?;
+            let instrument = if option_spread::is_spread(id) {
+                option_spread::load(&self.trading, id, ts_init).await?
+            } else {
+                load_option_contract(&self.trading, id, ts_init).await?
+            };
             self.sender
                 .send(DataEvent::Data(instrument.into()))
                 .context("Publishing Alpaca option definition")?;
@@ -610,7 +619,9 @@ async fn load_instrument(
     id: InstrumentId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
-    if is_option_symbol(id.symbol.as_str()) {
+    if option_spread::is_spread(id) {
+        option_spread::load(http, id, ts_init).await
+    } else if is_option_symbol(id.symbol.as_str()) {
         load_option_contract(http, id, ts_init).await
     } else {
         let asset = load_asset(http, id).await?;
@@ -622,7 +633,7 @@ fn validate_stock_history(ids: &[InstrumentId]) -> anyhow::Result<()> {
     validate_instruments(ids)?;
     for id in ids {
         ensure!(
-            !is_option_symbol(id.symbol.as_str()),
+            !is_option_symbol(id.symbol.as_str()) && !option_spread::is_spread(*id),
             "Alpaca historical option data is not supported for {id}",
         );
     }

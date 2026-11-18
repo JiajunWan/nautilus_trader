@@ -96,9 +96,8 @@ settlement, including early closes. SPX index spot data requires a separate
 provider. For direct OPRA chain snapshots of SPXO, use
 `/v1beta1/options/snapshots/SPXO`.
 
-The option adapter currently provides definitions and streaming quote and
-trade ticks. Equity order workflows, auction instructions, overnight
-execution and historical data requests remain equity features.
+Options support instrument definitions and streaming quote and trade ticks.
+Single-leg execution supports loaded standard equity and ETF option contracts.
 
 For a read-only check of Paper instrument definitions and OPRA ticks, pass
 one or more active OCC contract symbols. Tick counts depend on the contracts
@@ -128,6 +127,66 @@ These time-in-force values depend on Alpaca account eligibility.
 See [order types and time-in-force](https://docs.alpaca.markets/us/docs/orders-at-alpaca)
 and [24/5 Trading](https://docs.alpaca.markets/us/docs/245-trading-for-trading-api)
 for the broker's order and session restrictions.
+
+### Single-leg options
+
+Submit a single Market or Limit order with DAY time in force for a loaded
+equity, ETF, or supported index option instrument. Index option orders
+execute during regular hours. Quantity counts whole contracts. The adapter sends buys
+with `buy_to_open` and sells with `sell_to_close`. It routes cancellation by
+Alpaca order ID and reconciles single-leg option orders and FILL activities
+using the complete OCC symbol. Position reports also include option positions.
+
+Set `extended_hours: true` on DAY Limit orders for broker-enabled equity and
+ETF option contracts. Check the Paper asset's `has_options_extended_hours`
+attribute and the current [Alpaca options session rules](https://docs.alpaca.markets/us/docs/equity-options-eth)
+before testing this route. For regular-hours Paper smoke tests, choose an
+active non-0DTE contract with a fresh two-sided OPRA quote and no existing
+position or orders.
+
+```sh
+cargo run -p nautilus-alpaca --features examples --example alpaca-paper-smoke -- --option OCC_SYMBOL --limit-round-trip
+```
+
+Use `--market-round-trip` for DAY Market orders and `--regular-limit PRICE`
+for a passive DAY Limit cancellation. The eligible morning session can use
+`--extended-round-trip` or `--extended-limit PRICE`. Confirm both order
+receipts and the final position in Paper after each round trip.
+
+### Multi-leg option orders
+
+Use the same generic spread ID as other Nautilus spread adapters. Load both
+the leg contracts and the spread definition before submitting an order. For a
+vertical call spread, build the ID with the long leg at ratio `+1` and the
+short leg at ratio `-1`:
+
+```python
+from nautilus_trader.model import new_generic_spread_id
+
+spread_id = new_generic_spread_id([(long_leg.id, 1), (short_leg.id, -1)])
+```
+
+Request the spread through the strategy's instrument request or pass the leg
+OCC symbols and `str(spread_id.symbol)` in the Alpaca data config's
+`load_option_symbols`. Subscribe to the legs for quotes.
+
+Submit one regular-hours Limit DAY order on `spread_id`. The first version
+supports one lot with two to four option legs on the same underlying and
+requires Alpaca options Level 3. Index legs must share the same expiration
+and settlement session. A non-reduce-only order opens the legs. Set
+`reduce_only=True` and reverse the side on the same spread ID to close them.
+For example, a Buy at 0.47 limits the debit to 0.47 for a long call spread.
+A reduce-only Sell at 0.35 limits the credit to at least 0.35. The adapter
+translates the Sell limit to Alpaca's signed cash-flow price of -0.35.
+
+The adapter submits one Alpaca `mleg` order and cancels it by parent UUID.
+It uses the parent net fill to update the combo order and the broker's leg
+fills to update the option positions. On reconciliation the adapter reports
+known parent orders from the local cache and reconciles positions by OCC
+symbol. Orders submitted outside Nautilus have no cached combo identity.
+Combo replacement and spread quote subscriptions are outside this initial
+support. See [Alpaca multi-leg orders](https://docs.alpaca.markets/us/docs/options-level-3-trading)
+and [index options](https://docs.alpaca.markets/us/docs/index-options).
 
 ## Elite Smart Router
 

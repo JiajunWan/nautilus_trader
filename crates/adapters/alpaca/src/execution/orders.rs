@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Converts Nautilus equity orders to Alpaca order requests.
+//! Converts Nautilus orders to Alpaca order requests.
 
 use anyhow::{Context, bail, ensure};
 use nautilus_core::Params;
@@ -28,7 +28,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use super::advanced::AdvancedInstructions;
-use crate::option_provider::is_option_symbol;
+use crate::{option_provider::is_option_symbol, option_spread};
 
 pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
     ensure!(
@@ -41,6 +41,62 @@ pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow
         instructions.validate_order(order.order_type(), order.time_in_force(), extended)?;
         request["order_class"] = json!("simple");
         request["advanced_instructions"] = serde_json::to_value(instructions)?;
+    }
+    Ok(request)
+}
+
+pub(super) fn option_order_request(
+    order: &OrderAny,
+    params: Option<&Params>,
+) -> anyhow::Result<Value> {
+    ensure!(
+        order.contingency_type().is_none() && order.parent_order_id().is_none(),
+        "Submit Alpaca single-leg options as standalone orders",
+    );
+    ensure!(
+        !order.is_quote_quantity()
+            && order.quantity().as_decimal().fract().is_zero()
+            && !order.quantity().is_zero(),
+        "Alpaca options require a positive whole-contract base quantity",
+    );
+    ensure!(
+        !order.is_post_only() && order.display_qty().is_none(),
+        "Alpaca options do not support post-only or display quantities",
+    );
+    ensure!(
+        AdvancedInstructions::from_params(params)?.is_none(),
+        "Alpaca advanced instructions require an equity order",
+    );
+    ensure!(
+        order.time_in_force() == TimeInForce::Day,
+        "Alpaca single-leg option execution requires DAY time in force",
+    );
+    let extended = extended_hours(params)?;
+    let order_type = match order.order_type() {
+        OrderType::Limit => "limit",
+        OrderType::Market if !extended => "market",
+        _ => bail!(
+            "Alpaca options require limit orders in extended hours and market or limit in regular hours"
+        ),
+    };
+    // Bind closing sales to an existing long position at the broker.
+    let (side, intent) = match order.order_side() {
+        OrderSide::Buy if !order.is_reduce_only() => ("buy", "buy_to_open"),
+        OrderSide::Buy => bail!("Alpaca buy-to-close is not supported by this adapter"),
+        OrderSide::Sell => ("sell", "sell_to_close"),
+    };
+    let mut request = json!({
+        "symbol": order.instrument_id().symbol.to_string(),
+        "qty": order.quantity().as_decimal().normalize().to_string(),
+        "side": side,
+        "position_intent": intent,
+        "type": order_type,
+        "time_in_force": "day",
+        "client_order_id": order.client_order_id().to_string(),
+        "extended_hours": extended,
+    });
+    if order.order_type() == OrderType::Limit {
+        request["limit_price"] = json!(limit_price(order)?);
     }
     Ok(request)
 }
@@ -180,7 +236,7 @@ pub(super) fn order_list_request(
     Ok(request)
 }
 
-fn extended_hours(params: Option<&Params>) -> anyhow::Result<bool> {
+pub(super) fn extended_hours(params: Option<&Params>) -> anyhow::Result<bool> {
     params
         .and_then(|params| params.get("extended_hours"))
         .map_or(Ok(false), |value| {
@@ -192,8 +248,9 @@ fn extended_hours(params: Option<&Params>) -> anyhow::Result<bool> {
 
 fn validate_equity_order(order: &OrderAny) -> anyhow::Result<()> {
     ensure!(
-        !is_option_symbol(order.instrument_id().symbol.as_str()),
-        "Alpaca option execution is not supported",
+        !is_option_symbol(order.instrument_id().symbol.as_str())
+            && !option_spread::is_spread(order.instrument_id()),
+        "Alpaca equity execution requires a stock symbol",
     );
     ensure!(
         !order.is_quote_quantity(),
@@ -431,8 +488,58 @@ mod tests {
         let error = order_request(&order, None).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Alpaca option execution is not supported"
+            "Alpaca equity execution requires a stock symbol"
         );
+    }
+
+    #[rstest]
+    #[case(OrderType::Market, OrderSide::Buy, false, "market", "buy_to_open")]
+    #[case(OrderType::Limit, OrderSide::Sell, true, "limit", "sell_to_close")]
+    fn maps_option_position_intent(
+        #[case] order_type: OrderType,
+        #[case] side: OrderSide,
+        #[case] extended: bool,
+        #[case] wire_type: &str,
+        #[case] wire_intent: &str,
+    ) {
+        let order = order_builder(order_type, "OPT-1")
+            .instrument_id(InstrumentId::from("SPY261120C00745000.ALPACA"))
+            .side(side)
+            .price(Price::from("2.40"))
+            .build();
+        let params = Params::new([("extended_hours".to_string(), json!(extended))].into());
+        let request = option_order_request(&order, Some(&params)).unwrap();
+        assert_eq!(request["symbol"], "SPY261120C00745000");
+        assert_eq!(request["qty"], "1");
+        assert_eq!(request["time_in_force"], "day");
+        assert_eq!(request["type"], wire_type);
+        assert_eq!(request["position_intent"], wire_intent);
+        assert_eq!(request["extended_hours"], extended);
+        if order_type == OrderType::Limit {
+            assert_eq!(request["limit_price"], "2.4");
+        } else {
+            assert!(request.get("limit_price").is_none());
+        }
+    }
+
+    #[rstest]
+    #[case(OrderType::Limit, TimeInForce::Gtc, Quantity::from(1), true)]
+    #[case(OrderType::Limit, TimeInForce::Day, Quantity::from("0.5"), true)]
+    #[case(OrderType::Market, TimeInForce::Day, Quantity::from(1), true)]
+    fn rejects_invalid_option_combinations(
+        #[case] order_type: OrderType,
+        #[case] time_in_force: TimeInForce,
+        #[case] quantity: Quantity,
+        #[case] extended: bool,
+    ) {
+        let order = order_builder(order_type, "OPT-1")
+            .instrument_id(InstrumentId::from("SPY261120C00745000.ALPACA"))
+            .price(Price::from("2.40"))
+            .quantity(quantity)
+            .time_in_force(time_in_force)
+            .build();
+        let params = Params::new([("extended_hours".to_string(), json!(extended))].into());
+        assert!(option_order_request(&order, Some(&params)).is_err());
     }
 
     #[rstest]

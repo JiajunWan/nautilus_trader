@@ -25,6 +25,7 @@ pub use http::request_option_catalog;
 mod market_data;
 mod market_stream;
 mod option_provider;
+mod option_spread;
 pub use option_provider::OptionCatalogEntry;
 pub(crate) mod provider;
 #[cfg(feature = "python")]

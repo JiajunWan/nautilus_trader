@@ -25,6 +25,8 @@
 //! Use `-- --extended-round-trip` (DAY) or `-- --extended-gtc-round-trip` (GTC)
 //! to buy and sell one paper share with price-capped extended-hours orders.
 //! Prefix round-trip or extended limit modes with `--symbol SYMBOL` to select an equity.
+//! Prefix a Market or Limit DAY round trip or a passive limit cancellation with
+//! `--option OCC_SYMBOL` to test a single equity option contract in Paper.
 //! Use `--extended-dma-limit NASDAQ|ARCA PRICE` to submit and cancel a routed DAY limit.
 //! Use `-- --hold-limit DAY|GTC PRICE` to leave one nonmarketable, extended-hours
 //! order open. Verify and cancel it using `-- --verify-carryover DAY|GTC UUID`, or
@@ -52,7 +54,7 @@ use jiff::{
 use nautilus_alpaca::{
     common::{
         ALPACA_VENUE,
-        enums::{AlpacaEnvironment, AlpacaOvernightFeed, AlpacaStockFeed},
+        enums::{AlpacaEnvironment, AlpacaOptionFeed, AlpacaOvernightFeed, AlpacaStockFeed},
     },
     config::{AlpacaDataClientConfig, AlpacaExecutionClientConfig},
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
@@ -75,6 +77,8 @@ use rust_decimal::{Decimal, RoundingStrategy};
 mod auction;
 #[path = "paper_smoke/carryover.rs"]
 mod carryover;
+#[path = "paper_smoke/options.rs"]
+mod options;
 
 #[derive(Debug, Clone, Copy)]
 enum LimitRoute {
@@ -258,6 +262,7 @@ struct PaperSmoke {
     mode: Mode,
     remaining_modes: VecDeque<Mode>,
     instrument_id: InstrumentId,
+    option: bool,
     bar_type: BarType,
     node: LiveNodeHandle,
     observation: Rc<RefCell<Observation>>,
@@ -270,6 +275,14 @@ struct PaperSmoke {
 impl PaperSmoke {
     fn submit(&mut self, order: OrderAny, params: Option<Params>) -> Result<()> {
         self.active_order = Some(order.client_order_id());
+        if self.option {
+            log::info!(
+                "Paper option submitting {} {} {}",
+                order.client_order_id(),
+                order.instrument_id(),
+                order.order_side(),
+            );
+        }
         self.submit_order(order, None, None, params)
     }
 
@@ -327,7 +340,13 @@ impl PaperSmoke {
         };
 
         let cent = Decimal::new(1, 2);
-        let (side, price) = if self.round_trip_buy_filled {
+        let (side, price) = if self.option {
+            if self.round_trip_buy_filled {
+                (OrderSide::Sell, bid)
+            } else {
+                (OrderSide::Buy, ask)
+            }
+        } else if self.round_trip_buy_filled {
             let price = bid.round_dp_with_strategy(2, RoundingStrategy::ToNegativeInfinity) - cent;
             (OrderSide::Sell, price)
         } else {
@@ -444,7 +463,8 @@ impl PaperSmoke {
     fn maybe_stop(&self) {
         let observed = self.observation.borrow();
         let data_complete = observed.quote
-            && (matches!(self.mode, Mode::AdvancedChecks | Mode::Carryover { .. })
+            && (self.option
+                || matches!(self.mode, Mode::AdvancedChecks | Mode::Carryover { .. })
                 || (observed.trade && observed.bar));
         let execution_complete = matches!(self.mode, Mode::Data) || observed.execution.is_some();
         if (data_complete && execution_complete) || matches!(&observed.execution, Some(Err(_))) {
@@ -584,7 +604,7 @@ impl DataActor for PaperSmoke {
         }
         self.subscribe_quotes(self.instrument_id, None, None);
         self.subscribe_trades(self.instrument_id, None, None);
-        if !matches!(self.mode, Mode::AdvancedChecks) {
+        if !self.option && !matches!(self.mode, Mode::AdvancedChecks) {
             self.subscribe_bars(self.bar_type, None, None);
         }
         Ok(())
@@ -630,6 +650,10 @@ impl DataActor for PaperSmoke {
                     time_in_force,
                 } => self.submit_limit_round_trip(quote, extended_hours, time_in_force),
                 Mode::AdvancedChecks => self.submit_advanced_check(quote),
+                Mode::Limit { .. } if self.option && fresh_prices(quote).is_none() => {
+                    self.submitted = false;
+                    Ok(())
+                }
                 Mode::Limit { price, route } if price < quote.bid_price => {
                     let order = self.limit_order(OrderSide::Buy, price, TimeInForce::Day, None);
                     if let LimitRoute::Dma(destination) = route {
@@ -809,7 +833,31 @@ async fn main() -> Result<()> {
             Ok((target.duration_since(now) + SignedDuration::from_mins(4)).try_into()?)
         })
         .transpose()?;
-    let (mut modes, iex_only, symbol) = if auction.is_some() {
+    let (option, args) = match args.as_slice() {
+        [flag, symbol, rest @ ..] if flag == "--option" => {
+            ensure!(
+                matches!(
+                    rest,
+                    [mode] if matches!(mode.as_str(), "--market-round-trip" | "--limit-round-trip" | "--extended-round-trip")
+                ) || matches!(rest, [mode, _] if matches!(mode.as_str(), "--regular-limit" | "--extended-limit")),
+                "Select a single-leg option DAY round trip or submit-and-cancel limit mode",
+            );
+            let symbol = Symbol::new_checked(symbol)?;
+            let local = now.in_tz(NEW_YORK)?;
+            let session = if rest[0].starts_with("--extended-") {
+                time(7, 30, 0, 0)..time(9, 23, 0, 0)
+            } else {
+                time(9, 30, 0, 0)..time(15, 57, 0, 0)
+            };
+            ensure!(
+                local.weekday().to_monday_one_offset() <= 5 && session.contains(&local.time()),
+                "Paper option smoke mode requires an open session with time to reconcile",
+            );
+            (Some(symbol), rest.to_vec())
+        }
+        _ => (None, args),
+    };
+    let (mut modes, iex_only, default_symbol) = if auction.is_some() {
         (
             VecDeque::new(),
             false,
@@ -818,6 +866,13 @@ async fn main() -> Result<()> {
     } else {
         Mode::parse(args)?
     };
+    let symbol = option.unwrap_or(default_symbol);
+    let option_rest = option
+        .map(|_| carryover::paper_client(proxy_url.as_ref()))
+        .transpose()?;
+    if let Some(client) = &option_rest {
+        options::preflight(symbol.as_str(), now, client).await?;
+    }
     let mode = modes.pop_front();
     let suite = !modes.is_empty();
     let history = matches!(mode, Some(Mode::History(_)));
@@ -851,7 +906,14 @@ async fn main() -> Result<()> {
         .maybe_api_secret(mock_credential)
         .maybe_base_url_http_trading(asset_base_url)
         .maybe_base_url_ws_public(relay_port.map(|port| format!("ws://127.0.0.1:{port}")))
-        .load_symbols(vec![symbol.to_string()])
+        .load_symbols(vec![default_symbol.to_string()])
+        .load_option_symbols(
+            option
+                .map(|symbol| symbol.to_string())
+                .into_iter()
+                .collect(),
+        )
+        .maybe_option_feed(option.map(|_| AlpacaOptionFeed::Opra))
         .http_timeout_secs(30)
         .maybe_proxy_url(proxy_url.clone())
         .maybe_market_data_api_key(market_key.map(SecretString::from))
@@ -862,7 +924,8 @@ async fn main() -> Result<()> {
             AlpacaStockFeed::Sip
         })
         .maybe_overnight_feed(
-            (!iex_only && auction.is_none()).then_some(AlpacaOvernightFeed::Boats),
+            (!iex_only && auction.is_none() && option.is_none())
+                .then_some(AlpacaOvernightFeed::Boats),
         )
         .build();
     let trader = if auction.is_some() {
@@ -913,6 +976,7 @@ async fn main() -> Result<()> {
         mode,
         remaining_modes: modes,
         instrument_id,
+        option: option.is_some(),
         bar_type: format!("{instrument_id}-1-MINUTE-LAST-EXTERNAL").parse()?,
         node: node.handle(),
         observation: Rc::clone(&observation),
@@ -922,11 +986,16 @@ async fn main() -> Result<()> {
         advanced_checked: 0,
     })?;
 
-    run_node(
+    let result = run_node(
         &mut node,
         Duration::from_secs(if suite { 180 } else { 120 }),
     )
-    .await?;
+    .await;
+    if let Some(client) = &option_rest {
+        options::require_flat(symbol.as_str(), client).await?;
+        log::info!("Paper option {symbol} position and open orders are zero");
+    }
+    result?;
 
     let mut observed = observation.borrow_mut();
     if history {
@@ -946,7 +1015,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Timed out waiting for the paper order workflow"))?
             .map_err(anyhow::Error::msg)?;
     }
-    if suite || matches!(mode, Mode::AdvancedChecks | Mode::Carryover { .. }) {
+    if option.is_some() || suite || matches!(mode, Mode::AdvancedChecks | Mode::Carryover { .. }) {
         ensure!(observed.quote, "No SPY quote received");
         return Ok(());
     }
