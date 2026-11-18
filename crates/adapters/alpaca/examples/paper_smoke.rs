@@ -394,8 +394,8 @@ impl DataActor for PaperSmoke {
             return Ok(());
         }
         self.subscribe_quotes(self.instrument_id, None, None);
+        self.subscribe_trades(self.instrument_id, None, None);
         if !matches!(self.mode, Mode::AdvancedChecks) {
-            self.subscribe_trades(self.instrument_id, None, None);
             self.subscribe_bars(self.bar_type, None, None);
         }
         Ok(())
@@ -419,6 +419,9 @@ impl DataActor for PaperSmoke {
             self.observation.borrow_mut().quote = true;
         }
 
+        if matches!(self.mode, Mode::AdvancedChecks) && !self.observation.borrow().trade {
+            return Ok(());
+        }
         if !self.submitted {
             self.submitted = true;
             let result = match self.mode {
