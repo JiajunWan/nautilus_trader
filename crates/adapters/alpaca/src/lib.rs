@@ -18,6 +18,8 @@
 pub mod common;
 pub mod config;
 pub mod data;
+pub mod execution;
+pub mod factories;
 pub(crate) mod http;
 mod market_data;
 mod market_stream;
