@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Alpaca US equities integration for NautilusTrader"
+description = "Alpaca US equities and options integration for NautilusTrader"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
@@ -48,6 +48,7 @@ bon = { workspace = true }
 jiff = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }
+rmp-serde = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -70,4 +71,9 @@ rstest = { workspace = true }
 [[example]]
 name = "alpaca-paper-smoke"
 path = "examples/paper_smoke.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "alpaca-option-data"
+path = "examples/option_data.rs"
 required-features = ["examples"]

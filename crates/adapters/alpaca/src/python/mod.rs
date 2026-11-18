@@ -25,7 +25,7 @@ use pyo3::prelude::*;
 use crate::{
     common::{
         ALPACA_CLIENT_ID, ALPACA_NAME, ALPACA_VENUE,
-        enums::{AlpacaEnvironment, AlpacaOvernightFeed, AlpacaStockFeed},
+        enums::{AlpacaEnvironment, AlpacaOptionFeed, AlpacaOvernightFeed, AlpacaStockFeed},
     },
     config::{AlpacaDataClientConfig, AlpacaExecutionClientConfig},
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
@@ -44,6 +44,7 @@ pub fn alpaca(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AlpacaEnvironment>()?;
     m.add_class::<AlpacaStockFeed>()?;
     m.add_class::<AlpacaOvernightFeed>()?;
+    m.add_class::<AlpacaOptionFeed>()?;
     m.add_class::<AlpacaDataClientConfig>()?;
     m.add_class::<AlpacaDataClientFactory>()?;
     m.add_class::<AlpacaExecutionClientConfig>()?;

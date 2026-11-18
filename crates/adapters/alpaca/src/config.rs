@@ -19,11 +19,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{
     credential::AlpacaCredentials,
-    enums::{AlpacaEnvironment, AlpacaOvernightFeed, AlpacaStockFeed},
+    enums::{AlpacaEnvironment, AlpacaOptionFeed, AlpacaOvernightFeed, AlpacaStockFeed},
     urls,
 };
 
-/// Configuration for Alpaca stock market data and instrument discovery.
+/// Configuration for Alpaca stock and options market data and instrument discovery.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
@@ -49,11 +49,16 @@ pub struct AlpacaDataClientConfig {
     /// Stock symbols to load at startup. An empty list loads all active equities.
     #[builder(default)]
     pub load_symbols: Vec<String>,
+    /// Exact option contract symbols to load at startup.
+    #[builder(default)]
+    pub load_option_symbols: Vec<String>,
     /// Daytime market data feed.
     #[builder(default)]
     pub stock_feed: AlpacaStockFeed,
     /// Optional overnight market data feed.
     pub overnight_feed: Option<AlpacaOvernightFeed>,
+    /// Optional options market data feed.
+    pub option_feed: Option<AlpacaOptionFeed>,
     /// Public market data REST base URL override.
     pub base_url_http: Option<String>,
     /// Trading REST base URL override for instrument discovery.

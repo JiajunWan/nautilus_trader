@@ -13,7 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Alpaca stock feed authentication, subscriptions and event dispatch.
+//! Alpaca market feed authentication, subscriptions and event dispatch.
+
+#[path = "option_wire.rs"]
+mod option_wire;
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -28,6 +31,7 @@ use nautilus_network::{
     RECONNECTED,
     websocket::{WebSocketClient, WebSocketConfig, channel_epoch_message_handler},
 };
+use option_wire::OptionMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use tokio::sync::{mpsc, watch};
@@ -95,12 +99,42 @@ struct Authentication<'a> {
     secret: &'a str,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WireFormat {
+    Json,
+    MsgPack,
+}
+
+impl WireFormat {
+    async fn send(
+        self,
+        socket: &WebSocketClient,
+        epoch: u64,
+        request: &impl Serialize,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Json => {
+                let request = serde_json::to_string(request)?;
+                socket.send_text_on_connection(request, None, epoch).await?;
+            }
+            Self::MsgPack => {
+                let request = rmp_serde::to_vec_named(request)?;
+                socket
+                    .send_bytes_on_connection(request, None, epoch)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StockStream {
     socket: Arc<WebSocketClient>,
     input: mpsc::UnboundedReceiver<(u64, Message)>,
     credential: AlpacaCredentials,
     feed: &'static str,
+    format: WireFormat,
     authenticated_epoch: u64,
 }
 
@@ -111,11 +145,37 @@ impl StockStream {
         credential: AlpacaCredentials,
         proxy_url: Option<&str>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_format(url, feed, credential, proxy_url, WireFormat::Json).await
+    }
+
+    pub(crate) async fn connect_options(
+        url: String,
+        feed: &'static str,
+        credential: AlpacaCredentials,
+        proxy_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_format(url, feed, credential, proxy_url, WireFormat::MsgPack).await
+    }
+
+    async fn connect_with_format(
+        url: String,
+        feed: &'static str,
+        credential: AlpacaCredentials,
+        proxy_url: Option<&str>,
+        format: WireFormat,
+    ) -> anyhow::Result<Self> {
         let (handler, input) = channel_epoch_message_handler();
+        let headers = match format {
+            WireFormat::Json => Vec::new(),
+            WireFormat::MsgPack => {
+                vec![("Content-Type".to_owned(), "application/msgpack".to_owned())]
+            }
+        };
         let socket = WebSocketClient::epoch_builder()
             .config(
                 WebSocketConfig::builder()
                     .url(url)
+                    .headers(headers)
                     .maybe_proxy_url(proxy_url.map(str::to_owned))
                     .build()?,
             )
@@ -129,6 +189,7 @@ impl StockStream {
             input,
             credential,
             feed,
+            format,
             authenticated_epoch: epoch,
         };
         if let Err(error) = stream.authenticate(epoch).await {
@@ -143,13 +204,16 @@ impl StockStream {
     }
 
     async fn authenticate(&mut self, epoch: u64) -> anyhow::Result<()> {
-        let request = serde_json::to_string(&Authentication {
-            action: "auth",
-            key: self.credential.key(),
-            secret: self.credential.secret(),
-        })?;
-        self.socket
-            .send_text_on_connection(request, None, epoch)
+        self.format
+            .send(
+                &self.socket,
+                epoch,
+                &Authentication {
+                    action: "auth",
+                    key: self.credential.key(),
+                    secret: self.credential.secret(),
+                },
+            )
             .await?;
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -163,8 +227,11 @@ impl StockStream {
                 if payload == RECONNECTED.as_bytes() {
                     continue;
                 }
-                for message in serde_json::from_slice::<Vec<&RawValue>>(payload)? {
-                    let header: Header<'_> = serde_json::from_str(message.get())?;
+                let headers: Vec<Header<'_>> = match self.format {
+                    WireFormat::Json => serde_json::from_slice(payload)?,
+                    WireFormat::MsgPack => rmp_serde::from_slice(payload)?,
+                };
+                for header in headers {
                     match (header.kind, header.msg) {
                         ("success", Some("authenticated")) => return Ok(()),
                         ("error", _) => anyhow::bail!(
@@ -225,7 +292,10 @@ impl StockStream {
                         let desired = subscriptions.borrow_and_update().clone();
                         self.synchronize(&mut applied, desired).await?;
                     } else if message_epoch == self.authenticated_epoch {
-                        dispatch(payload, sender)?;
+                        match self.format {
+                            WireFormat::Json => dispatch(payload, sender)?,
+                            WireFormat::MsgPack => dispatch_options(payload, sender)?,
+                        }
                     }
                 }
             }
@@ -241,7 +311,7 @@ impl StockStream {
         if epoch != self.socket.connection_epoch() || !self.socket.is_active() {
             return Ok(());
         }
-        match update_subscriptions(&self.socket, epoch, applied, &desired).await {
+        match update_subscriptions(&self.socket, self.format, epoch, applied, &desired).await {
             Ok(()) => *applied = desired,
             Err(error) if epoch != self.socket.connection_epoch() || !self.socket.is_active() => {
                 log::debug!("Alpaca {} subscription interrupted: {error}", self.feed);
@@ -262,6 +332,7 @@ fn payload(message: &Message) -> Option<&[u8]> {
 
 async fn update_subscriptions(
     socket: &WebSocketClient,
+    format: WireFormat,
     epoch: u64,
     applied: &StockSubscriptions,
     desired: &StockSubscriptions,
@@ -285,9 +356,7 @@ async fn update_subscriptions(
         }
         if !request.is_empty() {
             request.insert("action".to_owned(), json!(action));
-            socket
-                .send_text_on_connection(Value::Object(request).to_string(), None, epoch)
-                .await?;
+            format.send(socket, epoch, &Value::Object(request)).await?;
         }
     }
     Ok(())
@@ -334,6 +403,17 @@ fn dispatch(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> 
         sender
             .send(DataEvent::Data(data))
             .context("Sending Alpaca market data")?;
+    }
+    Ok(())
+}
+
+fn dispatch_options(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> {
+    for message in rmp_serde::from_slice::<Vec<OptionMessage<'_>>>(body)? {
+        if let Some(data) = message.data()? {
+            sender
+                .send(DataEvent::Data(data))
+                .context("Sending Alpaca option market data")?;
+        }
     }
     Ok(())
 }

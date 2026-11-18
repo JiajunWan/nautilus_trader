@@ -20,7 +20,7 @@ use nautilus_model::{enums::AccountType, identifiers::AccountId};
 use pyo3::pymethods;
 
 use crate::{
-    common::enums::{AlpacaEnvironment, AlpacaOvernightFeed, AlpacaStockFeed},
+    common::enums::{AlpacaEnvironment, AlpacaOptionFeed, AlpacaOvernightFeed, AlpacaStockFeed},
     config::{AlpacaDataClientConfig, AlpacaExecutionClientConfig},
 };
 
@@ -28,7 +28,9 @@ nautilus_core::impl_pyo3_config_getters!(AlpacaDataClientConfig {
     environment: AlpacaEnvironment,
     stock_feed: AlpacaStockFeed,
     overnight_feed: Option<AlpacaOvernightFeed>,
+    option_feed: Option<AlpacaOptionFeed>,
     load_symbols: Vec<String>,
+    load_option_symbols: Vec<String>,
     base_url_http: Option<String>,
     base_url_http_trading: Option<String>,
     base_url_ws_public: Option<String>,
@@ -47,7 +49,7 @@ nautilus_core::impl_pyo3_config_getters!(AlpacaExecutionClientConfig {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl AlpacaDataClientConfig {
-    /// Configuration for Alpaca US equity market data.
+    /// Configuration for Alpaca US equity and options market data.
     #[new]
     #[pyo3(signature = (
         *,
@@ -58,7 +60,9 @@ impl AlpacaDataClientConfig {
         market_data_api_secret = None,
         stock_feed = None,
         overnight_feed = None,
+        option_feed = None,
         load_symbols = None,
+        load_option_symbols = None,
         base_url_http = None,
         base_url_http_trading = None,
         base_url_ws_public = None,
@@ -74,7 +78,9 @@ impl AlpacaDataClientConfig {
         market_data_api_secret: Option<String>,
         stock_feed: Option<AlpacaStockFeed>,
         overnight_feed: Option<AlpacaOvernightFeed>,
+        option_feed: Option<AlpacaOptionFeed>,
         load_symbols: Option<Vec<String>>,
+        load_option_symbols: Option<Vec<String>>,
         base_url_http: Option<String>,
         base_url_http_trading: Option<String>,
         base_url_ws_public: Option<String>,
@@ -90,7 +96,9 @@ impl AlpacaDataClientConfig {
             market_data_api_secret: market_data_api_secret.map(SecretString::from),
             stock_feed: stock_feed.unwrap_or(defaults.stock_feed),
             overnight_feed,
+            option_feed,
             load_symbols: load_symbols.unwrap_or(defaults.load_symbols),
+            load_option_symbols: load_option_symbols.unwrap_or(defaults.load_option_symbols),
             base_url_http,
             base_url_http_trading,
             base_url_ws_public,

@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Native Alpaca equity data client.
+//! Native Alpaca equity and options data client.
 
 use std::{future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
 
@@ -38,7 +38,10 @@ use nautilus_core::{
     time::get_atomic_clock_realtime,
 };
 use nautilus_live::task::TaskGroup;
-use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
+use nautilus_model::{
+    identifiers::{ClientId, InstrumentId, Venue},
+    instruments::InstrumentAny,
+};
 use nautilus_network::websocket::WebSocketClient;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
@@ -49,10 +52,11 @@ use crate::{
     http::AlpacaHttpClient,
     market_data::{HistoryKind, HistoryRequest, StockQuote, StockTrade, historical, timeframe},
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
-    provider::{load_asset, load_assets, load_selected_assets},
+    option_provider::{is_option_symbol, load_option_chain, load_option_contract},
+    provider::{instrument_id, load_asset, load_assets, load_selected_assets},
 };
 
-/// Native equity quotes, trades, bars and instrument definitions from Alpaca.
+/// Native Alpaca quotes, trades, equity bars and instrument definitions.
 #[derive(Debug)]
 pub struct AlpacaDataClient {
     client_id: ClientId,
@@ -63,10 +67,11 @@ pub struct AlpacaDataClient {
     tasks: TaskGroup,
     sockets: Vec<Arc<WebSocketClient>>,
     subscriptions: watch::Sender<StockSubscriptions>,
+    option_subscriptions: watch::Sender<StockSubscriptions>,
 }
 
 impl AlpacaDataClient {
-    /// Constructs a stock market data client.
+    /// Constructs an Alpaca market data client.
     ///
     /// # Errors
     ///
@@ -95,6 +100,7 @@ impl AlpacaDataClient {
             tasks: TaskGroup::new(),
             sockets: Vec::new(),
             subscriptions: watch::channel(StockSubscriptions::default()).0,
+            option_subscriptions: watch::channel(StockSubscriptions::default()).0,
         })
     }
 
@@ -109,9 +115,28 @@ impl AlpacaDataClient {
             !subscribe || (self.tasks.is_open() && !self.sockets.is_empty()),
             "Alpaca market data client has not connected",
         );
-        self.subscriptions.send_modify(|subscriptions| {
-            subscriptions.change(channel, ids.iter().map(|id| id.symbol.as_str()), subscribe);
-        });
+        let (options, stocks): (Vec<_>, Vec<_>) = ids
+            .iter()
+            .map(|id| id.symbol.as_str())
+            .partition(|symbol| is_option_symbol(symbol));
+        if !options.is_empty() {
+            ensure!(
+                !matches!(channel, StockChannel::Bars),
+                "Alpaca option streams provide quotes and trades"
+            );
+            ensure!(
+                !subscribe || self.config.option_feed.is_some(),
+                "Configure an Alpaca option feed to subscribe to option data",
+            );
+            self.option_subscriptions.send_modify(|subscriptions| {
+                subscriptions.change(channel, options, subscribe);
+            });
+        }
+        if !stocks.is_empty() {
+            self.subscriptions.send_modify(|subscriptions| {
+                subscriptions.change(channel, stocks, subscribe);
+            });
+        }
         Ok(())
     }
 
@@ -194,6 +219,8 @@ impl DataClient for AlpacaDataClient {
         self.stop()?;
         self.subscriptions
             .send_replace(StockSubscriptions::default());
+        self.option_subscriptions
+            .send_replace(StockSubscriptions::default());
         Ok(())
     }
 
@@ -231,18 +258,27 @@ impl DataClient for AlpacaDataClient {
                 .send(DataEvent::Data(asset.instrument(ts_init)?.into()))
                 .context("Publishing Alpaca equity definition")?;
         }
+        for symbol in &self.config.load_option_symbols {
+            let id = instrument_id(symbol)?;
+            let instrument = load_option_contract(&self.trading, id, ts_init).await?;
+            self.sender
+                .send(DataEvent::Data(instrument.into()))
+                .context("Publishing Alpaca option definition")?;
+        }
 
         let market_credentials = self.config.market_credentials()?;
         let ws_origin = self.config.market_ws_origin().trim_end_matches('/');
+        let proxy_url = self
+            .config
+            .proxy_url
+            .as_ref()
+            .map(SecretString::expose_secret);
         let feed = self.config.stock_feed;
         let main = StockStream::connect(
             format!("{ws_origin}{}", feed.ws_path()),
             feed.as_str(),
             market_credentials.clone(),
-            self.config
-                .proxy_url
-                .as_ref()
-                .map(SecretString::expose_secret),
+            proxy_url,
         )
         .await
         .inspect_err(|error| log::error!("Connecting Alpaca daytime data: {error:#}"))?;
@@ -250,11 +286,8 @@ impl DataClient for AlpacaDataClient {
             match StockStream::connect(
                 format!("{ws_origin}{}", feed.ws_path()),
                 feed.as_str(),
-                market_credentials,
-                self.config
-                    .proxy_url
-                    .as_ref()
-                    .map(SecretString::expose_secret),
+                market_credentials.clone(),
+                proxy_url,
             )
             .await
             {
@@ -269,10 +302,37 @@ impl DataClient for AlpacaDataClient {
             None
         };
 
-        for stream in [Some(main), overnight].into_iter().flatten() {
+        let options = if let Some(feed) = self.config.option_feed {
+            match StockStream::connect_options(
+                format!("{ws_origin}{}", feed.ws_path()),
+                feed.as_str(),
+                market_credentials,
+                proxy_url,
+            )
+            .await
+            {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    main.socket().disconnect().await;
+                    if let Some(overnight) = &overnight {
+                        overnight.socket().disconnect().await;
+                    }
+                    return Err(error.context("Connecting Alpaca option data"));
+                }
+            }
+        } else {
+            None
+        };
+
+        for (stream, subscriptions) in [
+            (Some(main), &self.subscriptions),
+            (overnight, &self.subscriptions),
+            (options, &self.option_subscriptions),
+        ] {
+            let Some(stream) = stream else { continue };
             self.sockets.push(stream.socket());
             self.tasks.spawn(stream.run(
-                self.subscriptions.subscribe(),
+                subscriptions.subscribe(),
                 self.sender.clone(),
                 self.tasks.cancellation_token(),
             ))?;
@@ -318,14 +378,14 @@ impl DataClient for AlpacaDataClient {
             let result = async {
                 let ts_init = get_atomic_clock_realtime().get_time_ns();
                 for id in cmd.instrument_ids {
-                    let instrument = load_asset(&http, id).await?.instrument(ts_init)?;
+                    let instrument = load_instrument(&http, id, ts_init).await?;
                     sender.send(DataEvent::Data(instrument.into()))?;
                 }
                 Ok::<(), anyhow::Error>(())
             }
             .await;
             if let Err(error) = result {
-                log::error!("Subscribing to Alpaca stock definition: {error:#}");
+                log::error!("Subscribing to Alpaca instrument definition: {error:#}");
             }
         })?;
         Ok(())
@@ -371,11 +431,36 @@ impl DataClient for AlpacaDataClient {
         self.spawn_request(request.request_id, async move {
             let clock = get_atomic_clock_realtime();
             let ts_init = clock.get_time_ns();
-            let instruments = load_assets(&http)
-                .await?
-                .iter()
-                .map(|asset| asset.instrument(ts_init))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let instruments = match &request.params {
+                Some(params) if params.contains_key("option_underlying") => {
+                    let underlying = params
+                        .get_str("option_underlying")
+                        .context("Alpaca option_underlying must be a string")?;
+                    let expiration_bound = |key: &str| {
+                        params
+                            .get(key)
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .with_context(|| format!("Alpaca {key} must be a string"))
+                            })
+                            .transpose()
+                    };
+                    load_option_chain(
+                        &http,
+                        underlying,
+                        expiration_bound("expiration_date_gte")?,
+                        expiration_bound("expiration_date_lte")?,
+                        ts_init,
+                    )
+                    .await?
+                }
+                _ => load_assets(&http)
+                    .await?
+                    .iter()
+                    .map(|asset| asset.instrument(ts_init))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            };
             Ok(DataResponse::Instruments(InstrumentsResponse::new(
                 request.request_id,
                 client_id,
@@ -395,13 +480,13 @@ impl DataClient for AlpacaDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.trading.clone();
         self.spawn_request(request.request_id, async move {
-            let asset = load_asset(&http, id).await?;
             let ts_init = get_atomic_clock_realtime().get_time_ns();
+            let instrument = load_instrument(&http, id, ts_init).await?;
             Ok(DataResponse::Instrument(Box::new(InstrumentResponse::new(
                 request.request_id,
                 client_id,
                 id,
-                asset.instrument(ts_init)?,
+                instrument,
                 datetime_to_unix_nanos(request.start),
                 datetime_to_unix_nanos(request.end),
                 ts_init,
@@ -418,7 +503,7 @@ impl DataClient for AlpacaDataClient {
             request.params.as_ref(),
             None,
         )?;
-        validate_instruments(&request.instrument_ids)?;
+        validate_stock_history(&request.instrument_ids)?;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
@@ -453,7 +538,7 @@ impl DataClient for AlpacaDataClient {
             request.params.as_ref(),
             None,
         )?;
-        validate_instruments(&request.instrument_ids)?;
+        validate_stock_history(&request.instrument_ids)?;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
@@ -483,7 +568,7 @@ impl DataClient for AlpacaDataClient {
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let bar_type = request.single_bar_type()?;
         let id = bar_type.instrument_id();
-        validate_instruments(&[id])?;
+        validate_stock_history(&[id])?;
         let spec = self.history(
             request.start,
             request.end,
@@ -523,6 +608,30 @@ impl DataClient for AlpacaDataClient {
             )))
         })
     }
+}
+
+async fn load_instrument(
+    http: &AlpacaHttpClient,
+    id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    if is_option_symbol(id.symbol.as_str()) {
+        load_option_contract(http, id, ts_init).await
+    } else {
+        let asset = load_asset(http, id).await?;
+        asset.instrument(ts_init)
+    }
+}
+
+fn validate_stock_history(ids: &[InstrumentId]) -> anyhow::Result<()> {
+    validate_instruments(ids)?;
+    for id in ids {
+        ensure!(
+            !is_option_symbol(id.symbol.as_str()),
+            "Alpaca historical option data is not supported for {id}",
+        );
+    }
+    Ok(())
 }
 
 fn validate_instruments(ids: &[InstrumentId]) -> anyhow::Result<()> {

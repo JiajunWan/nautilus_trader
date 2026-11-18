@@ -5589,6 +5589,7 @@ dependencies = [
  "nautilus-trading",
  "pyo3",
  "pyo3-stub-gen",
+ "rmp-serde",
  "rstest",
  "rust_decimal",
  "serde",

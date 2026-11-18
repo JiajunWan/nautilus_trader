@@ -1,4 +1,4 @@
-# Alpaca US equities
+# Alpaca US equities and options
 
 The adapter exposes US equity instruments with IDs such as `SPY.ALPACA`.
 Register the two native factories with a `LiveNode`. Data and execution
@@ -30,6 +30,48 @@ Market data credentials default to the trading environment's credentials.
 Set `market_data_api_key` and `market_data_api_secret` together when the
 data entitlement is held by a different Alpaca account. This leaves order
 routing and instrument discovery in the configured trading environment.
+
+### Option market data
+
+Set `option_feed` to `AlpacaOptionFeed::Opra` in Rust or
+`AlpacaOptionFeed.OPRA` in Python to enable real-time option quotes and
+trades. OPRA requires an Alpaca data entitlement and its signed agreement.
+`Indicative` is available as an explicit alternative. Option subscriptions
+use their own connection and the complete OCC symbol with venue `ALPACA`.
+Set `load_option_symbols` to publish selected contracts at startup.
+
+Call `request_instrument` for one contract or `request_instruments` with
+`params["option_underlying"]` for a paginated chain. When a catalog is
+configured, set `params["force_instrument_update"]` to `true` to route
+the request to Alpaca. Set
+`expiration_date_gte` and `expiration_date_lte` as `YYYY-MM-DD` strings to
+bound discovery. Alpaca limits the default discovery window to the upcoming
+weekend. Use `SPX` as the underlying to discover both SPX and SPXW contracts
+or pass `SPXW` to select just that root. Discovery covers standard
+100-share equity and ETF contracts and 100-multiplier SPX and SPXW index
+contracts.
+
+SPX and SPXW both use the SPX underlying and European cash settlement.
+SPX has AM settlement and SPXW has PM settlement. Alpaca supplies an
+expiration date, so Nautilus uses 09:30 or 16:00 New York time as a
+nominal expiry timestamp. Consult the broker calendar and
+contract rules for the actual last tradable time and settlement, including
+early closes. SPX index spot data requires a separate provider.
+
+The option adapter currently provides definitions and streaming quote and
+trade ticks. Equity order workflows, auction instructions, overnight
+execution and historical data requests remain equity features.
+
+For a read-only check of Paper instrument definitions and OPRA ticks, pass
+one or more active OCC contract symbols. Tick counts depend on the contracts
+and time of day.
+
+```sh
+cargo run -p nautilus-alpaca --features examples --example alpaca-option-data -- OCC_SYMBOL
+```
+
+See [Alpaca Index Options](https://docs.alpaca.markets/us/docs/index-options)
+and [real-time option data](https://docs.alpaca.markets/us/docs/real-time-option-data).
 
 ## Orders
 

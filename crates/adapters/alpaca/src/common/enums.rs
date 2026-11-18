@@ -128,3 +128,47 @@ impl AlpacaOvernightFeed {
         }
     }
 }
+
+/// US options market data feed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        rename_all = "SCREAMING_SNAKE_CASE",
+        module = "nautilus_trader.adapters.alpaca",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.alpaca")
+)]
+pub enum AlpacaOptionFeed {
+    /// Options Price Reporting Authority feed.
+    Opra,
+    /// Alpaca's indicative options feed.
+    Indicative,
+}
+
+impl AlpacaOptionFeed {
+    /// Feed parameter for options REST requests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opra => "opra",
+            Self::Indicative => "indicative",
+        }
+    }
+
+    /// WebSocket path for this options feed.
+    #[must_use]
+    pub const fn ws_path(self) -> &'static str {
+        match self {
+            Self::Opra => "/v1beta1/opra",
+            Self::Indicative => "/v1beta1/indicative",
+        }
+    }
+}

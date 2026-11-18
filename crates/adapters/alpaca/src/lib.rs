@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Alpaca Trading and Market Data integration for US equities.
+//! Alpaca Trading and Market Data integration for US equities and options.
 
 pub mod common;
 pub mod config;
@@ -23,6 +23,7 @@ pub mod factories;
 pub(crate) mod http;
 mod market_data;
 mod market_stream;
+mod option_provider;
 pub(crate) mod provider;
 #[cfg(feature = "python")]
 pub mod python;

@@ -24,7 +24,7 @@ use nautilus_model::identifiers::{ClientId, Venue};
 /// Alpaca client and venue name.
 pub const ALPACA_NAME: &str = "ALPACA";
 
-/// Venue identifier for Alpaca-routed US equities.
+/// Venue identifier for Alpaca US equities and options.
 pub static ALPACA_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(ALPACA_NAME));
 
 /// Default Alpaca client identifier.

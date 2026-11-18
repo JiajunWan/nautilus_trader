@@ -28,6 +28,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use super::advanced::AdvancedInstructions;
+use crate::option_provider::is_option_symbol;
 
 pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
     ensure!(
@@ -190,6 +191,10 @@ fn extended_hours(params: Option<&Params>) -> anyhow::Result<bool> {
 }
 
 fn validate_equity_order(order: &OrderAny) -> anyhow::Result<()> {
+    ensure!(
+        !is_option_symbol(order.instrument_id().symbol.as_str()),
+        "Alpaca option execution is not supported",
+    );
     ensure!(
         !order.is_quote_quantity(),
         "Alpaca equity orders require a whole-share base quantity",
@@ -413,6 +418,21 @@ mod tests {
         let order = order_builder(OrderType::Market, "ORDER-1").build();
         let params = Params::new([("extended_hours".to_string(), json!(true))].into());
         assert!(order_request(&order, Some(&params)).is_err());
+    }
+
+    #[rstest]
+    #[case("SPY261118C00717000.ALPACA")]
+    #[case("SPX261120C04000000.ALPACA")]
+    #[case("SPXW261118C06450000.ALPACA")]
+    fn denies_options_in_the_equity_order_path(#[case] id: &str) {
+        let order = order_builder(OrderType::Market, "ORDER-1")
+            .instrument_id(InstrumentId::from(id))
+            .build();
+        let error = order_request(&order, None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Alpaca option execution is not supported"
+        );
     }
 
     #[rstest]

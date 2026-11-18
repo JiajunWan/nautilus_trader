@@ -15,6 +15,7 @@ __all__ = [
     "AlpacaEnvironment",
     "AlpacaExecutionClientConfig",
     "AlpacaExecutionClientFactory",
+    "AlpacaOptionFeed",
     "AlpacaOvernightFeed",
     "AlpacaStockFeed",
 ]
@@ -32,7 +33,11 @@ class AlpacaDataClientConfig:
     @property
     def overnight_feed(self) -> AlpacaOvernightFeed | None: ...
     @property
+    def option_feed(self) -> AlpacaOptionFeed | None: ...
+    @property
     def load_symbols(self) -> list[str]: ...
+    @property
+    def load_option_symbols(self) -> list[str]: ...
     @property
     def base_url_http(self) -> str | None: ...
     @property
@@ -50,7 +55,9 @@ class AlpacaDataClientConfig:
         market_data_api_secret: str | None = None,
         stock_feed: AlpacaStockFeed | None = None,
         overnight_feed: AlpacaOvernightFeed | None = None,
+        option_feed: AlpacaOptionFeed | None = None,
         load_symbols: typing.Sequence[str] | None = None,
+        load_option_symbols: typing.Sequence[str] | None = None,
         base_url_http: str | None = None,
         base_url_http_trading: str | None = None,
         base_url_ws_public: str | None = None,
@@ -99,6 +106,11 @@ class AlpacaExecutionClientFactory:
 class AlpacaEnvironment(enum.Enum):
     PAPER = ...
     LIVE = ...
+
+@typing.final
+class AlpacaOptionFeed(enum.Enum):
+    OPRA = ...
+    INDICATIVE = ...
 
 @typing.final
 class AlpacaOvernightFeed(enum.Enum):

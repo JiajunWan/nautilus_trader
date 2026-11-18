@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Integration adapter for Alpaca US equity market data and trading.
+Integration adapter for Alpaca US equity and options APIs.
 """
 
 from nautilus_trader._fixup import fixup_module_names
@@ -29,6 +29,7 @@ __all__ = [
     "AlpacaEnvironment",
     "AlpacaExecutionClientConfig",
     "AlpacaExecutionClientFactory",
+    "AlpacaOptionFeed",
     "AlpacaOvernightFeed",
     "AlpacaStockFeed",
 ]
