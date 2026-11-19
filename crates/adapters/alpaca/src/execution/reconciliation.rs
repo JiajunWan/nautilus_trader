@@ -122,11 +122,10 @@ pub(super) async fn snapshot(
 }
 
 impl Snapshot {
-    pub(super) fn simple_fills(&self) -> impl Iterator<Item = &FillActivity> {
-        self.activities.iter().filter(|activity| {
-            self.orders
-                .get(&activity.order_id)
-                .is_some_and(BrokerOrder::supported)
+    pub(super) fn simple_fills(&self) -> impl Iterator<Item = (&FillActivity, &BrokerOrder)> {
+        self.activities.iter().filter_map(|activity| {
+            let order = self.orders.get(&activity.order_id)?;
+            order.supported().then_some((activity, order))
         })
     }
 
@@ -157,8 +156,7 @@ impl Snapshot {
                 orders.push(report);
             }
         }
-        for activity in self.simple_fills() {
-            let order = &self.orders[&activity.order_id];
+        for (activity, order) in self.simple_fills() {
             let id = state
                 .broker_order_client_id(order)?
                 .or(Some(order.client_id()?));

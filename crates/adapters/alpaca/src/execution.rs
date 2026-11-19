@@ -1057,8 +1057,8 @@ impl StreamTask {
 
         let mut state = lock_state(&self.state)?;
         let mut fills_by_order: HashMap<_, Vec<_>> = HashMap::new();
-        for activity in fills {
-            let venue_id = VenueOrderId::new_checked(&activity.order_id)?;
+        for (activity, order) in fills {
+            let venue_id = order.venue_id()?;
             let fill =
                 activity.to_report(self.emitter.account_id(), state.client_for(venue_id), now())?;
             fills_by_order.entry(venue_id).or_default().push(fill);

@@ -5573,6 +5573,7 @@ checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 name = "nautilus-alpaca"
 version = "0.69.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "async-trait",
  "blake3",

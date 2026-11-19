@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ahash::AHashMap;
 use anyhow::{Context, ensure};
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionEventEmitter;
@@ -115,10 +116,10 @@ impl TrackedOrder {
 
 #[derive(Debug, Default)]
 pub(super) struct OrderState {
-    tracked: HashMap<ClientOrderId, TrackedOrder>,
+    tracked: AHashMap<ClientOrderId, TrackedOrder>,
     active: ActiveOrders,
     combos: HashSet<ClientOrderId>,
-    venue_client_ids: HashMap<VenueOrderId, ClientOrderId>,
+    venue_client_ids: AHashMap<VenueOrderId, ClientOrderId>,
     broker_client_ids: HashMap<String, ClientOrderId>,
     advanced_instructions: HashMap<VenueOrderId, Value>,
     pending_advanced_instructions: HashMap<String, Value>,
@@ -538,7 +539,10 @@ impl OrderState {
 
         let venue_id = update.order.venue_id()?;
         let ts_event = update.ts_event()?;
-        let Some(client_id) = client_id.filter(|id| self.tracked.contains_key(id)) else {
+        self.confirm_replacement(&update.order, emitter, ts_event)?;
+        let Some((client_id, tracked)) =
+            client_id.and_then(|id| self.tracked.get_mut(&id).map(|tracked| (id, tracked)))
+        else {
             if matches!(
                 update.event.as_str(),
                 "pending_new" | "pending_cancel" | "pending_replace" | "replaced"
@@ -559,12 +563,7 @@ impl OrderState {
             return Ok(());
         };
 
-        self.confirm_replacement(&update.order, emitter, ts_event)?;
         self.venue_client_ids.insert(venue_id, client_id);
-        let tracked = self
-            .tracked
-            .get_mut(&client_id)
-            .context("Missing Alpaca tracked order")?;
         let fill = if update.is_fill() {
             Some(update.fill(emitter, Some(client_id), ts_event)?)
         } else {
