@@ -24,7 +24,9 @@
 //! or `-- --limit-round-trip` to buy and sell one paper share.
 //! Use `-- --extended-round-trip` (DAY) or `-- --extended-gtc-round-trip` (GTC)
 //! to buy and sell one paper share with price-capped extended-hours orders.
-//! Prefix round-trip or extended limit modes with `--symbol SYMBOL` to select an equity.
+//! Use `--regular-gtc-round-trip` for a one-share regular-session SPY round trip,
+//! or `--hold-regular-gtc PRICE` and `--verify-regular-gtc UUID` for cross-date carryover.
+//! Prefix extended round-trip or extended limit modes with `--symbol SYMBOL` to select an equity.
 //! Prefix a Market or Limit DAY round trip or a passive limit cancellation with
 //! `--option OCC_SYMBOL` to test a single equity option contract in Paper.
 //! Use `--extended-dma-limit NASDAQ|ARCA PRICE` to submit and cancel a routed DAY limit.
@@ -44,7 +46,7 @@
 //! For history-only testing, `ALPACA_HISTORY_MOCK_ASSET_PORT` can select an asset
 //! fixture server on localhost when only market data credentials are available.
 
-use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::VecDeque, ops::Range, rc::Rc, time::Duration};
 
 use anyhow::{Result, bail, ensure};
 use jiff::{
@@ -66,13 +68,15 @@ use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType},
     events::{OrderAccepted, OrderCanceled, OrderDenied, OrderFilled, OrderRejected},
-    identifiers::{ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId},
+    identifiers::{ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId, VenueOrderId},
     orders::{Order, OrderAny},
     types::{Price, Quantity},
 };
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use rust_decimal::{Decimal, RoundingStrategy};
 
+#[path = "paper_smoke/account.rs"]
+mod account;
 #[path = "paper_smoke/auction.rs"]
 mod auction;
 #[path = "paper_smoke/carryover.rs"]
@@ -123,12 +127,27 @@ enum Mode {
     },
     Carryover {
         price: Price,
+        extended_hours: bool,
         time_in_force: TimeInForce,
     },
     AdvancedChecks,
 }
 
 impl Mode {
+    fn is_regular_gtc(self) -> bool {
+        matches!(
+            self,
+            Self::LimitRoundTrip {
+                extended_hours: false,
+                time_in_force: TimeInForce::Gtc
+            } | Self::Carryover {
+                extended_hours: false,
+                time_in_force: TimeInForce::Gtc,
+                ..
+            }
+        )
+    }
+
     fn parse(args: Vec<String>) -> Result<(VecDeque<Self>, bool, Symbol)> {
         let mut args = args.into_iter().peekable();
         let iex_only = args.next_if(|arg| arg == "--iex").is_some();
@@ -199,6 +218,15 @@ impl Mode {
                     }
                 }
             }
+            [mode] if mode == "--regular-gtc-round-trip" => Self::LimitRoundTrip {
+                extended_hours: false,
+                time_in_force: TimeInForce::Gtc,
+            },
+            [mode, price] if mode == "--hold-regular-gtc" => Self::Carryover {
+                price: parse_limit_price(price)?,
+                extended_hours: false,
+                time_in_force: TimeInForce::Gtc,
+            },
             [mode] if mode == "--extended-round-trip" => Self::LimitRoundTrip {
                 extended_hours: true,
                 time_in_force: TimeInForce::Day,
@@ -220,22 +248,31 @@ impl Mode {
                 }
                 Self::Carryover {
                     price: parse_limit_price(price)?,
+                    extended_hours: true,
                     time_in_force,
                 }
             }
             [mode] if mode == "--advanced-checks" => Self::AdvancedChecks,
             _ => bail!(
-                "Expected [--iex] [--symbol SYMBOL] and --regular-limit PRICE, --extended-limit PRICE, --extended-dma-limit NASDAQ|ARCA PRICE, --market-round-trip, --limit-round-trip, --extended-round-trip, --extended-gtc-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
+                "Expected [--iex] [--symbol SYMBOL] and --regular-limit PRICE, --extended-limit PRICE, --extended-dma-limit NASDAQ|ARCA PRICE, --market-round-trip, --limit-round-trip, --regular-gtc-round-trip, --hold-regular-gtc PRICE, --extended-round-trip, --extended-gtc-round-trip, --hold-limit DAY|GTC PRICE, --advanced-checks, --suite PRICE, or --history YYYY-MM-DD (SIP + BOATS)",
             ),
         };
+        if mode.is_regular_gtc() {
+            ensure!(
+                symbol.is_none_or(|s| s.as_str() == "SPY"),
+                "Regular GTC smoke requires SPY"
+            );
+        }
         ensure!(
             symbol.is_none()
+                || mode.is_regular_gtc()
                 || matches!(
                     mode,
                     Self::Limit {
                         route: LimitRoute::Extended | LimitRoute::Dma(_),
                         ..
-                    } | Self::LimitRoundTrip { .. } | Self::MarketRoundTrip
+                    } | Self::LimitRoundTrip { .. }
+                        | Self::MarketRoundTrip
                 ),
             "--symbol requires a round trip or an extended limit mode",
         );
@@ -254,6 +291,8 @@ struct Observation {
     bar: bool,
     historical_sessions: Option<[usize; 4]>,
     execution: Option<Result<(), String>>,
+    regular_submissions: Vec<carryover::RegularSubmission>,
+    carryover_id: Option<VenueOrderId>,
 }
 
 #[derive(Debug)]
@@ -261,6 +300,7 @@ struct PaperSmoke {
     core: StrategyCore,
     mode: Mode,
     remaining_modes: VecDeque<Mode>,
+    regular_session: Option<Range<Timestamp>>,
     instrument_id: InstrumentId,
     option: bool,
     bar_type: BarType,
@@ -275,6 +315,23 @@ struct PaperSmoke {
 impl PaperSmoke {
     fn submit(&mut self, order: OrderAny, params: Option<Params>) -> Result<()> {
         self.active_order = Some(order.client_order_id());
+        if self.mode.is_regular_gtc() {
+            self.observation
+                .borrow_mut()
+                .regular_submissions
+                .push(carryover::RegularSubmission {
+                    client_id: order.client_order_id(),
+                    side: order.order_side(),
+                    limit: order
+                        .price()
+                        .ok_or_else(|| anyhow::anyhow!("Regular GTC requires a limit price"))?,
+                });
+            log::info!(
+                "Paper regular GTC submitting {} {}",
+                order.order_side(),
+                order.client_order_id()
+            );
+        }
         if self.option {
             log::info!(
                 "Paper option submitting {} {} {}",
@@ -464,6 +521,7 @@ impl PaperSmoke {
         let observed = self.observation.borrow();
         let data_complete = observed.quote
             && (self.option
+                || self.mode.is_regular_gtc()
                 || matches!(self.mode, Mode::AdvancedChecks | Mode::Carryover { .. })
                 || (observed.trade && observed.bar));
         let execution_complete = matches!(self.mode, Mode::Data) || observed.execution.is_some();
@@ -480,6 +538,7 @@ nautilus_strategy!(PaperSmoke, {
         }
 
         if let Mode::Carryover { time_in_force, .. } = self.mode {
+            self.observation.borrow_mut().carryover_id = Some(event.venue_order_id);
             log::info!(
                 "Paper {time_in_force} order left open as {}",
                 event.venue_order_id
@@ -603,6 +662,9 @@ impl DataActor for PaperSmoke {
             return Ok(());
         }
         self.subscribe_quotes(self.instrument_id, None, None);
+        if self.mode.is_regular_gtc() {
+            return Ok(());
+        }
         self.subscribe_trades(self.instrument_id, None, None);
         if !self.option && !matches!(self.mode, Mode::AdvancedChecks) {
             self.subscribe_bars(self.bar_type, None, None);
@@ -635,6 +697,15 @@ impl DataActor for PaperSmoke {
             return Ok(());
         }
         if !self.submitted {
+            if let Some(session) = &self.regular_session {
+                if !session.contains(&Timestamp::now()) {
+                    self.finish_execution(Err("The regular Paper session has ended".into()));
+                    return Ok(());
+                }
+                if i128::from(quote.ts_event.as_u64()) < session.start.as_nanosecond() {
+                    return Ok(());
+                }
+            }
             self.submitted = true;
             let result = match self.mode {
                 Mode::Data | Mode::History(_) => Ok(()),
@@ -666,6 +737,7 @@ impl DataActor for PaperSmoke {
                 }
                 Mode::Carryover {
                     price,
+                    extended_hours,
                     time_in_force,
                 } => match fresh_prices(quote) {
                     Some((bid, _)) if price.as_decimal() < bid => {
@@ -675,7 +747,7 @@ impl DataActor for PaperSmoke {
                             time_in_force,
                             Some(carryover::client_order_id()),
                         );
-                        self.submit(order, Some(extended_hours_params(true)))
+                        self.submit(order, Some(extended_hours_params(extended_hours)))
                     }
                     Some((bid, _)) => {
                         Err(anyhow::anyhow!("Paper limit must be below the bid {bid}"))
@@ -813,12 +885,24 @@ async fn main() -> Result<()> {
             return carryover::verify_and_cancel(
                 id.parse()?,
                 carryover_tif(tif)?,
+                true,
                 proxy_url.as_ref(),
             )
             .await;
         }
-        [mode, id] if mode == "--cancel-carryover" => {
-            return carryover::cancel(id.parse()?, proxy_url.as_ref()).await;
+        [mode, id] if mode == "--verify-regular-gtc" => {
+            return carryover::verify_and_cancel(
+                id.parse()?,
+                TimeInForce::Gtc,
+                false,
+                proxy_url.as_ref(),
+            )
+            .await;
+        }
+        [mode, id] if matches!(mode.as_str(), "--cancel-carryover" | "--cancel-regular-gtc") => {
+            let id = id.parse()?;
+            let client = account::paper_client(proxy_url.as_ref())?;
+            return carryover::cancel(&client, id, mode == "--cancel-carryover", None).await;
         }
         _ => {}
     }
@@ -867,13 +951,20 @@ async fn main() -> Result<()> {
         Mode::parse(args)?
     };
     let symbol = option.unwrap_or(default_symbol);
-    let option_rest = option
-        .map(|_| carryover::paper_client(proxy_url.as_ref()))
-        .transpose()?;
-    if let Some(client) = &option_rest {
-        options::preflight(symbol.as_str(), now, client).await?;
-    }
     let mode = modes.pop_front();
+    let regular_gtc = mode.is_some_and(Mode::is_regular_gtc);
+    let rest = (option.is_some() || regular_gtc)
+        .then(|| account::paper_client(proxy_url.as_ref()))
+        .transpose()?;
+    let mut regular_session = None;
+    if let Some(client) = &rest {
+        if regular_gtc {
+            regular_session = Some(account::regular_session(client).await?);
+            account::require_flat("SPY", "us_equity", client).await?;
+        } else {
+            options::preflight(symbol.as_str(), now, client).await?;
+        }
+    }
     let suite = !modes.is_empty();
     let history = matches!(mode, Some(Mode::History(_)));
     let relay_port = std::env::var("ALPACA_SMOKE_WS_PORT")
@@ -924,7 +1015,7 @@ async fn main() -> Result<()> {
             AlpacaStockFeed::Sip
         })
         .maybe_overnight_feed(
-            (!iex_only && auction.is_none() && option.is_none())
+            (!iex_only && auction.is_none() && option.is_none() && !regular_gtc)
                 .then_some(AlpacaOvernightFeed::Boats),
         )
         .build();
@@ -975,6 +1066,7 @@ async fn main() -> Result<()> {
         }),
         mode,
         remaining_modes: modes,
+        regular_session: regular_session.clone(),
         instrument_id,
         option: option.is_some(),
         bar_type: format!("{instrument_id}-1-MINUTE-LAST-EXTERNAL").parse()?,
@@ -990,14 +1082,58 @@ async fn main() -> Result<()> {
         &mut node,
         Duration::from_secs(if suite { 180 } else { 120 }),
     )
-    .await;
-    if let Some(client) = &option_rest {
-        options::require_flat(symbol.as_str(), client).await?;
-        log::info!("Paper option {symbol} position and open orders are zero");
+    .await
+    .and_then(|()| {
+        if matches!(mode, Mode::Data | Mode::History(_)) {
+            return Ok(());
+        }
+        observation
+            .borrow_mut()
+            .execution
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Timed out waiting for the paper order workflow"))?
+            .map_err(anyhow::Error::msg)
+    });
+    let hold = matches!(mode, Mode::Carryover { .. });
+    if let Some(client) = &rest
+        && !hold
+    {
+        let class = if option.is_some() {
+            "us_option"
+        } else {
+            "us_equity"
+        };
+        account::require_flat(symbol.as_str(), class, client).await?;
+        log::info!("Paper {symbol} position and open orders are zero");
     }
-    result?;
+    if let (Some(client), Some(session)) = (&rest, &regular_session) {
+        let submissions = std::mem::take(&mut observation.borrow_mut().regular_submissions);
+        if hold {
+            let Some(id) = observation.borrow().carryover_id else {
+                result?;
+                bail!("Regular GTC hold has no accepted broker UUID");
+            };
+            let id = id.as_str().parse()?;
+            let staged = match result {
+                Ok(()) => carryover::verify_hold(client, id, &submissions, session).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = staged {
+                eprintln!("Regular GTC staging failed for {id}: {error}");
+                if let [submitted] = submissions.as_slice() {
+                    carryover::cancel(client, id, false, Some(submitted.client_id)).await?;
+                }
+                return Err(error);
+            }
+        } else {
+            result?;
+            carryover::verify_round_trip(client, &submissions, session).await?;
+        }
+    } else {
+        result?;
+    }
 
-    let mut observed = observation.borrow_mut();
+    let observed = observation.borrow();
     if history {
         let counts = observed
             .historical_sessions
@@ -1008,14 +1144,11 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if !matches!(mode, Mode::Data) {
-        observed
-            .execution
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Timed out waiting for the paper order workflow"))?
-            .map_err(anyhow::Error::msg)?;
-    }
-    if option.is_some() || suite || matches!(mode, Mode::AdvancedChecks | Mode::Carryover { .. }) {
+    if option.is_some()
+        || suite
+        || regular_gtc
+        || matches!(mode, Mode::AdvancedChecks | Mode::Carryover { .. })
+    {
         ensure!(observed.quote, "No SPY quote received");
         return Ok(());
     }
@@ -1034,6 +1167,37 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn regular_gtc_modes_select_one_spy_workflow() {
+        let (modes, _, symbol) = Mode::parse(vec!["--regular-gtc-round-trip".into()]).unwrap();
+        assert_eq!(symbol.as_str(), "SPY");
+        assert!(matches!(
+            modes.as_slices(),
+            (
+                [Mode::LimitRoundTrip {
+                    extended_hours: false,
+                    time_in_force: TimeInForce::Gtc
+                }],
+                []
+            )
+        ));
+        let (modes, _, _) =
+            Mode::parse(["--hold-regular-gtc", "100"].map(String::from).into()).unwrap();
+        assert!(
+            matches!(modes.front(), Some(Mode::Carryover { extended_hours: false, time_in_force: TimeInForce::Gtc, price }) if *price == Price::from("100"))
+        );
+        let (modes, _, _) =
+            Mode::parse(["--hold-limit", "GTC", "100"].map(String::from).into()).unwrap();
+        assert!(matches!(
+            modes.front(),
+            Some(Mode::Carryover {
+                extended_hours: true,
+                time_in_force: TimeInForce::Gtc,
+                ..
+            })
+        ));
+    }
 
     #[rstest]
     #[case(&["--extended-round-trip"], "SPY", TimeInForce::Day)]
@@ -1085,6 +1249,9 @@ mod tests {
 
     #[rstest]
     #[case(&["--extended-dma-limit", "NYSE", "100"])]
+    #[case(&["--symbol", "QQQ", "--regular-gtc-round-trip"])]
+    #[case(&["--symbol", "QQQ", "--hold-regular-gtc", "100"])]
+    #[case(&["--hold-regular-gtc", "0"])]
     #[case(&["--symbol", "QQQ", "--hold-limit", "GTC", "100"])]
     #[case(&["--symbol", "QQQ", "--auction-check", "open"])]
     #[case(&["--symbol", "QQQ", "--suite", "100"])]

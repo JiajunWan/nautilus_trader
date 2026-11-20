@@ -289,6 +289,22 @@ by default. Prefix the mode with `--symbol SYMBOL` to select another equity.
 Begin each round trip with a flat position in that equity and verify both
 terminal fills and the final position in Paper.
 
+For a regular-session GTC round trip, run `--regular-gtc-round-trip`. The
+example checks the Paper clock and calendar, including early closes, and
+requires a flat SPY position with zero open SPY orders. It buys and sells one
+share using GTC limits with `extended_hours=false`. It checks each native
+client order ID against the Paper REST fill quantity, price, limit and session
+timestamps, and checks the final position and open orders.
+
+To verify regular GTC carryover, run `--hold-regular-gtc PRICE` during regular
+hours with a positive limit below the SPY bid. Record the printed broker UUID,
+client order ID, limit, creation time and zero-fill working status. On a later
+New York trading date, run `--verify-regular-gtc UUID`. It checks the same
+order is still working with zero fills, cancels it by UUID, and confirms
+terminal cancellation and zero SPY position and open orders. Use
+`--cancel-regular-gtc UUID` for early cleanup. Early cleanup leaves cross-date
+verification pending. These checks use the Paper simulator.
+
 For an Elite DMA submit-and-cancel check, use `--extended-dma-limit NASDAQ|ARCA PRICE`.
 Choose a limit price below the current bid. The strategy submits a one-share DAY
 buy with extended hours enabled, logs the destination and client order ID, and

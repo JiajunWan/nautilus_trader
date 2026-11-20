@@ -18,12 +18,12 @@ use jiff::{
     Timestamp,
     civil::{Date, time},
 };
-use nautilus_network::http::{HttpClient, Method};
+use nautilus_network::http::HttpClient;
 use serde::Deserialize;
 
 use super::{
     NEW_YORK,
-    carryover::{PAPER_API_URL, verify_trading_dates},
+    account::{get, require_flat, verify_trading_dates},
 };
 
 #[derive(Deserialize)]
@@ -33,43 +33,6 @@ struct PaperOption {
     expiration_date: Date,
     tradable: bool,
     status: String,
-}
-
-#[derive(Deserialize)]
-struct ContractExposure {
-    symbol: Option<String>,
-    legs: Option<Vec<Self>>,
-}
-
-impl ContractExposure {
-    fn contains(&self, symbol: &str) -> bool {
-        self.symbol.as_deref() == Some(symbol)
-            || self.legs.iter().flatten().any(|leg| leg.contains(symbol))
-    }
-}
-
-async fn get<T: serde::de::DeserializeOwned>(
-    client: &HttpClient,
-    path: &str,
-    params: &[(&str, &str)],
-) -> Result<T> {
-    let response = client
-        .request_with_params(
-            Method::GET,
-            format!("{PAPER_API_URL}{path}"),
-            Some(&params),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
-    ensure!(
-        response.status.is_success(),
-        "Paper preflight {path}: HTTP {}",
-        response.status.as_u16()
-    );
-    Ok(serde_json::from_slice(&response.body)?)
 }
 
 pub(super) async fn preflight(symbol: &str, now: Timestamp, client: &HttpClient) -> Result<()> {
@@ -122,27 +85,5 @@ pub(super) async fn preflight(symbol: &str, now: Timestamp, client: &HttpClient)
             "Paper market must be open with enough time to reconcile",
         );
     }
-    require_flat(symbol, client).await
-}
-
-pub(super) async fn require_flat(symbol: &str, client: &HttpClient) -> Result<()> {
-    let positions: Vec<ContractExposure> = get(client, "/v2/positions", &[]).await?;
-    let orders: Vec<ContractExposure> = get(
-        client,
-        "/v2/orders",
-        &[
-            ("status", "open"),
-            ("asset_class", "us_option"),
-            ("limit", "500"),
-            ("nested", "true"),
-        ],
-    )
-    .await?;
-    ensure!(
-        orders.len() < 500
-            && !orders.iter().any(|order| order.contains(symbol))
-            && !positions.iter().any(|position| position.contains(symbol)),
-        "Paper smoke requires no position or open order in {symbol}",
-    );
-    Ok(())
+    require_flat(symbol, "us_option", client).await
 }
