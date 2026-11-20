@@ -196,7 +196,12 @@ also queries all working orders, including orders submitted before the lookback,
 and retrieves missing order records for fills inside the window.
 
 The execution client reauthenticates the private stream and catches up on order
-updates and fills after a reconnect. WebSocket and REST fills share a trade
+updates and fills after a reconnect. If a fill references an order not yet visible
+in REST, or a recovery read encounters a transient HTTP or transport error,
+the client retries with capped exponential backoff from the original lookback.
+It processes private-stream updates between attempts and permits new submissions
+and modifications once reconciliation completes on the current connection.
+WebSocket and REST fills share a trade
 identifier derived from the broker order ID and cumulative filled quantity.
 
 An order placed outside Nautilus is imported by the execution engine as an

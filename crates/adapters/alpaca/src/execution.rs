@@ -65,11 +65,16 @@ use nautilus_model::{
 };
 use nautilus_network::{
     Message, RECONNECTED,
+    backoff::ExponentialBackoff,
+    http::HttpClientError,
     websocket::{WebSocketClient, WebSocketConfig},
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, sleep_until, timeout},
+};
 
 use self::{
     orders::{
@@ -949,7 +954,10 @@ async fn authenticate(
 
 async fn receive_handshake(rx: &mut StreamReceiver, epoch: u64) -> anyhow::Result<PrivateMessage> {
     while let Some((frame_epoch, frame)) = rx.recv().await {
-        if frame_epoch < epoch || frame.is_control() {
+        if frame_epoch < epoch
+            || frame.is_control()
+            || (frame_epoch == epoch && frame.as_text() == Some(RECONNECTED))
+        {
             continue;
         }
         ensure!(
@@ -974,21 +982,46 @@ struct StreamTask {
 
 impl StreamTask {
     async fn run(mut self, mut rx: StreamReceiver) -> anyhow::Result<()> {
-        while let Some((epoch, frame)) = rx.recv().await {
-            if frame.as_text() == Some(RECONNECTED) {
-                let result = async {
-                    authenticate(&self.socket, &mut rx, &self.credentials, epoch).await?;
-                    Box::pin(self.reconcile()).await
+        let result = self.run_session(&mut rx).await;
+        self.ready_epoch.store(u64::MAX, Ordering::Release);
+        self.socket.disconnect().await;
+        result
+    }
+
+    async fn run_session(&mut self, rx: &mut StreamReceiver) -> anyhow::Result<()> {
+        let mut retry = None;
+        let mut backoff = ExponentialBackoff::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            2.0,
+            250,
+            false,
+        )?;
+        loop {
+            let frame = if let Some((epoch, deadline)) = retry {
+                tokio::select! {
+                    biased;
+                    () = sleep_until(deadline) => {
+                        retry = self.recover(epoch, &mut backoff).await?;
+                        continue;
+                    }
+                    frame = rx.recv() => frame,
                 }
-                .await;
-                if let Err(error) = result {
-                    self.socket.disconnect().await;
-                    return Err(error);
-                }
-                self.ready_epoch.store(epoch, Ordering::Release);
+            } else {
+                rx.recv().await
+            };
+            let Some((epoch, frame)) = frame else {
+                anyhow::bail!("Alpaca private WebSocket message stream closed");
+            };
+            if epoch != self.socket.connection_epoch() || frame.is_control() {
                 continue;
             }
-            if frame.is_control() || epoch != self.socket.connection_epoch() {
+            if frame.as_text() == Some(RECONNECTED) {
+                self.ready_epoch.store(u64::MAX, Ordering::Release);
+                retry = self
+                    .authenticate_current(rx, epoch)
+                    .await?
+                    .map(|epoch| (epoch, Instant::now()));
                 continue;
             }
             match serde_json::from_slice::<PrivateMessage>(frame.as_bytes()) {
@@ -1000,7 +1033,11 @@ impl StreamTask {
                         } else {
                             lock_state(&self.state)?.handle(*update, &self.emitter)?;
                         }
-                        self.last_seen = self.last_seen.max(timestamp);
+                        // Keep the original lookback until the gap is closed, even if newer
+                        // WebSocket updates arrive during backoff or the socket reconnects again
+                        if self.ready_epoch.load(Ordering::Acquire) == epoch {
+                            self.last_seen = self.last_seen.max(timestamp);
+                        }
                         Ok::<(), anyhow::Error>(())
                     }
                     .await;
@@ -1014,8 +1051,57 @@ impl StreamTask {
                 Err(error) => log::error!("Invalid Alpaca private WebSocket frame: {error}"),
             }
         }
-        self.ready_epoch.store(u64::MAX, Ordering::Release);
-        anyhow::bail!("Alpaca private WebSocket message stream closed")
+    }
+
+    fn is_current(&self, epoch: u64) -> bool {
+        self.socket.is_active() && self.socket.connection_epoch() == epoch
+    }
+
+    async fn authenticate_current(
+        &self,
+        rx: &mut StreamReceiver,
+        mut epoch: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        loop {
+            let result = authenticate(&self.socket, rx, &self.credentials, epoch).await;
+            if !self.socket.is_active() {
+                return Ok(None);
+            }
+            let current = self.socket.connection_epoch();
+            if current == epoch {
+                result?;
+                return Ok(Some(epoch));
+            }
+            // The handshake may have consumed the replacement connection's notification
+            epoch = current;
+        }
+    }
+
+    async fn recover(
+        &self,
+        epoch: u64,
+        backoff: &mut ExponentialBackoff,
+    ) -> anyhow::Result<Option<(u64, Instant)>> {
+        if !self.is_current(epoch) {
+            return Ok(None);
+        }
+        let result = Box::pin(self.reconcile(epoch)).await;
+        if !self.is_current(epoch) {
+            return Ok(None);
+        }
+        let error = match result {
+            Ok(true) => {
+                self.ready_epoch.store(epoch, Ordering::Release);
+                backoff.reset();
+                return Ok(None);
+            }
+            Ok(false) => anyhow::anyhow!("Alpaca fill history references missing orders"),
+            Err(e) if retryable_recovery_error(&e) => e,
+            Err(e) => return Err(e),
+        };
+        let delay = backoff.next_duration();
+        log::warn!("Alpaca reconciliation for epoch {epoch} will retry in {delay:?}: {error:#}");
+        Ok(Some((epoch, Instant::now() + delay)))
     }
 
     async fn apply_combo(&self, snapshot: &BrokerOrder, ts_event: UnixNanos) -> anyhow::Result<()> {
@@ -1038,12 +1124,16 @@ impl StreamTask {
         result
     }
 
-    async fn reconcile(&self) -> anyhow::Result<()> {
+    async fn reconcile(&self, epoch: u64) -> anyhow::Result<bool> {
         let start = self.last_seen.saturating_sub(DurationNanos::from_secs(1));
         let (snapshot, account): (_, Account) = tokio::try_join!(
             reconciliation::snapshot(&self.http, &self.state, Some(start), false),
             self.http.get("/v2/account", &()),
         )?;
+        if !snapshot.complete || !self.is_current(epoch) {
+            return Ok(false);
+        }
+        let balance = account.balance()?;
         let fills = snapshot.simple_fills();
         let orders = &snapshot.orders;
 
@@ -1088,15 +1178,19 @@ impl StreamTask {
             self.emitter.send_fill_report(fill);
         }
 
-        self.emitter.try_emit_account_state(
-            vec![account.balance()?],
-            Vec::new(),
-            true,
-            now(),
-            None,
-        )?;
-        Ok(())
+        self.emitter
+            .try_emit_account_state(vec![balance], Vec::new(), true, now(), None)?;
+        Ok(true)
     }
+}
+
+fn retryable_recovery_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<HttpClientError>(),
+        Some(HttpClientError::TransportError(_) | HttpClientError::TimeoutError(_))
+    ) || error
+        .downcast_ref::<AlpacaApiError>()
+        .is_some_and(|e| matches!(e.status, 408 | 429 | 500..=599))
 }
 
 async fn supported_fills(

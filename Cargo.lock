@@ -5576,6 +5576,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "async-trait",
+ "axum",
  "blake3",
  "bon",
  "futures-util",
