@@ -37,6 +37,7 @@ use std::{
 
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
+use jiff::Timestamp;
 use nautilus_common::{
     clients::ExecutionClient,
     live::runner::{get_exec_event_sender, try_get_exec_event_sender},
@@ -1047,6 +1048,46 @@ async fn receive_handshake(rx: &mut StreamReceiver, epoch: u64) -> anyhow::Resul
     anyhow::bail!("Alpaca private WebSocket closed during handshake")
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecoveryAttempt {
+    epoch: u64,
+    deadline: Instant,
+    rate_limited: bool,
+}
+
+impl RecoveryAttempt {
+    fn new(epoch: u64) -> Self {
+        Self {
+            epoch,
+            deadline: Instant::now(),
+            rate_limited: false,
+        }
+    }
+
+    fn schedule_retry(
+        &mut self,
+        error: &anyhow::Error,
+        backoff: Duration,
+        now: Timestamp,
+    ) -> Duration {
+        let throttled = error
+            .downcast_ref::<AlpacaApiError>()
+            .filter(|e| e.status == 429);
+        // Paper can replenish quota before Reset. Allow one ordinary backoff per streak.
+        let start = Instant::now();
+        self.deadline = start + backoff;
+        if self.rate_limited
+            && let Some(reset) = throttled.and_then(|e| e.rate_limit_reset)
+            && let Ok(remaining) = Duration::try_from(reset.duration_since(now))
+            && let Some(reset_deadline) = start.checked_add(remaining)
+        {
+            self.deadline = self.deadline.max(reset_deadline);
+        }
+        self.rate_limited = throttled.is_some();
+        self.deadline - start
+    }
+}
+
 #[derive(Debug)]
 struct StreamTask {
     socket: Arc<WebSocketClient>,
@@ -1067,7 +1108,7 @@ impl StreamTask {
     }
 
     async fn run_session(&mut self, rx: &mut StreamReceiver) -> anyhow::Result<()> {
-        let mut retry = None;
+        let mut retry: Option<RecoveryAttempt> = None;
         let mut backoff = ExponentialBackoff::new(
             Duration::from_secs(1),
             Duration::from_secs(30),
@@ -1076,11 +1117,11 @@ impl StreamTask {
             false,
         )?;
         loop {
-            let frame = if let Some((epoch, deadline)) = retry {
+            let frame = if let Some(attempt) = retry {
                 tokio::select! {
                     biased;
-                    () = sleep_until(deadline) => {
-                        retry = self.recover(epoch, &mut backoff).await?;
+                    () = sleep_until(attempt.deadline) => {
+                        retry = self.recover(attempt, &mut backoff).await?;
                         continue;
                     }
                     frame = rx.recv() => frame,
@@ -1099,7 +1140,7 @@ impl StreamTask {
                 retry = self
                     .authenticate_current(rx, epoch)
                     .await?
-                    .map(|epoch| (epoch, Instant::now()));
+                    .map(RecoveryAttempt::new);
                 continue;
             }
             match serde_json::from_slice::<PrivateMessage>(frame.as_bytes()) {
@@ -1161,9 +1202,10 @@ impl StreamTask {
 
     async fn recover(
         &self,
-        epoch: u64,
+        mut attempt: RecoveryAttempt,
         backoff: &mut ExponentialBackoff,
-    ) -> anyhow::Result<Option<(u64, Instant)>> {
+    ) -> anyhow::Result<Option<RecoveryAttempt>> {
+        let epoch = attempt.epoch;
         if !self.is_current(epoch) {
             return Ok(None);
         }
@@ -1181,9 +1223,9 @@ impl StreamTask {
             Err(e) if retryable_recovery_error(&e) => e,
             Err(e) => return Err(e),
         };
-        let delay = backoff.next_duration();
+        let delay = attempt.schedule_retry(&error, backoff.next_duration(), Timestamp::now());
         log::warn!("Alpaca reconciliation for epoch {epoch} will retry in {delay:?}: {error:#}");
-        Ok(Some((epoch, Instant::now() + delay)))
+        Ok(Some(attempt))
     }
 
     fn apply_combo_snapshot(
@@ -1374,12 +1416,53 @@ mod tests {
         let error = AlpacaApiError {
             status,
             code: None,
+            rate_limit_reset: None,
             message: message.to_string(),
         }
         .into();
         assert_eq!(
             matches!(classify(&error), CommandFailure::VenueRejected(_)),
             definitive
+        );
+    }
+
+    #[rstest]
+    #[case::future(Some(160), 60)]
+    #[case::shorter_than_backoff(Some(101), 2)]
+    #[case::expired(Some(99), 2)]
+    #[case::missing(None, 2)]
+    fn recovery_backoff_uses_reset_only_for_consecutive_throttled_rounds(
+        #[case] reset: Option<i64>,
+        #[case] expected_secs: u64,
+    ) {
+        let now = Timestamp::from_second(100).unwrap();
+        let throttled = AlpacaApiError {
+            status: 429,
+            code: Some(42_910_000),
+            rate_limit_reset: reset.map(|s| Timestamp::from_second(s).unwrap()),
+            message: "rate limit exceeded".to_owned(),
+        }
+        .into();
+        let unavailable = AlpacaApiError {
+            status: 503,
+            code: None,
+            rate_limit_reset: None,
+            message: "service unavailable".to_owned(),
+        }
+        .into();
+        let first = Duration::from_millis(1125);
+        let next = Duration::from_secs(2);
+        let mut attempt = RecoveryAttempt::new(1);
+        assert_eq!(attempt.schedule_retry(&throttled, first, now), first);
+        assert_eq!(
+            attempt.schedule_retry(&throttled, next, now),
+            Duration::from_secs(expected_secs)
+        );
+        assert_eq!(attempt.schedule_retry(&unavailable, next, now), next);
+        assert_eq!(attempt.schedule_retry(&throttled, next, now), next);
+        assert_eq!(
+            RecoveryAttempt::new(2).schedule_retry(&throttled, next, now),
+            next
         );
     }
 

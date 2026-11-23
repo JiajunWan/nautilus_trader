@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use anyhow::Context;
+use jiff::Timestamp;
 use nautilus_core::string::secret::SecretString;
 use nautilus_network::http::{
     HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
@@ -25,6 +26,8 @@ use crate::{
     config::AlpacaDataClientConfig,
     option_provider::{OptionCatalogEntry, load_option_catalog},
 };
+
+const RATE_LIMIT_RESET: &str = "x-ratelimit-reset";
 
 /// Discovers active option contracts for an exact underlying, including unrecognized series.
 ///
@@ -57,6 +60,7 @@ pub async fn request_option_catalog(
 pub(crate) struct AlpacaApiError {
     pub(crate) status: u16,
     pub(crate) code: Option<u64>,
+    pub(crate) rate_limit_reset: Option<Timestamp>,
     pub(crate) message: String,
 }
 
@@ -100,6 +104,7 @@ impl AlpacaHttpClient {
         ]);
         let client = HttpClient::builder()
             .headers(headers)
+            .header_keys(vec![RATE_LIMIT_RESET.to_owned()])
             .timeout_secs(timeout_secs)
             .maybe_proxy_url(proxy_url.map(str::to_owned))
             .redirect_policy(HttpRedirectPolicy::Reject)
@@ -178,8 +183,19 @@ impl AlpacaHttpClient {
             return Ok(response);
         }
         let details = serde_json::from_slice::<ErrorResponse>(&response.body).ok();
+        let status = response.status.as_u16();
+        let rate_limit_reset = if status == 429 {
+            response
+                .headers
+                .get(RATE_LIMIT_RESET)
+                .and_then(|value| value.parse().ok())
+                .and_then(|seconds| Timestamp::from_second(seconds).ok())
+        } else {
+            None
+        };
         Err(AlpacaApiError {
-            status: response.status.as_u16(),
+            status,
+            rate_limit_reset,
             code: details.as_ref().and_then(|error| error.code),
             message: details.map_or_else(
                 || format!("HTTP {}", response.status.as_u16()),
@@ -192,5 +208,41 @@ impl AlpacaHttpClient {
     fn decode<T: DeserializeOwned>(response: HttpResponse) -> anyhow::Result<T> {
         let response = Self::check_status(response)?;
         serde_json::from_slice(&response.body).context("Invalid Alpaca response")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(429, Some("1795450391"), Some(1_795_450_391))]
+    #[case(429, None, None)]
+    #[case(429, Some("soon"), None)]
+    #[case(429, Some("9223372036854775807"), None)]
+    #[case(503, Some("1795450391"), None)]
+    fn preserves_rate_limit_reset_on_throttled_responses(
+        #[case] status: u16,
+        #[case] header: Option<&str>,
+        #[case] expected: Option<i64>,
+    ) {
+        let response = HttpResponse {
+            status: status.try_into().unwrap(),
+            headers: header
+                .map(|value| (RATE_LIMIT_RESET.to_owned(), value.to_owned()))
+                .into_iter()
+                .collect(),
+            body: r#"{"code":42910000,"message":"broker message"}"#.into(),
+        };
+        let error = AlpacaHttpClient::check_status(response)
+            .unwrap_err()
+            .downcast::<AlpacaApiError>()
+            .unwrap();
+        assert_eq!(error.status, status);
+        assert_eq!(error.code, Some(42_910_000));
+        assert_eq!(error.message, "broker message");
+        assert_eq!(error.rate_limit_reset.map(|t| t.as_second()), expected);
     }
 }
