@@ -1107,13 +1107,17 @@ impl StreamTask {
                     let result = async {
                         let timestamp = update.ts_event()?;
                         if update.order.is_combo() && update.is_fill() {
-                            self.apply_combo(&update.order, timestamp).await?;
+                            if !self.apply_combo(epoch, &update.order, timestamp).await? {
+                                return Ok(());
+                            }
                         } else {
                             lock_state(&self.state)?.handle(*update, &self.emitter)?;
                         }
                         // Keep the original lookback until the gap is closed, even if newer
                         // WebSocket updates arrive during backoff or the socket reconnects again
-                        if self.ready_epoch.load(Ordering::Acquire) == epoch {
+                        if self.is_current(epoch)
+                            && self.ready_epoch.load(Ordering::Acquire) == epoch
+                        {
                             self.last_seen = self.last_seen.max(timestamp);
                         }
                         Ok::<(), anyhow::Error>(())
@@ -1182,22 +1186,50 @@ impl StreamTask {
         Ok(Some((epoch, Instant::now() + delay)))
     }
 
-    async fn apply_combo(&self, snapshot: &BrokerOrder, ts_event: UnixNanos) -> anyhow::Result<()> {
-        let result = lock_state(&self.state)?.handle_combo(snapshot, &self.emitter, ts_event);
+    fn apply_combo_snapshot(
+        &self,
+        epoch: u64,
+        snapshot: &BrokerOrder,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<bool> {
+        let mut state = lock_state(&self.state)?;
+        if !self.is_current(epoch) {
+            return Ok(false);
+        }
+        state.handle_combo(snapshot, &self.emitter, ts_event)?;
+        Ok(true)
+    }
+
+    async fn apply_combo(
+        &self,
+        epoch: u64,
+        snapshot: &BrokerOrder,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<bool> {
+        let result = self.apply_combo_snapshot(epoch, snapshot, ts_event);
         if result.is_ok() || snapshot.status != "filled" {
             return result;
         }
         // The fill notification can precede the last leg snapshot on the parent
         let venue_id = snapshot.venue_id()?;
-        for _ in 0..3 {
-            let order = reports::exact_order(&self.http, venue_id).await?;
+        for attempt in 0..3 {
+            if attempt != 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if !self.is_current(epoch) {
+                return Ok(false);
+            }
+            let response = reports::exact_order(&self.http, venue_id).await;
+            if !self.is_current(epoch) {
+                return Ok(false);
+            }
+            let order = response?;
             if order.status == "filled" {
-                let result = lock_state(&self.state)?.handle_combo(&order, &self.emitter, ts_event);
+                let result = self.apply_combo_snapshot(epoch, &order, ts_event);
                 if result.is_ok() {
                     return result;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         result
     }
@@ -1216,14 +1248,22 @@ impl StreamTask {
         let orders = &snapshot.orders;
 
         for order in orders.values().filter(|order| order.is_combo()) {
-            self.apply_combo(
-                order,
-                reports::timestamp(order.updated_at.as_deref().unwrap_or(&order.created_at))?,
-            )
-            .await?;
+            if !self
+                .apply_combo(
+                    epoch,
+                    order,
+                    reports::timestamp(order.updated_at.as_deref().unwrap_or(&order.created_at))?,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
         }
 
         let mut state = lock_state(&self.state)?;
+        if !self.is_current(epoch) {
+            return Ok(false);
+        }
         snapshot.bind_groups(&mut state, &self.emitter);
         let mut fills_by_order: HashMap<_, Vec<_>> = HashMap::new();
         for (activity, order) in fills {

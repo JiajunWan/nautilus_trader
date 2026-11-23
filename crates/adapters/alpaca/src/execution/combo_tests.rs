@@ -15,6 +15,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use axum::{Json, Router, routing::get};
 use futures_util::{SinkExt, StreamExt};
 use nautilus_common::{
     cache::Cache, live::runner::set_exec_event_sender, messages::ExecutionEvent,
@@ -27,9 +28,11 @@ use nautilus_model::{
     orders::OrderTestBuilder,
     types::{Price, Quantity},
 };
+use rstest::rstest;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
+    sync::oneshot,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use ustr::Ustr;
@@ -394,4 +397,152 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
     assert!(events.try_recv().is_err());
     rest_task.abort();
     ws_task.abort();
+}
+
+#[rstest]
+#[case::stream_fill(false)]
+#[case::reconnect_snapshot(true)]
+#[tokio::test]
+async fn superseded_combo_lookup_does_not_publish_fills(#[case] reconciliation: bool) {
+    timeout(
+        Duration::from_secs(15),
+        Box::pin(exercise_superseded_lookup(reconciliation)),
+    )
+    .await
+    .expect("Alpaca combo recovery did not finish");
+}
+
+async fn exercise_superseded_lookup(reconciliation: bool) {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_url = format!("http://{}", http.local_addr().unwrap());
+    let ws_url = format!("ws://{}", ws.local_addr().unwrap());
+    let name = "COMBO-OPEN";
+    let fill = response(name, "filled");
+    let mut incomplete = fill.clone();
+    incomplete["legs"] = Value::Null;
+    let incomplete_order: BrokerOrder = serde_json::from_value(incomplete.clone()).unwrap();
+    let (lookups, mut pending) = mpsc::unbounded_channel();
+    let server = Router::new()
+        .route(
+            "/v2/account",
+            get(|| async {
+                Json(json!({"account_number": "ALPACA-TEST", "currency": "USD", "cash": "100000"}))
+            }),
+        )
+        .route("/v2/orders", get(async move || Json(json!([incomplete]))))
+        .route(
+            "/v2/account/activities/FILL",
+            get(|| async { Json(json!([])) }),
+        )
+        .route(
+            "/v2/orders/COMBO-OPEN-PARENT",
+            get(async move || {
+                let (release, wait) = oneshot::channel();
+                lookups.send(release).unwrap();
+                wait.await.unwrap();
+                Json(fill.clone())
+            }),
+        );
+    let rest_task = tokio::spawn(axum::serve(http, server).into_future());
+
+    let (new_epoch, mut epochs) = mpsc::unbounded_channel();
+    let (socket, original) = tokio::join!(
+        WebSocketClient::epoch_builder()
+            .config(WebSocketConfig::builder().url(ws_url).build().unwrap())
+            .epoch_handler(Arc::new(move |epoch, frame| {
+                if frame.as_text() == Some(RECONNECTED) {
+                    new_epoch.send(epoch).unwrap();
+                }
+            }))
+            .connect(),
+        async { accept_async(ws.accept().await.unwrap().0).await.unwrap() },
+    );
+    let socket = Arc::new(socket.unwrap());
+    let epoch = socket.connection_epoch();
+
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .build();
+    let credentials = config.credentials().unwrap();
+    let http = AlpacaHttpClient::new(&rest_url, &credentials, 10, None).unwrap();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let mut emitter = ExecutionEventEmitter::new(
+        get_atomic_clock_realtime(),
+        TraderId::from("TEST-001"),
+        AccountId::from("ALPACA-001"),
+        AccountType::Margin,
+        Some(Currency::USD()),
+    );
+    emitter.set_sender(tx);
+    let leg_ids = [LONG, SHORT].map(|symbol| crate::provider::instrument_id(symbol).unwrap());
+    let spread = new_generic_spread_id(&[(leg_ids[0], 1), (leg_ids[1], -1)]).unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(spread)
+        .client_order_id(ClientOrderId::from(name))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .price(Price::from("1.95"))
+        .build();
+    let ts = reports::timestamp(TS).unwrap();
+    let mut state = OrderState::default();
+    state.register(order);
+    state
+        .handle_combo(
+            &serde_json::from_value(response(name, "new")).unwrap(),
+            &emitter,
+            ts,
+        )
+        .unwrap();
+    assert!(matches!(
+        order_event(&mut events).await,
+        OrderEventAny::Accepted(_)
+    ));
+
+    let task = Arc::new(StreamTask {
+        socket,
+        credentials,
+        http,
+        emitter,
+        state: Arc::new(Mutex::new(state)),
+        last_seen: ts,
+        ready_epoch: Arc::new(AtomicU64::new(epoch)),
+    });
+    let old = Arc::clone(&task);
+    let old_lookup = tokio::spawn(async move {
+        if reconciliation {
+            Box::pin(old.reconcile(epoch)).await
+        } else {
+            old.apply_combo(epoch, &incomplete_order, ts).await
+        }
+    });
+    let release = pending.recv().await.unwrap();
+    drop(original);
+    let _replacement = accept_async(ws.accept().await.unwrap().0).await.unwrap();
+    let current = epochs.recv().await.unwrap();
+    assert_ne!(epoch, current);
+    release.send(()).unwrap();
+    assert!(!old_lookup.await.unwrap().unwrap());
+    assert!(events.try_recv().is_err());
+    assert_eq!(lock_state(&task.state).unwrap().active_orders().len(), 1);
+
+    let (current_lookup, ()) = tokio::join!(Box::pin(task.reconcile(current)), async {
+        pending.recv().await.unwrap().send(()).unwrap();
+    },);
+    assert!(current_lookup.unwrap());
+    for instrument in leg_ids.into_iter().chain([spread]) {
+        assert!(
+            matches!(order_event(&mut events).await, OrderEventAny::Filled(fill)
+            if fill.instrument_id == instrument && fill.last_qty == Quantity::from(1))
+        );
+    }
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        ExecutionEvent::Account(_)
+    ));
+    assert!(events.try_recv().is_err());
+    assert!(lock_state(&task.state).unwrap().active_orders().is_empty());
+    task.socket.disconnect().await;
+    rest_task.abort();
 }
