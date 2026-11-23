@@ -179,7 +179,23 @@ impl AlpacaExecutionClient {
             }
             return Ok(());
         }
-        let grouped = orders.len() > 1;
+        let group = if orders.len() > 1 {
+            let root = ClientOrderId::new_checked(
+                body["client_order_id"]
+                    .as_str()
+                    .context("Missing Alpaca group root")?,
+            )?;
+            let list = orders[0]
+                .order_list_id()
+                .context("Missing Alpaca order list ID")?;
+            let class = body["order_class"]
+                .as_str()
+                .context("Missing Alpaca group class")?;
+            Some((root, list, class))
+        } else {
+            None
+        };
+        let group_root = group.map(|(root, _, _)| root);
         let combo = body["order_class"] == "mleg";
         let http = self.http.clone();
         let emitter = self.emitter.clone();
@@ -191,8 +207,8 @@ impl AlpacaExecutionClient {
                 self.emitter.try_emit_order_submitted(order)?;
                 state.register(order.clone());
             }
-            if grouped {
-                state.begin_group();
+            if let Some((root, list, class)) = group {
+                state.begin_group(list, root, class.to_owned());
             }
             if let Some(instructions) = body.get("advanced_instructions") {
                 state.stage_advanced_instructions(
@@ -204,23 +220,45 @@ impl AlpacaExecutionClient {
 
         let client_ids: Vec<_> = orders.iter().map(Order::client_order_id).collect();
         let result = self.spawn("submit_order", async move {
-            let result = http.post::<BrokerOrder, _>("/v2/orders", &body).await;
-            let mut state = lock_state(&state)?;
-            let result = match result {
-                Ok(order) if grouped => state.bind_group(&order, &orders),
-                Ok(order) if combo => state.handle_combo(&order, &emitter, now()),
-                Ok(order) => state.remember_advanced_instructions(&order),
-                Err(error) => {
-                    state.submit_failed(
-                        orders.iter().map(Order::client_order_id),
-                        classify(&error),
-                        &emitter,
-                    );
-                    Err(error)
+            let response = http.post::<BrokerOrder, _>("/v2/orders", &body).await;
+            let result = {
+                let mut state = lock_state(&state)?;
+                match response {
+                    Ok(order) => {
+                        if let Some(root) = group_root {
+                            state.bind_group(root, &order)
+                        } else if combo {
+                            state.handle_combo(&order, &emitter, now())
+                        } else {
+                            state.remember_advanced_instructions(&order)
+                        }
+                    }
+                    Err(e) => {
+                        let failure = classify(&e);
+                        if matches!(failure, CommandFailure::VenueRejected(_))
+                            && let Some(root) = group_root
+                        {
+                            state.forget_group(root);
+                        }
+                        state.submit_failed(
+                            orders.iter().map(Order::client_order_id),
+                            failure,
+                            &emitter,
+                        );
+                        Err(e)
+                    }
                 }
             };
-            if grouped {
-                state.complete_group(&emitter);
+            if let Some(root) = group_root {
+                let pending = lock_state(&state)?.pending_group_root(root).is_some();
+                if pending {
+                    match lookup_order(&http, &state, &emitter, Some(root), None).await {
+                        Ok(Some(_)) => return Ok(()),
+                        Ok(None) => {}
+                        Err(e) => log::warn!("Alpaca group {root} remains unresolved: {e:#}"),
+                    }
+                }
+                lock_state(&state)?.replay_group_updates(&emitter);
             }
             result
         });
@@ -232,8 +270,9 @@ impl AlpacaExecutionClient {
                 CommandFailure::not_sent(error.to_string()),
                 &self.emitter,
             );
-            if grouped {
-                state.complete_group(&self.emitter);
+            if let Some(root) = group_root {
+                state.forget_group(root);
+                state.replay_group_updates(&self.emitter);
             }
             return Err(error);
         }
@@ -483,12 +522,16 @@ impl ExecutionClient for AlpacaExecutionClient {
         let http = self.http.clone();
         let emitter = self.emitter.clone();
         let state = Arc::clone(&self.orders);
-        let venue_id = self
-            .order_state()?
-            .venue_for(cmd.client_order_id)
-            .or(cmd.venue_order_id);
         self.spawn("query_order", async move {
-            if let Some(order) = reports::order(&http, Some(cmd.client_order_id), venue_id).await? {
+            if let Some(order) = lookup_order(
+                &http,
+                &state,
+                &emitter,
+                Some(cmd.client_order_id),
+                cmd.venue_order_id,
+            )
+            .await?
+            {
                 let mut state = lock_state(&state)?;
                 if let Some(report) = state.order_report(
                     &order,
@@ -744,13 +787,15 @@ impl ExecutionClient for AlpacaExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let venue_id = {
-            let state = self.order_state()?;
-            cmd.client_order_id
-                .and_then(|id| state.venue_for(id))
-                .or(cmd.venue_order_id)
-        };
-        let Some(order) = reports::order(&self.http, cmd.client_order_id, venue_id).await? else {
+        let Some(order) = lookup_order(
+            &self.http,
+            &self.orders,
+            &self.emitter,
+            cmd.client_order_id,
+            cmd.venue_order_id,
+        )
+        .await?
+        else {
             return Ok(None);
         };
         let mut state = self.order_state()?;
@@ -849,6 +894,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             ExecutionMassStatus::new(self.core.client_id, account_id, *ALPACA, ts_init, None);
         status.set_report_window(start, start.is_some() && snapshot.complete);
         let mut state = self.order_state()?;
+        snapshot.bind_groups(&mut state, &self.emitter);
         let (orders, fills) = snapshot.mass_reports(&mut state, account_id, start, ts_init)?;
         status.add_order_reports(orders);
         status.add_fill_reports(fills);
@@ -875,6 +921,46 @@ impl ExecutionClient for AlpacaExecutionClient {
             .map(|position| position.to_report(self.core.account_id, now()))
             .collect()
     }
+}
+
+async fn lookup_order(
+    http: &AlpacaHttpClient,
+    state: &Mutex<OrderState>,
+    emitter: &ExecutionEventEmitter,
+    client_id: Option<ClientOrderId>,
+    venue_id: Option<VenueOrderId>,
+) -> anyhow::Result<Option<BrokerOrder>> {
+    let (group_root, known_venue) = {
+        let state = lock_state(state)?;
+        (
+            client_id.and_then(|id| state.pending_group_root(id)),
+            client_id.and_then(|id| state.venue_for(id)).or(venue_id),
+        )
+    };
+    let Some(root) = group_root else {
+        return reports::order(http, client_id, known_venue).await;
+    };
+    let Some(mut order) = reports::order(http, Some(root), None).await? else {
+        return Ok(None);
+    };
+    let mut state = lock_state(state)?;
+    if let Err(e) = state.bind_group(root, &order) {
+        log::warn!("Cannot resolve Alpaca group {root}: {e:#}");
+        return Ok(None);
+    }
+    state.replay_group_updates(emitter);
+    if client_id == Some(root) {
+        return Ok(Some(order));
+    }
+    let Some(venue) = client_id.and_then(|id| state.venue_for(id)) else {
+        return Ok(None);
+    };
+    Ok(order
+        .legs
+        .take()
+        .into_iter()
+        .flatten()
+        .find(|leg| leg.id == venue.as_str()))
 }
 
 fn lock_state(state: &Mutex<OrderState>) -> anyhow::Result<MutexGuard<'_, OrderState>> {
@@ -1138,8 +1224,12 @@ impl StreamTask {
         }
 
         let mut state = lock_state(&self.state)?;
+        snapshot.bind_groups(&mut state, &self.emitter);
         let mut fills_by_order: HashMap<_, Vec<_>> = HashMap::new();
         for (activity, order) in fills {
+            if state.unresolved_group_child(order)? {
+                continue;
+            }
             let venue_id = order.venue_id()?;
             let fill =
                 activity.to_report(self.emitter.account_id(), state.client_for(venue_id), now())?;
@@ -1150,6 +1240,9 @@ impl StreamTask {
             .values()
             .filter(|order| order.supported() && order.replaced_by.is_none())
         {
+            if state.unresolved_group_child(order)? {
+                continue;
+            }
             let client_id = state
                 .broker_order_client_id(order)?
                 .or(Some(order.client_id()?));
@@ -1208,7 +1301,9 @@ async fn supported_fills(
         } else if let Some(supported) = supported_by_order.get(&venue_id) {
             *supported
         } else {
-            let supported = reports::exact_order(http, venue_id).await?.supported();
+            let order = reports::exact_order(http, venue_id).await?;
+            let supported =
+                order.supported() && !lock_state(state)?.unresolved_group_child(&order)?;
             supported_by_order.insert(venue_id, supported);
             supported
         };

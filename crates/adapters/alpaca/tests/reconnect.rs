@@ -32,17 +32,22 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     live::runner::{set_data_event_sender, set_exec_event_sender},
-    messages::{DataEvent, ExecutionEvent, ExecutionReport, execution::SubmitOrder},
+    messages::{
+        DataEvent, ExecutionEvent, ExecutionReport,
+        execution::{QueryOrder, SubmitOrder, SubmitOrderList},
+    },
 };
 use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     data::Data,
-    enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{
+        AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+    },
     events::OrderEventAny,
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TraderId},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, TraderId},
     instruments::Instrument,
-    orders::OrderTestBuilder,
+    orders::{Order, OrderList, OrderTestBuilder},
     types::{Price, Quantity},
 };
 use rstest::rstest;
@@ -153,6 +158,191 @@ fn order(id: &str, filled: bool) -> Value {
         "status": if filled { "filled" } else { "new" },
         "filled_qty": if filled { "1" } else { "0" }, "created_at": TS,
     })
+}
+
+#[tokio::test]
+async fn recovers_group_by_parent_after_submit_and_first_query_fail() {
+    tokio::time::timeout(Duration::from_secs(10), exercise_group_recovery())
+        .await
+        .expect("Group recovery did not finish");
+}
+
+async fn exercise_group_recovery() {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .build();
+
+    let broker = |venue, client, kind, side, filled| {
+        let mut row = order(venue, filled);
+        row["client_order_id"] = json!(client);
+        row["order_class"] = json!("bracket");
+        row["type"] = json!(kind);
+        row["side"] = json!(side);
+        row
+    };
+    let profit = broker("PROFIT-UUID", "BROKER-PROFIT", "limit", "sell", true);
+    let stop = broker("STOP-UUID", "BROKER-STOP", "stop", "sell", false);
+    let mut root = broker("ROOT-UUID", "ROOT", "limit", "buy", false);
+    root["legs"] = json!([stop, profit]);
+    let (submissions, mut submitted) = mpsc::unbounded_channel();
+    let (lookups, mut queried) = mpsc::unbounded_channel();
+    let first_lookup = Arc::new(OnceLock::new());
+    let app = Router::new()
+        .route(
+            "/v2/account",
+            get(|| async {
+                Json(json!({"account_number":"TEST","currency":"USD","cash":"10000"}))
+            }),
+        )
+        .route(
+            "/v2/orders",
+            axum::routing::post(async move |Json(request): Json<Value>| {
+                assert_eq!(request["client_order_id"], "ROOT");
+                let (finish, wait) = oneshot::channel();
+                submissions.send(finish).unwrap();
+                wait.await.unwrap();
+                StatusCode::SERVICE_UNAVAILABLE
+            }),
+        )
+        .route(
+            "/v2/orders:by_client_order_id",
+            get(async move |Query(query): Query<HashMap<String, String>>| {
+                assert_eq!(query["client_order_id"], "ROOT");
+                assert_eq!(query["nested"], "true");
+                lookups.send(()).unwrap();
+                if first_lookup.set(()).is_ok() {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                Ok(Json(root.clone()))
+            }),
+        );
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+    let (tx, mut events) = mpsc::unbounded_channel();
+    set_exec_event_sender(tx);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let trader = TraderId::from("TEST-001");
+    let client_id = ClientId::from("ALPACA");
+    let instrument = InstrumentId::from("SPY.ALPACA");
+    let list_id = OrderListId::from("GROUP-1");
+    let core = ExecutionClientCore::new(
+        trader,
+        client_id,
+        *ALPACA_VENUE,
+        OmsType::Netting,
+        AccountId::from("ALPACA-001"),
+        AccountType::Margin,
+        None,
+        cache.clone(),
+    );
+    let mut client = AlpacaExecutionClient::new(core, &config).unwrap();
+    let (connected, mut socket) = tokio::join!(client.connect(), accept_private(&ws));
+    connected.unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(ExecutionEvent::Account(_))
+    ));
+
+    let root_id = ClientOrderId::from("ROOT");
+    let profit_id = ClientOrderId::from("PROFIT");
+    let stop_id = ClientOrderId::from("STOP");
+    let make = |kind, id, side| {
+        let mut builder = OrderTestBuilder::new(kind);
+        builder
+            .trader_id(trader)
+            .instrument_id(instrument)
+            .client_order_id(id)
+            .side(side)
+            .order_list_id(list_id)
+            .time_in_force(TimeInForce::Day)
+            .quantity(Quantity::from(1));
+        builder
+    };
+    let orders = [
+        make(OrderType::Limit, root_id, OrderSide::Buy)
+            .price(Price::from("100"))
+            .linked_order_ids(vec![profit_id, stop_id])
+            .contingency_type(ContingencyType::Oto)
+            .build(),
+        make(OrderType::Limit, profit_id, OrderSide::Sell)
+            .price(Price::from("120"))
+            .parent_order_id(root_id)
+            .build(),
+        make(OrderType::StopMarket, stop_id, OrderSide::Sell)
+            .trigger_price(Price::from("95"))
+            .parent_order_id(root_id)
+            .build(),
+    ];
+    let strategy = orders[0].strategy_id();
+    let list = SubmitOrderList::new(
+        trader,
+        Some(client_id),
+        strategy,
+        OrderList::from_orders(&orders, 0.into()),
+        orders.iter().map(|o| o.init_event().clone()).collect(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        0.into(),
+        None,
+    );
+    for o in orders {
+        cache
+            .borrow_mut()
+            .add_order(o, None, Some(client_id), false)
+            .unwrap();
+    }
+    client.submit_order_list(list).unwrap();
+    let finish = submitted.recv().await.unwrap();
+    for id in [root_id, profit_id, stop_id] {
+        assert!(
+            matches!(events.recv().await, Some(ExecutionEvent::Order(OrderEventAny::Submitted(event))) if event.client_order_id == id)
+        );
+    }
+
+    let frame = json!({"stream":"trade_updates","data":{
+        "event":"fill","timestamp":TS,"qty":"1","price":"120","order":profit
+    }});
+    socket.send(Message::text(frame.to_string())).await.unwrap();
+    stream_update(&mut socket, "BARRIER", false).await;
+    assert!(
+        matches!(events.recv().await, Some(ExecutionEvent::Report(ExecutionReport::Order(report))) if report.venue_order_id.as_str()=="BARRIER")
+    );
+    finish.send(()).unwrap();
+    queried.recv().await.unwrap();
+
+    client
+        .query_order(QueryOrder::new(
+            trader,
+            Some(client_id),
+            strategy,
+            instrument,
+            profit_id,
+            None,
+            UUID4::new(),
+            0.into(),
+            None,
+            None,
+        ))
+        .unwrap();
+    queried.recv().await.unwrap();
+    assert!(
+        matches!(events.recv().await, Some(ExecutionEvent::Order(OrderEventAny::Accepted(event))) if event.client_order_id == profit_id)
+    );
+    assert!(
+        matches!(events.recv().await, Some(ExecutionEvent::Order(OrderEventAny::Filled(event))) if event.client_order_id == profit_id && event.venue_order_id.as_str()=="PROFIT-UUID")
+    );
+    assert!(
+        matches!(events.recv().await, Some(ExecutionEvent::Report(ExecutionReport::Order(report))) if report.client_order_id == Some(profit_id) && report.venue_order_id.as_str()=="PROFIT-UUID")
+    );
+    assert!(submitted.try_recv().is_err());
+    client.disconnect().await.unwrap();
+    server.abort();
 }
 
 async fn accept_private(listener: &TcpListener) -> WebSocketStream<TcpStream> {

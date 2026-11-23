@@ -22,7 +22,7 @@ use nautilus_live::{ExecutionEventEmitter, execution::failure::CommandFailure};
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus},
     events::OrderEventAny,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, TradeId, VenueOrderId},
     orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Price},
@@ -37,6 +37,8 @@ use super::{
     reports::{BrokerOrder, order_side, quantity, timestamp, trade_id},
 };
 use crate::{option_spread, provider::instrument_id};
+
+const MAX_DEFERRED_GROUP_UPDATES: usize = 256;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TradeUpdate {
@@ -123,7 +125,7 @@ pub(super) struct OrderState {
     broker_client_ids: HashMap<String, ClientOrderId>,
     advanced_instructions: HashMap<VenueOrderId, Value>,
     pending_advanced_instructions: HashMap<String, Value>,
-    pending_groups: usize,
+    pending_groups: HashMap<OrderListId, (ClientOrderId, String)>,
     deferred_group_updates: Vec<TradeUpdate>,
 }
 
@@ -349,6 +351,9 @@ impl OrderState {
         client_id: Option<ClientOrderId>,
         ts_init: UnixNanos,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        if self.unresolved_group_child(order)? {
+            return Ok(None);
+        }
         let combo = self.combo_order(order)?;
         if !order.supported() && combo.is_none() {
             return Ok(None);
@@ -484,55 +489,126 @@ impl OrderState {
         }
     }
 
-    pub(super) fn begin_group(&mut self) {
-        self.pending_groups += 1;
+    pub(super) fn begin_group(&mut self, list: OrderListId, root: ClientOrderId, class: String) {
+        self.pending_groups.insert(list, (root, class));
     }
 
-    pub(super) fn complete_group(&mut self, emitter: &ExecutionEventEmitter) {
-        self.pending_groups -= 1;
-        if self.pending_groups == 0 {
-            for update in std::mem::take(&mut self.deferred_group_updates) {
-                if let Err(error) = self.handle(update, emitter) {
-                    log::error!("Invalid deferred Alpaca update: {error:#}");
-                }
+    pub(super) fn pending_group_root(&self, id: ClientOrderId) -> Option<ClientOrderId> {
+        let list = self.tracked.get(&id)?.order.order_list_id()?;
+        self.pending_groups.get(&list).map(|(root, _)| *root)
+    }
+
+    pub(super) fn forget_group(&mut self, root: ClientOrderId) {
+        if let Some(list) = self
+            .tracked
+            .get(&root)
+            .and_then(|tracked| tracked.order.order_list_id())
+        {
+            self.pending_groups.remove(&list);
+        }
+    }
+
+    fn possible_group_child(&self, order: &BrokerOrder) -> bool {
+        self.pending_groups.values().any(|(root, class)| {
+            order.order_class.as_ref() == Some(class)
+                && order.symbol == self.tracked[root].order.instrument_id().symbol.as_str()
+        })
+    }
+
+    pub(super) fn unresolved_group_child(&self, order: &BrokerOrder) -> anyhow::Result<bool> {
+        Ok(self.possible_group_child(order) && self.broker_order_client_id(order)?.is_none())
+    }
+
+    pub(super) fn replay_group_updates(&mut self, emitter: &ExecutionEventEmitter) {
+        for update in std::mem::take(&mut self.deferred_group_updates) {
+            if let Err(e) = self.handle(update, emitter) {
+                log::warn!("Invalid deferred Alpaca update: {e:#}");
             }
         }
     }
 
     pub(super) fn bind_group(
         &mut self,
+        root_id: ClientOrderId,
         root: &BrokerOrder,
-        orders: &[OrderAny],
     ) -> anyhow::Result<()> {
-        let root_id = root.client_id()?;
+        let local_root = &self
+            .tracked
+            .get(&root_id)
+            .context("Missing Alpaca group root")?
+            .order;
+        let list = local_root
+            .order_list_id()
+            .context("Missing Alpaca order list ID")?;
+        let Some((expected_root, class)) = self.pending_groups.get(&list) else {
+            return Ok(());
+        };
         ensure!(
-            orders
-                .iter()
-                .any(|order| order.client_order_id() == root_id),
-            "Unexpected Alpaca order-list root"
+            *expected_root == root_id
+                && root.client_id()? == root_id
+                && root.order_class.as_ref() == Some(class),
+            "Unexpected Alpaca order-list root",
         );
+        let links = local_root
+            .linked_order_ids()
+            .context("Missing Alpaca group links")?;
         let legs = root
             .legs
             .as_deref()
             .context("Alpaca order-list response omitted legs")?;
         ensure!(
-            legs.len() + 1 == orders.len(),
-            "Alpaca order-list leg count does not match the order list"
+            legs.len() == links.len(),
+            "Alpaca order-list leg count does not match"
         );
-
-        for broker_leg in legs {
-            let leg_type = super::orders::parse_order_type(&broker_leg.order_type)?;
-            let local = orders
+        let mut bindings = vec![(root, root_id, root.venue_id()?)];
+        for leg in legs {
+            let kind = super::orders::parse_order_type(&leg.order_type)?;
+            let child = links
                 .iter()
-                .find(|order| order.client_order_id() != root_id && order.order_type() == leg_type)
+                .copied()
+                .find(|id| {
+                    self.tracked
+                        .get(id)
+                        .is_some_and(|tracked| tracked.order.order_type() == kind)
+                })
                 .context("Alpaca order-list leg did not match a Nautilus order")?;
-            let client_id = local.client_order_id();
-            self.venue_client_ids
-                .insert(broker_leg.venue_id()?, client_id);
-            self.broker_client_ids
-                .insert(broker_leg.client_order_id.clone(), client_id);
+            bindings.push((leg, child, leg.venue_id()?));
         }
-        self.venue_client_ids.insert(root.venue_id()?, root_id);
+        for (index, (broker, id, venue)) in bindings.iter().enumerate() {
+            let tracked = &self.tracked[id];
+            ensure!(
+                broker.supported()
+                    && broker.symbol == tracked.order.instrument_id().symbol.as_str()
+                    && order_side(&broker.side)? == tracked.order.order_side()
+                    && super::orders::parse_order_type(&broker.order_type)?
+                        == tracked.order.order_type()
+                    && !broker.client_order_id.is_empty()
+                    && tracked
+                        .active_venue_id
+                        .is_none_or(|active| active == *venue)
+                    && self
+                        .broker_order_client_id(broker)?
+                        .is_none_or(|active| active == *id)
+                    && self
+                        .broker_client_ids
+                        .get(&broker.client_order_id)
+                        .is_none_or(|active| active == id)
+                    && !bindings[..index].iter().any(|(seen, seen_id, seen_venue)| {
+                        seen_id == id
+                            || seen_venue == venue
+                            || seen.client_order_id == broker.client_order_id
+                    }),
+                "Conflicting Alpaca order-list member identity",
+            );
+        }
+        for (broker, id, venue) in bindings {
+            self.bind_venue_id(venue, id);
+            self.register_alias(broker.client_order_id.clone(), id);
+            if let Some(tracked) = self.tracked.get_mut(&id) {
+                tracked.set_venue_id(venue, &mut self.active);
+            }
+        }
+        self.pending_groups.remove(&list);
         Ok(())
     }
 
@@ -563,8 +639,13 @@ impl OrderState {
 
         self.remember_advanced_instructions(&update.order)?;
         let client_id = self.broker_order_client_id(&update.order)?;
-        if client_id.is_none() && self.pending_groups > 0 {
-            self.deferred_group_updates.push(update);
+        if client_id.is_none() && self.possible_group_child(&update.order) {
+            // An exact nested lookup is required before attributing a broker-generated ID
+            if self.deferred_group_updates.len() < MAX_DEFERRED_GROUP_UPDATES {
+                self.deferred_group_updates.push(update);
+            } else {
+                log::warn!("Alpaca unresolved order group update buffer is full");
+            }
             return Ok(());
         }
 
@@ -826,6 +907,58 @@ mod tests {
         assert_eq!(fill.last_qty, report.last_qty);
         assert_eq!(fill.last_px, report.last_px);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn incomplete_or_conflicting_group_evidence_does_not_bind_members() {
+        let (mut state, _, _) = execution_rig();
+        let list = OrderListId::from("GROUP");
+        let root = ClientOrderId::from("ROOT");
+        let child = ClientOrderId::from("STOP");
+        let make = |kind, id, side| {
+            let mut builder = OrderTestBuilder::new(kind);
+            builder
+                .instrument_id(instrument_id("SPY").unwrap())
+                .client_order_id(id)
+                .order_list_id(list)
+                .side(side)
+                .quantity(Quantity::from(1));
+            builder
+        };
+        state.register(
+            make(OrderType::Limit, root, OrderSide::Buy)
+                .price(Price::from("500"))
+                .linked_order_ids(vec![child])
+                .build(),
+        );
+        state.register(
+            make(OrderType::StopMarket, child, OrderSide::Sell)
+                .trigger_price(Price::from("495"))
+                .parent_order_id(root)
+                .build(),
+        );
+        state.begin_group(list, root, "oto".into());
+        let mut row = update("new", "new", "root-uuid", root.as_str()).order;
+        row.order_class = Some("oto".into());
+        assert!(state.bind_group(root, &row).is_err());
+        assert_eq!(state.venue_for(root), None);
+        assert_eq!(state.pending_group_root(child), Some(root));
+
+        let mut stop = update("held", "held", "stop-uuid", "client-id").order;
+        stop.order_type = "stop".into();
+        stop.side = "sell".into();
+        row.legs = Some(vec![stop.clone()]);
+        assert!(state.bind_group(root, &row).is_err());
+        assert_eq!(state.venue_for(root), None);
+        assert_eq!(state.venue_for(child), None);
+        assert_eq!(state.pending_group_root(child), Some(root));
+
+        stop.client_order_id = "broker-stop".into();
+        row.legs = Some(vec![stop]);
+        state.bind_group(root, &row).unwrap();
+        assert_eq!(state.venue_for(root), Some("root-uuid".into()));
+        assert_eq!(state.venue_for(child), Some("stop-uuid".into()));
+        assert_eq!(state.pending_group_root(child), None);
     }
 
     #[rstest]

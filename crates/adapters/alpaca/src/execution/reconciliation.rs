@@ -22,6 +22,7 @@ use std::{
 
 use futures_util::{StreamExt, TryStreamExt, stream};
 use nautilus_core::UnixNanos;
+use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     identifiers::{AccountId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
@@ -65,20 +66,37 @@ pub(super) async fn snapshot(
         .chain(recent)
         .map(|order| (order.id.clone(), order))
         .collect();
-    let mut active = lock_state(state)?.active_orders();
-    active.retain(|(_, venue_id)| {
-        venue_id.is_none_or(|id| {
-            orders
-                .get(id.as_str())
-                .is_none_or(|order| order.replaced_by.is_some())
-        })
-    });
+    let active: HashSet<_> = {
+        let state = lock_state(state)?;
+        state
+            .active_orders()
+            .into_iter()
+            .filter_map(|(client, venue)| {
+                if let Some(root) = state.pending_group_root(client) {
+                    Some((root, None))
+                } else {
+                    venue
+                        .is_none_or(|id| {
+                            orders
+                                .get(id.as_str())
+                                .is_none_or(|order| order.replaced_by.is_some())
+                        })
+                        .then_some((client, venue))
+                }
+            })
+            .collect()
+    };
     let active: Vec<_> = stream::iter(active)
         .map(|(client_id, venue_id)| reports::order(http, Some(client_id), venue_id))
         .buffer_unordered(MAX_ORDER_LOOKUPS)
         .try_collect()
         .await?;
     for order in active.into_iter().flatten() {
+        if !order.is_combo() {
+            for leg in order.legs.iter().flatten() {
+                orders.entry(leg.id.clone()).or_insert_with(|| leg.clone());
+            }
+        }
         orders.insert(order.id.clone(), order);
     }
 
@@ -122,6 +140,18 @@ pub(super) async fn snapshot(
 }
 
 impl Snapshot {
+    pub(super) fn bind_groups(&self, state: &mut OrderState, emitter: &ExecutionEventEmitter) {
+        for order in self.orders.values() {
+            if let Ok(id) = order.client_id()
+                && state.pending_group_root(id) == Some(id)
+                && let Err(e) = state.bind_group(id, order)
+            {
+                log::warn!("Cannot resolve Alpaca group {id}: {e:#}");
+            }
+        }
+        state.replay_group_updates(emitter);
+    }
+
     pub(super) fn simple_fills(&self) -> impl Iterator<Item = (&FillActivity, &BrokerOrder)> {
         self.activities.iter().filter_map(|activity| {
             let order = self.orders.get(&activity.order_id)?;
@@ -157,6 +187,9 @@ impl Snapshot {
             }
         }
         for (activity, order) in self.simple_fills() {
+            if state.unresolved_group_child(order)? {
+                continue;
+            }
             let id = state
                 .broker_order_client_id(order)?
                 .or(Some(order.client_id()?));
