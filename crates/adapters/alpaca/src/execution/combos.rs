@@ -19,7 +19,7 @@ use anyhow::{Context, ensure};
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderType, TimeInForce},
-    events::OrderFilled,
+    events::{OrderDeniedReason, OrderFilled},
     identifiers::{AccountId, ClientOrderId, VenueOrderId},
     orders::{Order, OrderAny},
     reports::FillReport,
@@ -45,10 +45,14 @@ pub(super) fn cash_price(value: Decimal, side: OrderSide) -> Decimal {
 
 pub(super) fn request(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
     ensure!(
-        order.order_type() == OrderType::Limit
-            && order.time_in_force() == TimeInForce::Day
-            && !extended_hours(params)?,
-        "Alpaca option combos require a regular-hours Limit DAY order",
+        order.order_type() == OrderType::Limit,
+        OrderDeniedReason::UnsupportedOrderType {
+            order_type: order.order_type()
+        },
+    );
+    ensure!(
+        order.time_in_force() == TimeInForce::Day && !extended_hours(params)?,
+        "Alpaca option combos require a regular-hours DAY order",
     );
     ensure!(
         order.quantity() == Quantity::from(1)

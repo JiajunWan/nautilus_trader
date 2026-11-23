@@ -184,7 +184,7 @@ impl AlpacaExecutionClient {
         let emitter = self.emitter.clone();
         let state = Arc::clone(&self.orders);
 
-        let advanced_id = {
+        {
             let mut state = self.order_state()?;
             for order in &orders {
                 self.emitter.try_emit_order_submitted(order)?;
@@ -193,15 +193,15 @@ impl AlpacaExecutionClient {
             if grouped {
                 state.begin_group();
             }
-            body.get("advanced_instructions").map(|instructions| {
-                let id = orders[0].client_order_id().to_string();
-                state.stage_advanced_instructions(id.clone(), instructions.clone());
-                id
-            })
-        };
+            if let Some(instructions) = body.get("advanced_instructions") {
+                state.stage_advanced_instructions(
+                    orders[0].client_order_id().to_string(),
+                    instructions.clone(),
+                );
+            }
+        }
 
-        let original_orders = orders.clone();
-        let staged_id = advanced_id.clone();
+        let client_ids: Vec<_> = orders.iter().map(Order::client_order_id).collect();
         let result = self.spawn("submit_order", async move {
             let result = http.post::<BrokerOrder, _>("/v2/orders", &body).await;
             let mut state = lock_state(&state)?;
@@ -210,14 +210,11 @@ impl AlpacaExecutionClient {
                 Ok(order) if combo => state.handle_combo(&order, &emitter, now()),
                 Ok(order) => state.remember_advanced_instructions(&order),
                 Err(error) => {
-                    if let CommandFailure::VenueRejected(reason) = classify(&error) {
-                        if let Some(id) = staged_id {
-                            state.forget_advanced_request(&id);
-                        }
-                        for order in &orders {
-                            emitter.emit_order_rejected(order, &reason, now(), false);
-                        }
-                    }
+                    state.submit_failed(
+                        orders.iter().map(Order::client_order_id),
+                        classify(&error),
+                        &emitter,
+                    );
                     Err(error)
                 }
             };
@@ -229,18 +226,13 @@ impl AlpacaExecutionClient {
 
         if let Err(error) = result {
             let mut state = self.order_state()?;
-            if let Some(id) = advanced_id {
-                state.forget_advanced_request(&id);
-            }
+            state.submit_failed(
+                client_ids,
+                CommandFailure::not_sent(error.to_string()),
+                &self.emitter,
+            );
             if grouped {
                 state.complete_group(&self.emitter);
-            }
-            let reason = CommandFailure::not_sent(error.to_string());
-            if let CommandFailure::NotSent(reason) = reason {
-                for order in &original_orders {
-                    self.emitter
-                        .emit_order_rejected(order, &reason, now(), false);
-                }
             }
             return Err(error);
         }

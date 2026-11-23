@@ -22,6 +22,7 @@ use nautilus_model::{
         ContingencyType, OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
+    events::OrderDeniedReason,
     orders::{Order, OrderAny},
 };
 use rust_decimal::Decimal;
@@ -74,10 +75,14 @@ pub(super) fn option_order_request(
     let extended = extended_hours(params)?;
     let order_type = match order.order_type() {
         OrderType::Limit => "limit",
-        OrderType::Market if !extended => "market",
-        _ => bail!(
-            "Alpaca options require limit orders in extended hours and market or limit in regular hours"
-        ),
+        OrderType::Market => {
+            ensure!(
+                !extended,
+                "Alpaca options require limit orders in extended hours"
+            );
+            "market"
+        }
+        order_type => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
     };
     // Bind closing sales to an existing long position at the broker.
     let (side, intent) = match order.order_side() {
@@ -159,9 +164,14 @@ pub(super) fn order_list_request(
         _ => bail!("An Alpaca bracket requires an OTO entry order"),
     };
     ensure!(
-        matches!(root.order_type(), OrderType::Market | OrderType::Limit)
-            && matches!(root.time_in_force(), TimeInForce::Day | TimeInForce::Gtc),
-        "Alpaca order groups require a market or limit parent with DAY or GTC time in force",
+        matches!(root.order_type(), OrderType::Market | OrderType::Limit),
+        OrderDeniedReason::UnsupportedOrderType {
+            order_type: root.order_type()
+        },
+    );
+    ensure!(
+        matches!(root.time_in_force(), TimeInForce::Day | TimeInForce::Gtc),
+        "Alpaca order groups require DAY or GTC time in force",
     );
     let group_id = root
         .order_list_id()
@@ -215,7 +225,10 @@ pub(super) fn order_list_request(
                 }
                 request["stop_loss"] = stop;
             }
-            other => bail!("Alpaca group cannot contain this exit order type: {other}"),
+            OrderType::Limit | OrderType::StopMarket | OrderType::StopLimit => {
+                bail!("Alpaca order group contains a duplicate take-profit or stop-loss exit")
+            }
+            order_type => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
         }
     }
     if entry.is_none() {
@@ -302,7 +315,7 @@ fn equity_request(order: &OrderAny, extended: bool) -> anyhow::Result<Value> {
         OrderType::StopMarket => "stop",
         OrderType::StopLimit => "stop_limit",
         OrderType::TrailingStopMarket => "trailing_stop",
-        _ => bail!("Alpaca does not support equity order type {order_type}"),
+        _ => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
     };
     let wire_time_in_force = match time_in_force {
         TimeInForce::Day => "day",
@@ -425,7 +438,7 @@ pub(super) fn parse_order_status(value: &str) -> anyhow::Result<OrderStatus> {
 #[cfg(test)]
 mod tests {
     use nautilus_model::{
-        identifiers::{ClientOrderId, InstrumentId, OrderListId},
+        identifiers::{ClientOrderId, InstrumentId, OrderListId, new_generic_spread_id},
         orders::OrderTestBuilder,
         types::{Price, Quantity},
     };
@@ -468,6 +481,33 @@ mod tests {
         assert_eq!(body["time_in_force"], wire_tif);
         assert_eq!(body["extended_hours"], is_extended);
         assert_eq!(parse_time_in_force(wire_tif).unwrap(), time_in_force);
+    }
+
+    #[rstest]
+    fn uses_canonical_denial_for_unsupported_order_types() {
+        let order_type = OrderType::MarketToLimit;
+        let equity = order_builder(order_type, "EQUITY-1").build();
+        let option = order_builder(order_type, "OPTION-1")
+            .instrument_id(InstrumentId::from("SPY261120C00745000.ALPACA"))
+            .build();
+        let spread = new_generic_spread_id(&[
+            (option.instrument_id(), 1),
+            (InstrumentId::from("SPY261120C00750000.ALPACA"), -1),
+        ])
+        .unwrap();
+        let combo = order_builder(order_type, "COMBO-1")
+            .instrument_id(spread)
+            .build();
+        for result in [
+            order_request(&equity, None),
+            option_order_request(&option, None),
+            super::super::combos::request(&combo, None),
+        ] {
+            assert_eq!(
+                result.unwrap_err().downcast_ref::<OrderDeniedReason>(),
+                Some(&OrderDeniedReason::UnsupportedOrderType { order_type })
+            );
+        }
     }
 
     #[rstest]

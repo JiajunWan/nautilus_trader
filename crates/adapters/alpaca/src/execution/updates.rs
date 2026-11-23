@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use ahash::AHashMap;
 use anyhow::{Context, ensure};
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_live::ExecutionEventEmitter;
+use nautilus_live::{ExecutionEventEmitter, execution::failure::CommandFailure};
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus},
     events::OrderEventAny,
@@ -171,6 +171,38 @@ impl OrderState {
 
     pub(super) fn forget_advanced_request(&mut self, broker_client_id: &str) {
         self.pending_advanced_instructions.remove(broker_client_id);
+    }
+
+    pub(super) fn submit_failed(
+        &mut self,
+        client_ids: impl IntoIterator<Item = ClientOrderId>,
+        failure: CommandFailure,
+        emitter: &ExecutionEventEmitter,
+    ) {
+        let reason = match failure {
+            CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => reason,
+            CommandFailure::Ambiguous(_) => return,
+        };
+        let ts_event = super::now();
+        for id in client_ids {
+            self.forget_advanced_request(id.as_str());
+            self.reject_order(id, &reason, emitter, ts_event);
+        }
+    }
+
+    fn reject_order(
+        &mut self,
+        client_id: ClientOrderId,
+        reason: &str,
+        emitter: &ExecutionEventEmitter,
+        ts_event: UnixNanos,
+    ) {
+        if let Some(tracked) = self.tracked.get_mut(&client_id)
+            && !tracked.status.is_closed()
+        {
+            tracked.set_status(OrderStatus::Rejected, &mut self.active);
+            emitter.emit_order_rejected(&tracked.order, reason, ts_event, false);
+        }
     }
 
     pub(super) fn advanced_instructions(&self, venue_id: VenueOrderId) -> Option<&Value> {
@@ -349,6 +381,8 @@ impl OrderState {
             tracked.active_venue_id.is_none_or(|id| id == venue_id),
             "Alpaca combo broker order ID changed unexpectedly",
         );
+        self.venue_client_ids.insert(venue_id, client_id);
+        tracked.set_venue_id(venue_id, &mut self.active);
         if tracked.status.is_closed() {
             return Ok(());
         }
@@ -362,8 +396,6 @@ impl OrderState {
             None
         };
 
-        self.venue_client_ids.insert(venue_id, client_id);
-        tracked.set_venue_id(venue_id, &mut self.active);
         tracked.last_combo_update = tracked.last_combo_update.max(ts_event);
         let order = &tracked.order;
         if matches!(
@@ -405,13 +437,12 @@ impl OrderState {
                 tracked.set_status(status, &mut self.active);
             }
             OrderStatus::Rejected => {
-                emitter.emit_order_rejected(
-                    order,
+                self.reject_order(
+                    client_id,
                     "Alpaca rejected the option combo",
+                    emitter,
                     ts_event,
-                    false,
                 );
-                tracked.set_status(status, &mut self.active);
             }
             _ => {}
         }
@@ -638,13 +669,12 @@ impl OrderState {
                 tracked.set_status(OrderStatus::Expired, &mut self.active);
             }
             "rejected" => {
-                emitter.emit_order_rejected(
-                    &tracked.order,
+                self.reject_order(
+                    client_id,
                     "Alpaca trade stream rejected the order",
+                    emitter,
                     ts_event,
-                    false,
                 );
-                tracked.set_status(OrderStatus::Rejected, &mut self.active);
             }
             "order_cancel_rejected" => emitter.emit_order_cancel_rejected(
                 &tracked.order,
@@ -671,7 +701,7 @@ impl OrderState {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::messages::ExecutionEvent;
+    use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
     use nautilus_model::{
         enums::{AccountType, OrderSide, OrderType},
         events::OrderEventAny,
@@ -795,6 +825,112 @@ mod tests {
         assert_eq!(fill.instrument_id, report.instrument_id);
         assert_eq!(fill.last_qty, report.last_qty);
         assert_eq!(fill.last_px, report.last_px);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case::rest_first(true)]
+    #[case::stream_first(false)]
+    fn rejects_once_and_preserves_late_fill_identity(#[case] rest_first: bool) {
+        let (mut state, emitter, mut rx) = execution_rig();
+        let id = ClientOrderId::from("client-id");
+        let rest = |state: &mut OrderState| {
+            state.submit_failed(
+                [id],
+                CommandFailure::venue_rejected("invalid price"),
+                &emitter,
+            );
+        };
+        if rest_first {
+            rest(&mut state);
+            assert!(state.active_orders().is_empty());
+        }
+        state
+            .handle(
+                update("rejected", "rejected", "venue-a", "client-id"),
+                &emitter,
+            )
+            .unwrap();
+        rest(&mut state);
+        assert!(state.active_orders().is_empty());
+        assert_eq!(state.tracked[&id].status, OrderStatus::Rejected);
+        let ExecutionEvent::Order(OrderEventAny::Rejected(event)) = rx.try_recv().unwrap() else {
+            panic!("Expected one rejection");
+        };
+        assert_eq!(event.client_order_id, id);
+        assert_eq!(
+            event.reason.as_str(),
+            if rest_first {
+                "invalid price"
+            } else {
+                "Alpaca trade stream rejected the order"
+            }
+        );
+
+        for _ in 0..2 {
+            state
+                .handle(
+                    update("fill", "filled", "venue-a", "broker-alias"),
+                    &emitter,
+                )
+                .unwrap();
+        }
+        assert!(
+            matches!(rx.try_recv().unwrap(), ExecutionEvent::Report(ExecutionReport::Fill(fill))
+            if fill.client_order_id == Some(id) && fill.venue_order_id == VenueOrderId::from("venue-a"))
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn ambiguous_submit_retains_active_order_and_staged_instructions() {
+        let (mut state, emitter, mut rx) = execution_rig();
+        let id = ClientOrderId::from("client-id");
+        let advanced = serde_json::json!({"algorithm": "VWAP"});
+        state.stage_advanced_instructions(id.to_string(), advanced.clone());
+        let timeout =
+            nautilus_network::http::HttpClientError::TimeoutError("submit timed out".into());
+        state.submit_failed([id], super::super::classify(&timeout.into()), &emitter);
+        assert_eq!(state.active_orders(), vec![(id, None)]);
+        assert!(rx.try_recv().is_err());
+
+        state
+            .handle(update("new", "new", "venue-a", "client-id"), &emitter)
+            .unwrap();
+        assert_eq!(
+            state.advanced_instructions("venue-a".into()),
+            Some(&advanced)
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Accepted(_))
+        ));
+    }
+
+    #[rstest]
+    fn not_sent_closes_each_submitted_group_member() {
+        let (mut state, emitter, mut rx) = execution_rig();
+        let parent = ClientOrderId::from("client-id");
+        let child = ClientOrderId::from("child-id");
+        state.register(
+            OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument_id("SPY").unwrap())
+                .client_order_id(child)
+                .quantity(Quantity::from(1))
+                .build(),
+        );
+        state.submit_failed(
+            [parent, child],
+            CommandFailure::not_sent("task closed"),
+            &emitter,
+        );
+        for id in [parent, child] {
+            assert!(
+                matches!(rx.try_recv().unwrap(), ExecutionEvent::Order(OrderEventAny::Rejected(event))
+                if event.client_order_id == id && event.reason == "task closed")
+            );
+        }
+        assert!(state.active_orders().is_empty());
         assert!(rx.try_recv().is_err());
     }
 
