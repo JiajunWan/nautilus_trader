@@ -92,8 +92,8 @@ use crate::{
             MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_depth_topic,
             get_book_snapshots_topic, get_custom_topic, get_funding_rate_topic,
             get_index_price_topic, get_instrument_close_topic, get_instrument_status_topic,
-            get_instrument_topic, get_mark_price_topic, get_option_chain_topic,
-            get_option_greeks_topic, get_quotes_topic, get_trades_topic,
+            get_instrument_topic, get_mark_price_topic, get_option_greeks_topic, get_quotes_topic,
+            get_trades_topic,
         },
     },
     nautilus_actor,
@@ -1131,8 +1131,8 @@ fn test_data_actor_cache_api_returns_owned_market_data_point_reads(
     let trade_count = cache_api.trade_count(&instrument_id);
     let bar_count = cache_api.bar_count(&bar_type);
     let has_order_book = cache_api.has_order_book(&instrument_id);
-    let has_quote_ticks = cache_api.has_quote_ticks(&instrument_id);
-    let has_trade_ticks = cache_api.has_trade_ticks(&instrument_id);
+    let has_quotes = cache_api.has_quotes(&instrument_id);
+    let has_trades = cache_api.has_trades(&instrument_id);
     let has_bars = cache_api.has_bars(&bar_type);
     let cached_currency = cache_api.currency(&usd.code);
     let required_currency = cache_api.try_currency(&usd.code).unwrap();
@@ -1172,8 +1172,8 @@ fn test_data_actor_cache_api_returns_owned_market_data_point_reads(
     assert_eq!(trade_count, 1);
     assert_eq!(bar_count, 1);
     assert!(has_order_book);
-    assert!(has_quote_ticks);
-    assert!(has_trade_ticks);
+    assert!(has_quotes);
+    assert!(has_trades);
     assert!(has_bars);
     assert_eq!(cached_currency, Some(usd));
     assert_eq!(required_currency, usd);
@@ -1551,8 +1551,8 @@ fn test_data_actor_cache_api_surface_returns_owned_values(
     let _: usize = cache_api.trade_count(&instrument_id);
     let _: usize = cache_api.bar_count(&bar_type);
     let _: bool = cache_api.has_order_book(&instrument_id);
-    let _: bool = cache_api.has_quote_ticks(&instrument_id);
-    let _: bool = cache_api.has_trade_ticks(&instrument_id);
+    let _: bool = cache_api.has_quotes(&instrument_id);
+    let _: bool = cache_api.has_trades(&instrument_id);
     let _: bool = cache_api.has_bars(&bar_type);
     let _: Option<Currency> = cache_api.currency(&currency_code);
     let _: Result<Currency, crate::cache::CurrencyLookupError> =
@@ -2060,6 +2060,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
             SubscribeCommand::BookDeltas(_)
                 | SubscribeCommand::BookDepth(_)
                 | SubscribeCommand::BookSnapshots(_)
+                | SubscribeCommand::OptionChain(_)
         )
         .then(|| subscribe.command_id());
         assert_eq!(unsubscribe.correlation_id(), expected);
@@ -3190,7 +3191,7 @@ fn test_reset_releases_subscription_before_restart(
 }
 
 #[rstest]
-fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
+fn test_option_chain_duplicate_subscription_keeps_first_identity(
     clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
@@ -3232,40 +3233,26 @@ fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
     actor
         .subscribe_option_chain(
             series_id,
-            second_range.clone(),
+            second_range,
             Some(2_000),
             Some(second_client_id),
             None,
         )
         .unwrap();
 
-    assert_eq!(
-        get_message_bus()
-            .borrow()
-            .router_option_chain
-            .subscription_count(),
-        1,
-    );
+    assert_eq!(get_message_bus().borrow().option_chain_owners.len(), 1,);
 
     let commands = saver.get_messages();
-    let [
-        DataCommand::Subscribe(SubscribeCommand::OptionChain(first)),
-        DataCommand::Subscribe(SubscribeCommand::OptionChain(second)),
-    ] = commands.as_slice()
-    else {
-        panic!("expected two option chain subscribe commands, was {commands:?}");
+
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(first))] = commands.as_slice() else {
+        panic!("expected one option chain subscribe command, was {commands:?}");
     };
     assert_eq!(first.series_id, series_id);
     assert_eq!(first.strike_range, first_range);
     assert_eq!(first.snapshot_interval_ms, Some(1_000));
     assert_eq!(first.client_id, Some(first_client_id));
     assert_eq!(first.correlation_id, None);
-    assert_eq!(second.series_id, series_id);
-    assert_eq!(second.strike_range, second_range);
-    assert_eq!(second.snapshot_interval_ms, Some(2_000));
-    assert_eq!(second.client_id, Some(second_client_id));
-    assert_ne!(second.command_id, first.command_id);
-    assert_eq!(second.correlation_id, Some(first.command_id));
+    let owner_id = first.command_id;
 
     saver.clear();
     actor.unsubscribe_option_chain(series_id, Some(fallback_client_id));
@@ -3276,14 +3263,9 @@ fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
         panic!("expected one option chain unsubscribe command, was {commands:?}");
     };
     assert_eq!(command.series_id, series_id);
-    assert_eq!(command.client_id, Some(second_client_id));
-    assert_eq!(
-        get_message_bus()
-            .borrow()
-            .router_option_chain
-            .subscription_count(),
-        0,
-    );
+    assert_eq!(command.client_id, Some(first_client_id));
+    assert_eq!(command.correlation_id, Some(owner_id));
+    assert_eq!(get_message_bus().borrow().option_chain_owners.len(), 0,);
 }
 
 #[rstest]
@@ -5030,6 +5012,11 @@ fn test_subscribe_and_receive_option_chain(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
 
     let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
@@ -5055,8 +5042,15 @@ fn test_subscribe_and_receive_option_chain(
         ts_init: UnixNanos::default(),
     };
 
-    let topic = get_option_chain_topic(series_id);
-    msgbus::publish_option_chain(topic, &slice);
+    let commands = saver.get_messages();
+
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(command))] = commands.as_slice()
+    else {
+        panic!("expected one option chain subscribe");
+    };
+
+    let owner_id = command.owner_id();
+    msgbus::publish_option_chain_owner(owner_id, &slice);
 
     assert_eq!(actor.received_chain_slices.len(), 1);
     assert_eq!(actor.received_chain_slices[0].series_id, series_id);
@@ -5363,6 +5357,11 @@ fn test_unsubscribe_option_chain(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
 
     let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
@@ -5388,14 +5387,21 @@ fn test_unsubscribe_option_chain(
         ts_init: UnixNanos::default(),
     };
 
-    let topic = get_option_chain_topic(series_id);
-    msgbus::publish_option_chain(topic, &slice);
+    let commands = saver.get_messages();
+
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(command))] = commands.as_slice()
+    else {
+        panic!("expected one option chain subscribe");
+    };
+
+    let owner_id = command.owner_id();
+    msgbus::publish_option_chain_owner(owner_id, &slice);
 
     assert_eq!(actor.received_chain_slices.len(), 1);
 
     actor.unsubscribe_option_chain(series_id, None);
 
-    msgbus::publish_option_chain(topic, &slice);
+    msgbus::publish_option_chain_owner(owner_id, &slice);
 
     assert_eq!(actor.received_chain_slices.len(), 1);
 }
@@ -5848,10 +5854,10 @@ fn test_subscribe_and_receive_blocks(
     let block = Block::new(
         "0x123".to_string(),
         "0x456".to_string(),
-        1u64,
+        1_u64,
         "miner".into(),
-        1000000u64,
-        500000u64,
+        1000000_u64,
+        500000_u64,
         UnixNanos::from(1),
         Some(blockchain),
     );
@@ -5879,10 +5885,10 @@ fn test_unsubscribe_blocks(
     let block1 = Block::new(
         "0x123".to_string(),
         "0x456".to_string(),
-        1u64,
+        1_u64,
         "miner".into(),
-        1000000u64,
-        500000u64,
+        1000000_u64,
+        500000_u64,
         UnixNanos::from(1),
         Some(blockchain),
     );
@@ -5894,10 +5900,10 @@ fn test_unsubscribe_blocks(
     let block2 = Block::new(
         "0x789".to_string(),
         "0xabc".to_string(),
-        2u64,
+        2_u64,
         "miner2".into(),
-        1000001u64,
-        500001u64,
+        1000001_u64,
+        500001_u64,
         UnixNanos::from(2),
         Some(blockchain),
     );
@@ -6011,7 +6017,7 @@ fn test_subscribe_and_receive_pool_swaps(
         Arc::new(dex),
         instrument_id,
         PoolIdentifier::from_address(pool_address),
-        1000u64,
+        1000_u64,
         "0x123".to_string(),
         0,
         0,
@@ -6021,7 +6027,7 @@ fn test_subscribe_and_receive_pool_swaps(
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
         I256::from_str("400000000000000").unwrap(),
-        U160::from(59000000000000u128),
+        U160::from(59000000000000_u128),
         1000000,
         100,
     );
@@ -6073,7 +6079,7 @@ fn test_unsubscribe_pool_swaps(
         Arc::new(dex.clone()),
         instrument_id,
         PoolIdentifier::from_address(pool_address),
-        1000u64,
+        1000_u64,
         "0x123".to_string(),
         0,
         0,
@@ -6083,7 +6089,7 @@ fn test_unsubscribe_pool_swaps(
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
         I256::from_str("400000000000000").unwrap(),
-        U160::from(59000000000000u128),
+        U160::from(59000000000000_u128),
         1000000,
         100,
     );
@@ -6097,7 +6103,7 @@ fn test_unsubscribe_pool_swaps(
         Arc::new(dex),
         instrument_id,
         PoolIdentifier::from_address(pool_address),
-        2000u64,
+        2000_u64,
         "0x456".to_string(),
         0,
         0,
@@ -6107,7 +6113,7 @@ fn test_unsubscribe_pool_swaps(
         Address::from([0x12; 20]),
         I256::from_str("1000000000000000000").unwrap(),
         I256::from_str("400000000000000").unwrap(),
-        U160::from(59000000000000u128),
+        U160::from(59000000000000_u128),
         1000000,
         100,
     );
@@ -6664,7 +6670,7 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
             bus.router_index_prices.subscription_count(),
             bus.router_funding_rates.subscription_count(),
             bus.router_option_greeks.subscription_count(),
-            bus.router_option_chain.subscription_count(),
+            bus.option_chain_owners.len(),
         ]
     };
     #[cfg(feature = "defi")]
@@ -8874,10 +8880,7 @@ fn test_option_chain_zero_interval_has_no_side_effects(
         "invalid u64 for 'snapshot_interval_ms' not positive, was 0"
     );
     assert_eq!(
-        get_message_bus()
-            .borrow()
-            .router_option_chain
-            .subscription_count(),
+        get_message_bus().borrow().option_chain_owners.len(),
         usize::from(subscribed)
     );
     assert!(saver.get_messages().is_empty());
@@ -8897,12 +8900,6 @@ fn test_option_chain_zero_interval_has_no_side_effects(
         assert_eq!(command.client_id, Some(client_id));
         assert_eq!(command.venue, Some(series_id.venue));
         assert_eq!(command.params, Some(params));
-        assert_eq!(
-            get_message_bus()
-                .borrow()
-                .router_option_chain
-                .subscription_count(),
-            0
-        );
+        assert_eq!(get_message_bus().borrow().option_chain_owners.len(), 0);
     }
 }

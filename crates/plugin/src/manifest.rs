@@ -202,6 +202,7 @@ fn validate_build_id(build_id: &PluginBuildId, errors: &mut PluginManifestValida
     validate_optional_str("build_id.rustc_version", build_id.rustc_version, errors);
     validate_optional_str("build_id.target_triple", build_id.target_triple, errors);
     validate_optional_str("build_id.build_profile", build_id.build_profile, errors);
+
     if let Some(precision_mode) =
         validate_required_str("build_id.precision_mode", build_id.precision_mode, errors)
     {
@@ -368,7 +369,7 @@ mod tests {
 
     #[rstest]
     fn validate_rejects_invalid_utf8() {
-        static INVALID_UTF8: [u8; 1] = [0xFF];
+        static INVALID_UTF8: [u8; 1] = [0xff];
         let mut plugin_name = BorrowedStr::empty();
         plugin_name.ptr = INVALID_UTF8.as_ptr();
         plugin_name.len = INVALID_UTF8.len();

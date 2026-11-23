@@ -39,15 +39,17 @@ use super::enums::{OKXWsChannel, OKXWsOperation};
 use crate::{
     common::{
         enums::{
-            OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXExecType,
-            OKXInstrumentType, OKXMarginMode, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
-            OKXPositionSide, OKXPriceType, OKXQuickMarginType, OKXSelfTradePreventionMode,
-            OKXSettlementState, OKXSide, OKXTargetCurrency, OKXTradeMode, OKXTriggerType,
+            OKXAdvanceOrderType, OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction,
+            OKXCandleConfirm, OKXExecType, OKXInstrumentType, OKXMarginMode, OKXOrderCategory,
+            OKXOrderStatus, OKXOrderType, OKXPositionSide, OKXPriceType, OKXQuickMarginType,
+            OKXSelfTradePreventionMode, OKXSettlementState, OKXSide, OKXTargetCurrency,
+            OKXTradeMode, OKXTriggerType,
         },
-        models::{OKXInstrument, OKXRpiBookLevel},
+        models::{OKXChaseParams, OKXInstrument, OKXRpiBookLevel},
         parse::{
             deserialize_empty_string_as_none, deserialize_empty_ustr_as_none,
-            deserialize_string_to_u64, deserialize_target_currency_as_none,
+            deserialize_optional_order_enum, deserialize_string_to_u64,
+            deserialize_target_currency_as_none,
         },
     },
     http::models::OKXSpreadOrder,
@@ -170,6 +172,45 @@ pub enum OKXWsMessage {
     Reconnected,
     /// WebSocket authenticated.
     Authenticated,
+}
+
+#[derive(Debug)]
+pub(crate) enum OKXWsInbound<T> {
+    Standard(T),
+    MarketData {
+        inst_id: Option<Ustr>,
+        data: OKXMarketData,
+    },
+}
+
+impl<T> OKXWsInbound<T> {
+    pub(crate) fn into_standard(self) -> Option<T> {
+        match self {
+            Self::Standard(message) => Some(message),
+            Self::MarketData { .. } => None,
+        }
+    }
+}
+
+impl<T> From<T> for OKXWsInbound<T> {
+    fn from(message: T) -> Self {
+        Self::Standard(message)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum OKXMarketData {
+    Bbo(Vec<OKXBookMsg>),
+    Trades(Vec<OKXTradeMsg>),
+}
+
+impl OKXMarketData {
+    pub(crate) fn channel(&self) -> OKXWsChannel {
+        match self {
+            Self::Bbo(_) => OKXWsChannel::BboTbt,
+            Self::Trades(_) => OKXWsChannel::Trades,
+        }
+    }
 }
 
 /// Generic WebSocket request for OKX trading commands.
@@ -314,7 +355,31 @@ impl<'de> Deserialize<'de> for OKXWsFrame {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(OKXWsFrameVisitor)
+        deserializer
+            .deserialize_map(OKXWsFrameVisitor { market_data: false })?
+            .into_standard()
+            .ok_or_else(|| D::Error::custom("expected a standard OKX frame"))
+    }
+}
+
+impl OKXWsInbound<OKXWsFrame> {
+    pub(crate) fn decode(raw: &str, market_data: bool) -> serde_json::Result<Self> {
+        if market_data {
+            // Retry when a late control key or an unexpected payload invalidates the typed decode
+            serde_json::from_str::<Self>(raw)
+                .or_else(|_| serde_json::from_str(raw).map(Self::Standard))
+        } else {
+            serde_json::from_str(raw).map(Self::Standard)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OKXWsInbound<OKXWsFrame> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(OKXWsFrameVisitor { market_data: true })
     }
 }
 
@@ -362,6 +427,7 @@ enum OKXWsFrameData {
     Value(serde_json::Value),
     Book(Vec<OKXBookMsg>),
     RpiBook(Vec<OKXRpiBookMsg>),
+    MarketData(OKXMarketData),
 }
 
 impl OKXWsFrameData {
@@ -371,14 +437,17 @@ impl OKXWsFrameData {
             Self::Book(_) | Self::RpiBook(_) => {
                 Err(E::custom("invalid data: book levels in a non-book frame"))
             }
+            Self::MarketData(_) => Err(E::custom("invalid data: expected generic payload")),
         }
     }
 }
 
-struct OKXWsFrameVisitor;
+struct OKXWsFrameVisitor {
+    market_data: bool,
+}
 
 impl<'de> Visitor<'de> for OKXWsFrameVisitor {
-    type Value = OKXWsFrame;
+    type Value = OKXWsInbound<OKXWsFrame>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("JSON object for OKXWsFrame")
@@ -400,7 +469,7 @@ impl<'de> Visitor<'de> for OKXWsFrameVisitor {
                     &mut fields.arg
                 }
                 OKXWsFrameKey::Data => {
-                    fields.data = Some(fields.next_data(&mut map)?);
+                    fields.data = Some(fields.next_data(&mut map, self.market_data)?);
                     continue;
                 }
                 OKXWsFrameKey::Code => &mut fields.code,
@@ -426,20 +495,28 @@ impl OKXWsFrameFields {
     fn next_data<'de, A: MapAccess<'de>>(
         &mut self,
         map: &mut A,
+        market_data: bool,
     ) -> Result<OKXWsFrameData, A::Error> {
         let invalid_data = |e: A::Error| A::Error::custom(format!("invalid data: {e}"));
 
         if self.event.is_none()
             && self.op.is_none()
-            && self.action.is_some()
+            && (self.action.is_some() || market_data)
             && let Some(raw) = self.arg.as_deref()
         {
             let arg: OKXWebSocketArg = parse_raw(raw, "arg")?;
-
-            let data = if arg.channel == OKXWsChannel::BooksRpi {
-                OKXWsFrameData::RpiBook(map.next_value().map_err(invalid_data)?)
-            } else {
-                OKXWsFrameData::Book(map.next_value().map_err(invalid_data)?)
+            let data = match (self.action.is_some(), &arg.channel) {
+                (true, OKXWsChannel::BooksRpi) => {
+                    OKXWsFrameData::RpiBook(map.next_value().map_err(invalid_data)?)
+                }
+                (true, _) => OKXWsFrameData::Book(map.next_value().map_err(invalid_data)?),
+                (false, OKXWsChannel::BboTbt) => OKXWsFrameData::MarketData(OKXMarketData::Bbo(
+                    map.next_value().map_err(invalid_data)?,
+                )),
+                (false, OKXWsChannel::Trades) => OKXWsFrameData::MarketData(OKXMarketData::Trades(
+                    map.next_value().map_err(invalid_data)?,
+                )),
+                (false, _) => OKXWsFrameData::Value(map.next_value()?),
             };
 
             self.arg_decoded = Some(arg);
@@ -456,17 +533,19 @@ impl OKXWsFrameFields {
         }
     }
 
-    fn into_frame<E: serde::de::Error>(self) -> Result<OKXWsFrame, E> {
+    fn into_frame<E: serde::de::Error>(self) -> Result<OKXWsInbound<OKXWsFrame>, E> {
         // Check discriminant fields in priority order
 
         // 1. "event" field - Login, Subscription, ChannelConnCount, or Error
         if let Some(event) = self.event.as_deref().and_then(raw_as_string) {
             match event.as_str() {
-                "login" => return parse_login(self),
-                "subscribe" | "unsubscribe" => return parse_subscription(self),
-                "error" => return parse_error(self),
+                "login" => return parse_login(self).map(OKXWsInbound::Standard),
+                "subscribe" | "unsubscribe" => {
+                    return parse_subscription(self).map(OKXWsInbound::Standard);
+                }
+                "error" => return parse_error(self).map(OKXWsInbound::Standard),
                 _ if self.channel.is_some() && self.conn_count.is_some() => {
-                    return parse_channel_conn_count(self);
+                    return parse_channel_conn_count(self).map(OKXWsInbound::Standard);
                 }
                 _ => {}
             }
@@ -474,12 +553,12 @@ impl OKXWsFrameFields {
 
         // 2. "op" field - OrderResponse
         if self.op.is_some() {
-            return parse_order_response(self);
+            return parse_order_response(self).map(OKXWsInbound::Standard);
         }
 
         // 3. "action" + "arg" - BookData
         if self.action.is_some() && self.arg.is_some() {
-            return parse_book_data(self);
+            return parse_book_data(self).map(OKXWsInbound::Standard);
         }
 
         // 4. "arg" + "data" without "action" - Data
@@ -489,7 +568,7 @@ impl OKXWsFrameFields {
 
         // 5. Fallback to Error if it has "code" and "msg"
         if self.code.is_some() && self.msg.is_some() {
-            return parse_error(self);
+            return parse_error(self).map(OKXWsInbound::Standard);
         }
 
         Err(E::custom("cannot determine OKXWsFrame variant"))
@@ -606,14 +685,23 @@ fn parse_book_data<E: serde::de::Error>(mut fields: OKXWsFrameFields) -> Result<
     Ok(OKXWsFrame::BookData { arg, action, data })
 }
 
-fn parse_data<E: serde::de::Error>(mut fields: OKXWsFrameFields) -> Result<OKXWsFrame, E> {
+fn parse_data<E: serde::de::Error>(
+    mut fields: OKXWsFrameFields,
+) -> Result<OKXWsInbound<OKXWsFrame>, E> {
     let arg = fields.take_arg()?;
-    let data = fields
-        .data
-        .ok_or_else(|| E::missing_field("data"))?
-        .into_value()?;
-
-    Ok(OKXWsFrame::Data { arg, data })
+    match fields.data.ok_or_else(|| E::missing_field("data"))? {
+        OKXWsFrameData::MarketData(data) if arg.channel == data.channel() => {
+            Ok(OKXWsInbound::MarketData {
+                inst_id: arg.inst_id,
+                data,
+            })
+        }
+        data => Ok(OKXWsFrame::Data {
+            arg,
+            data: data.into_value()?,
+        }
+        .into()),
+    }
 }
 
 fn parse_error<E: serde::de::Error>(mut fields: OKXWsFrameFields) -> Result<OKXWsFrame, E> {
@@ -1358,9 +1446,15 @@ pub struct OKXAlgoOrderMsg {
     /// Fee currency.
     #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
     pub fee_ccy: Option<Ustr>,
-    /// Trigger order type (fok, ioc).
-    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
-    pub advance_ord_type: Option<String>,
+    /// Execution type selected by the trigger.
+    #[serde(default, deserialize_with = "deserialize_optional_order_enum")]
+    pub advance_ord_type: Option<OKXAdvanceOrderType>,
+    /// Chase parameters for a trigger that spawns a chase order.
+    #[serde(default)]
+    pub adv_chase_params: Vec<OKXChaseParams>,
+    /// Spawned algo order IDs, including the chase algo ID after a chase trigger fires.
+    #[serde(default)]
+    pub sub_algo_id_list: Vec<String>,
 }
 
 /// Parameters for WebSocket place order operation.
@@ -2259,7 +2353,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2280,7 +2374,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Market)
@@ -2299,7 +2393,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Market)
@@ -2318,7 +2412,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(20459u64)
+            .inst_id_code(20459_u64)
             .td_mode(OKXTradeMode::Cash)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2340,7 +2434,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(20459u64)
+            .inst_id_code(20459_u64)
             .td_mode(OKXTradeMode::Cash)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2360,7 +2454,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode, OKXTriggerType};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2401,7 +2495,7 @@ mod tests {
         use super::WsCancelOrderParamsBuilder;
 
         let params = WsCancelOrderParamsBuilder::default()
-            .inst_id_code(10461u64)
+            .inst_id_code(10461_u64)
             .ord_id("12345678".to_string())
             .build()
             .unwrap();
@@ -2418,7 +2512,7 @@ mod tests {
         use super::WsAmendOrderParamsBuilder;
 
         let params = WsAmendOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .cl_ord_id("client123".to_string())
             .new_px("51000".to_string())
             .build()
@@ -2437,7 +2531,7 @@ mod tests {
         use crate::common::enums::{OKXAlgoOrderType, OKXSide, OKXTradeMode, OKXTriggerType};
 
         let params = WsPostAlgoOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXAlgoOrderType::Trigger)
@@ -2474,7 +2568,7 @@ mod tests {
         use super::WsCancelAlgoOrderParamsBuilder;
 
         let by_cl_ord_id = WsCancelAlgoOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .algo_cl_ord_id("Odstalgocancel0000001".to_string())
             .build()
             .unwrap();
@@ -2483,7 +2577,7 @@ mod tests {
         assert!(json.get("algoId").is_none());
 
         let by_algo_id = WsCancelAlgoOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .algo_id("987654321".to_string())
             .build()
             .unwrap();
@@ -2498,7 +2592,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2519,7 +2613,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cross)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2539,7 +2633,7 @@ mod tests {
         use super::WsAmendOrderParamsBuilder;
 
         let params = WsAmendOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .cl_ord_id("client123".to_string())
             .new_px_usd("105.0".to_string())
             .build()
@@ -2556,7 +2650,7 @@ mod tests {
         use super::WsAmendOrderParamsBuilder;
 
         let params = WsAmendOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .cl_ord_id("client123".to_string())
             .new_px_vol("0.60".to_string())
             .build()
@@ -2583,7 +2677,7 @@ mod tests {
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
 
         let params = WsPostOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .td_mode(OKXTradeMode::Cash)
             .side(OKXSide::Buy)
             .ord_type(OKXOrderType::Limit)
@@ -2604,7 +2698,7 @@ mod tests {
         use super::WsAmendOrderParamsBuilder;
 
         let params = WsAmendOrderParamsBuilder::default()
-            .inst_id_code(10459u64)
+            .inst_id_code(10459_u64)
             .cl_ord_id("event-1".to_string())
             .new_px("0.43".to_string())
             .build()

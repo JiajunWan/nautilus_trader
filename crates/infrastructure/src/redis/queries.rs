@@ -29,7 +29,7 @@ use nautilus_model::{
     accounts::AccountAny,
     data::{CustomData, DataType, HasTsInit, InstrumentClose},
     enums::CurrencyType,
-    events::{AccountState, OrderEventAny, OrderFilled, PositionSnapshot},
+    events::{AccountState, OrderFilled, PositionSnapshot},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::{Order, OrderAny},
@@ -50,6 +50,7 @@ use ustr::Ustr;
 use super::get_index_key;
 #[cfg(feature = "defi")]
 use crate::defi::{contract_conflict, integrity_error, redis_read_error, validate_marker};
+use crate::order_replay::transform_order;
 
 /// Persisted representation of a [`Currency`].
 ///
@@ -139,6 +140,7 @@ const ACCOUNTS: &str = "accounts";
 const ORDERS: &str = "orders";
 const POSITIONS: &str = "positions";
 const SNAPSHOTS: &str = "snapshots";
+pub(super) const POSITION_SNAPSHOTS_PREFIX: &str = "snapshots:positions:";
 const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
 const CUSTOM: &str = "custom";
@@ -156,6 +158,7 @@ const INDEX_ORDERS_INFLIGHT: &str = "index:orders_inflight";
 const INDEX_POSITIONS: &str = "index:positions";
 const INDEX_POSITIONS_OPEN: &str = "index:positions_open";
 const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
+pub(super) const INDEX_POSITIONS_REPLAY_SOURCE: &str = "index:positions_replay_source";
 
 #[derive(Debug)]
 pub struct DatabaseQueries;
@@ -543,6 +546,7 @@ impl DatabaseQueries {
             if previous.base_currency() != incoming.base_currency()
                 || previous.quote_currency() != incoming.quote_currency()
                 || previous.settlement_currency() != incoming.settlement_currency()
+                || previous.strike_currency() != incoming.strike_currency()
             {
                 return Err(integrity_error(
                     "Cannot change a persisted token instrument's currency identities",
@@ -705,7 +709,7 @@ impl DatabaseQueries {
         pattern: String,
     ) -> anyhow::Result<Vec<String>> {
         let mut result = Vec::new();
-        let mut cursor = 0u64;
+        let mut cursor = 0_u64;
 
         loop {
             let scan_result: (u64, Vec<String>) = redis::cmd("SCAN")
@@ -1128,7 +1132,8 @@ impl DatabaseQueries {
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
         let mut synthetics = AHashMap::new();
-        let pattern = format!("{trader_key}{REDIS_DELIMITER}{SYNTHETICS}*");
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{SYNTHETICS}{REDIS_DELIMITER}");
+        let pattern = format!("{prefix}*");
         log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
@@ -1138,24 +1143,14 @@ impl DatabaseQueries {
             .iter()
             .map(|key| {
                 let con = con.clone();
+                let prefix = &prefix;
                 async move {
-                    let instrument_id = key
-                        .as_str()
-                        .rsplit(':')
-                        .next()
-                        .ok_or_else(|| {
-                            log::error!("Invalid key format: {key}");
-                            "Invalid key format"
-                        })
-                        .and_then(|code| {
-                            InstrumentId::from_str(code).map_err(|e| {
-                                log::error!("Failed to parse InstrumentId for {key}: {e}");
-                                "Invalid instrument ID"
-                            })
-                        });
-
-                    let Ok(instrument_id) = instrument_id else {
-                        return None;
+                    let instrument_id = match parse_instrument_key(key, prefix) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::error!("Failed to parse InstrumentId from Redis key: {e}");
+                            return None;
+                        }
                     };
 
                     match Self::load_synthetic(&con, trader_key, &instrument_id, encoding).await {
@@ -1185,18 +1180,14 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading account data fails.
-    /// Loads all accounts for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading account data fails.
     pub async fn load_accounts(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
         let mut accounts = AHashMap::new();
-        let pattern = format!("{trader_key}{REDIS_DELIMITER}{ACCOUNTS}*");
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{ACCOUNTS}{REDIS_DELIMITER}");
+        let pattern = format!("{prefix}*");
         log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
@@ -1206,12 +1197,14 @@ impl DatabaseQueries {
             .iter()
             .map(|key| {
                 let con = con.clone();
+                let prefix = &prefix;
                 async move {
-                    let account_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        AccountId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
+                    let account_id = match parse_account_key(key, prefix) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::error!("Failed to parse AccountId from Redis key: {e}");
+                            return None;
+                        }
                     };
 
                     match Self::load_account(&con, trader_key, &account_id, encoding).await {
@@ -1241,18 +1234,14 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading order data fails.
-    /// Loads all orders for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading order data fails.
     pub async fn load_orders(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
         let mut orders = AHashMap::new();
-        let pattern = format!("{trader_key}{REDIS_DELIMITER}{ORDERS}*");
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{ORDERS}{REDIS_DELIMITER}");
+        let pattern = format!("{prefix}*");
         log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
@@ -1262,12 +1251,14 @@ impl DatabaseQueries {
             .iter()
             .map(|key| {
                 let con = con.clone();
+                let prefix = &prefix;
                 async move {
-                    let client_order_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        ClientOrderId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
+                    let client_order_id = match parse_order_key(key, prefix) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::error!("Failed to parse ClientOrderId from Redis key: {e}");
+                            return None;
+                        }
                     };
 
                     match Self::load_order(&con, trader_key, &client_order_id, encoding).await {
@@ -1297,18 +1288,14 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if scanning keys or reading position data fails.
-    /// Loads all positions for `trader_key` using the specified `encoding`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if scanning keys or reading position data fails.
     pub async fn load_positions(
         con: &ConnectionManager,
         trader_key: &str,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<PositionId, Position>> {
         let mut positions = AHashMap::new();
-        let pattern = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}*");
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}");
+        let pattern = format!("{prefix}*");
         log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
@@ -1318,12 +1305,14 @@ impl DatabaseQueries {
             .iter()
             .map(|key| {
                 let con = con.clone();
+                let prefix = &prefix;
                 async move {
-                    let position_id = if let Some(code) = key.as_str().rsplit(':').next() {
-                        PositionId::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
+                    let position_id = match parse_position_key(key, prefix) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::error!("Failed to parse PositionId from Redis key: {e}");
+                            return None;
+                        }
                     };
 
                     match Self::load_position(&con, trader_key, &position_id, encoding).await {
@@ -1643,7 +1632,7 @@ impl DatabaseQueries {
             let legacy_init = value.get("type").and_then(Value::as_str) == Some("OrderInitialized");
             let event = deserialize_payload_value(value)?;
             if legacy_init {
-                order = transform_order(&order, event)?;
+                order = transform_order(&order, event, order.ts_init())?;
             } else {
                 order.apply(event)?;
             }
@@ -1663,32 +1652,80 @@ impl DatabaseQueries {
         position_id: &PositionId,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<Option<Position>> {
+        let key = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}");
         let snapshot_key =
-            format!("{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let snapshots = Self::read(con, trader_key, &snapshot_key).await?;
-        for payload in snapshots.iter().rev() {
-            let snapshot: PositionSnapshot = Self::deserialize_payload(encoding, payload)?;
-            if let Some(replay_state) = snapshot.replay_state {
-                let position: Position = serde_json::from_value(replay_state)
-                    .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
-                position.check_accounting()?;
+            format!("{trader_key}{REDIS_DELIMITER}{POSITION_SNAPSHOTS_PREFIX}{position_id}");
+        let source_key = format!("{trader_key}{REDIS_DELIMITER}{INDEX_POSITIONS_REPLAY_SOURCE}");
+        let mut con = con.clone();
+        let member = position_id.to_string();
+        let uses_snapshot: Option<bool> = con.hget(&source_key, &member).await?;
+        let read_snapshots = uses_snapshot != Some(false);
+        let records_key = if read_snapshots { &snapshot_key } else { &key };
+
+        let mut source = redis::pipe();
+        source.atomic().hget(source_key, member);
+        let (uses_snapshot, payloads): (Option<bool>, Vec<Bytes>) = source
+            .clone()
+            .lrange(records_key, 0, -1)
+            .query_async(&mut con)
+            .await?;
+
+        let fills = 'selected: {
+            if !read_snapshots && uses_snapshot == Some(false) {
+                break 'selected payloads;
+            }
+
+            if read_snapshots && uses_snapshot != Some(false) {
+                if let Some(position) = Self::decode_position_replay(encoding, &payloads)? {
+                    return Ok(Some(position));
+                }
+
+                // A new replay snapshot records its source in the same write
+                let (uses_snapshot, fills): (Option<bool>, Vec<Bytes>) = source
+                    .clone()
+                    .lrange(&key, 0, -1)
+                    .query_async(&mut con)
+                    .await?;
+
+                if uses_snapshot != Some(true) {
+                    break 'selected fills;
+                }
+            }
+
+            // A source change can invalidate the selected list
+            let (uses_snapshot, snapshots, fills): (Option<bool>, Vec<Bytes>, Vec<Bytes>) = source
+                .lrange(snapshot_key, 0, -1)
+                .lrange(key, 0, -1)
+                .query_async(&mut con)
+                .await?;
+
+            if uses_snapshot != Some(false)
+                && let Some(position) = Self::decode_position_replay(encoding, &snapshots)?
+            {
                 return Ok(Some(position));
             }
-        }
 
-        let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let result = Self::read(con, trader_key, &key).await?;
-        if result.is_empty() {
-            return Ok(None);
-        }
+            fills
+        };
 
-        let fills: Vec<OrderFilled> = result
+        Self::replay_position_fills(&con, trader_key, position_id, encoding, &fills).await
+    }
+
+    async fn replay_position_fills(
+        con: &ConnectionManager,
+        trader_key: &str,
+        position_id: &PositionId,
+        encoding: SerializationEncoding,
+        fills: &[Bytes],
+    ) -> anyhow::Result<Option<Position>> {
+        let fills: Vec<OrderFilled> = fills
             .iter()
             .map(|payload| Self::deserialize_payload(encoding, payload))
             .collect::<anyhow::Result<_>>()?;
         let Some((first_fill, remaining_fills)) = fills.split_first() else {
             return Ok(None);
         };
+
         let Some(instrument) =
             Self::load_instrument(con, trader_key, &first_fill.instrument_id, encoding).await?
         else {
@@ -1714,6 +1751,23 @@ impl DatabaseQueries {
         Ok(Some(position))
     }
 
+    fn decode_position_replay(
+        encoding: SerializationEncoding,
+        snapshots: &[Bytes],
+    ) -> anyhow::Result<Option<Position>> {
+        for payload in snapshots.iter().rev() {
+            let snapshot: PositionSnapshot = Self::deserialize_payload(encoding, payload)?;
+            if let Some(replay_state) = snapshot.replay_state {
+                let position: Position = serde_json::from_value(replay_state)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
+                position.check_accounting()?;
+                return Ok(Some(position));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn get_collection_key(key: &str) -> anyhow::Result<&str> {
         key.split_once(REDIS_DELIMITER)
             .map(|(collection, _)| collection)
@@ -1734,7 +1788,9 @@ impl DatabaseQueries {
             | INDEX_POSITIONS
             | INDEX_POSITIONS_OPEN
             | INDEX_POSITIONS_CLOSED => Self::read_set(conn, key).await,
-            INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => Self::read_hset(conn, key).await,
+            INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT | INDEX_POSITIONS_REPLAY_SOURCE => {
+                Self::read_hset(conn, key).await
+            }
             _ => anyhow::bail!("Index unknown '{index_key}' on read"),
         }
     }
@@ -1764,45 +1820,6 @@ impl DatabaseQueries {
         let result: Vec<Bytes> = conn.lrange(key, 0, -1).await?;
         Ok(result)
     }
-}
-
-fn transform_order(order: &OrderAny, event: OrderEventAny) -> anyhow::Result<OrderAny> {
-    let history = order.events();
-    anyhow::ensure!(
-        !history.contains(&&event),
-        "Duplicate initialization in legacy order history"
-    );
-    let mut transformed = OrderAny::from_events(vec![event])?;
-    anyhow::ensure!(
-        (
-            transformed.trader_id(),
-            transformed.strategy_id(),
-            transformed.instrument_id(),
-            transformed.client_order_id()
-        ) == (
-            order.trader_id(),
-            order.strategy_id(),
-            order.instrument_id(),
-            order.client_order_id()
-        ),
-        "Legacy order transformation changes the order identity"
-    );
-    let history = history.into_iter().cloned();
-
-    match &mut transformed {
-        OrderAny::Market(target) => {
-            target.ts_init = order.ts_init();
-            target.prepend_events(history);
-        }
-        OrderAny::Limit(target) => {
-            target.ts_init = order.ts_init();
-            target.liquidity_side = order.liquidity_side();
-            target.prepend_events(history);
-        }
-        _ => anyhow::bail!("Legacy order transformation must produce a market or limit order"),
-    }
-
-    Ok(transformed)
 }
 
 fn deserialize_payload_value<T: DeserializeOwned>(mut value: Value) -> anyhow::Result<T> {
@@ -1936,6 +1953,33 @@ fn parse_instrument_key(key: &str, prefix: &str) -> anyhow::Result<InstrumentId>
         .map_err(|e| anyhow::anyhow!("Failed to parse instrument ID from key '{key}': {e}"))
 }
 
+fn parse_account_key(key: &str, prefix: &str) -> anyhow::Result<AccountId> {
+    let value = key
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid account key '{key}'"))?;
+    AccountId::new_checked(value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse account ID from key '{key}': {e}"))
+}
+
+fn parse_order_key(key: &str, prefix: &str) -> anyhow::Result<ClientOrderId> {
+    let value = key
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid order key '{key}'"))?;
+    ClientOrderId::new_checked(value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse client order ID from key '{key}': {e}"))
+}
+
+fn parse_position_key(key: &str, prefix: &str) -> anyhow::Result<PositionId> {
+    let value = key
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid position key '{key}'"))?;
+    PositionId::new_checked(value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse position ID from key '{key}': {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{hint::black_box, str::FromStr, time::Instant};
@@ -1950,7 +1994,7 @@ mod tests {
             AccountState, OrderEventAny, OrderInitialized,
             order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
         },
-        identifiers::{AccountId, InstrumentId, PositionId, TradeId},
+        identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId},
         instruments::{Instrument, InstrumentAny, stubs::currency_pair_btcusdt},
         orders::{Order, OrderError},
         position::Position,
@@ -1960,7 +2004,10 @@ mod tests {
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use ustr::Ustr;
 
-    use super::{CurrencyDecode, CurrencyRecord, DatabaseQueries, parse_instrument_key};
+    use super::{
+        CurrencyDecode, CurrencyRecord, DatabaseQueries, parse_account_key, parse_instrument_key,
+        parse_order_key, parse_position_key,
+    };
 
     #[rstest]
     #[case(SerializationEncoding::Json)]
@@ -2629,5 +2676,53 @@ mod tests {
         let result = parse_instrument_key(&key, prefix).unwrap();
 
         assert_eq!(result, InstrumentId::from_str(value).unwrap());
+    }
+
+    #[rstest]
+    #[case("xyz:ABC-USDC-PERP.SIM-FIXTURE-001")]
+    #[case("SIM-BTC-USDT-001")]
+    #[case("Arbitrum:UniswapV3:0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443-STRAT1")]
+    fn test_parse_position_key_preserves_colons(#[case] value: &str) {
+        let prefix = "TRADER-001:positions:";
+        let key = format!("{prefix}{value}");
+
+        let result = parse_position_key(&key, prefix).unwrap();
+
+        assert_eq!(result, PositionId::new(value));
+    }
+
+    #[rstest]
+    #[case("ORD:2026-11-19:0001")]
+    #[case("O-12345")]
+    fn test_parse_order_key_preserves_colons(#[case] value: &str) {
+        let prefix = "TRADER-001:orders:";
+        let key = format!("{prefix}{value}");
+
+        let result = parse_order_key(&key, prefix).unwrap();
+
+        assert_eq!(result, ClientOrderId::new(value));
+    }
+
+    #[rstest]
+    #[case("SIM:SUB-001-ACCOUNT")]
+    #[case("SIM-001")]
+    fn test_parse_account_key_preserves_colons(#[case] value: &str) {
+        let prefix = "TRADER-001:accounts:";
+        let key = format!("{prefix}{value}");
+
+        let result = parse_account_key(&key, prefix).unwrap();
+
+        assert_eq!(result, AccountId::new(value));
+    }
+
+    #[rstest]
+    fn test_parse_key_helpers_reject_invalid_prefix_or_empty_id() {
+        assert!(parse_position_key("OTHER:positions:POS-1", "TRADER-001:positions:").is_err());
+        assert!(parse_position_key("TRADER-001:positions:", "TRADER-001:positions:").is_err());
+        assert!(parse_order_key("TRADER-001:orders:", "TRADER-001:orders:").is_err());
+        assert!(parse_account_key("TRADER-001:accounts:", "TRADER-001:accounts:").is_err());
+        assert!(
+            parse_instrument_key("TRADER-001:instruments:", "TRADER-001:instruments:").is_err()
+        );
     }
 }

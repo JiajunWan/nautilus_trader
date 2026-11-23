@@ -1576,6 +1576,7 @@ fn reemit_terminal_cancel(
 
     if let Some(cancel_ts) = cancel_ts {
         log::debug!("Re-emitting cancel for {venue_order_id} after fill to restore terminal state");
+
         match ctx.order_contexts.get(&venue_order_id) {
             Some(context) => {
                 if state
@@ -2121,7 +2122,7 @@ mod tests {
     fn test_instrument() -> InstrumentAny {
         let market: GammaMarket = load("gamma_market.json");
         let defs = parse_gamma_market(&market).unwrap();
-        create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap()
+        create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000_u64)).unwrap()
     }
 
     fn bind_instrument(
@@ -2815,8 +2816,8 @@ mod tests {
     fn test_build_ws_order_status_report() {
         let order: PolymarketUserOrder = load("ws_user_order_placement.json");
         let instrument = test_instrument();
-        let ts_event = UnixNanos::from(1_000_000_000u64);
-        let ts_init = UnixNanos::from(2_000_000_000u64);
+        let ts_event = UnixNanos::from(1_000_000_000_u64);
+        let ts_init = UnixNanos::from(2_000_000_000_u64);
 
         let report = build_ws_order_status_report(
             &order,
@@ -2845,8 +2846,8 @@ mod tests {
     fn test_build_ws_order_status_report_venue_cancel_maps_to_canceled() {
         let order: PolymarketUserOrder = load("ws_user_order_venue_cancel.json");
         let instrument = test_instrument();
-        let ts_event = UnixNanos::from(1_000_000_000u64);
-        let ts_init = UnixNanos::from(2_000_000_000u64);
+        let ts_event = UnixNanos::from(1_000_000_000_u64);
+        let ts_init = UnixNanos::from(2_000_000_000_u64);
 
         let report = build_ws_order_status_report(
             &order,
@@ -2884,14 +2885,14 @@ mod tests {
             &instrument,
             AccountId::from("POLY-001"),
             UnixNanos::from(ts_event),
-            UnixNanos::from(2_000_000_000u64),
+            UnixNanos::from(2_000_000_000_u64),
         )
         .unwrap();
 
         assert_eq!(report.order_status, expected);
         assert_eq!(
             report.expire_time,
-            Some(UnixNanos::from(1_000_000_000_000u64))
+            Some(UnixNanos::from(1_000_000_000_000_u64))
         );
     }
 
@@ -2914,8 +2915,8 @@ mod tests {
             order.order_type.unwrap(),
             &instrument,
             AccountId::from("POLY-001"),
-            UnixNanos::from(999_000_000_000u64),
-            UnixNanos::from(2_000_000_000u64),
+            UnixNanos::from(999_000_000_000_u64),
+            UnixNanos::from(2_000_000_000_u64),
         )
         .unwrap();
 
@@ -2934,8 +2935,8 @@ mod tests {
             PolymarketOrderType::GTD,
             &instrument,
             AccountId::from("POLY-001"),
-            UnixNanos::from(1_000_000_000_000u64),
-            UnixNanos::from(2_000_000_000u64),
+            UnixNanos::from(1_000_000_000_000_u64),
+            UnixNanos::from(2_000_000_000_u64),
         )
         .unwrap();
         let venue_order_id = report.venue_order_id;
@@ -3072,8 +3073,8 @@ mod tests {
             order.order_type.unwrap(),
             &instrument,
             AccountId::from("POLY-001"),
-            UnixNanos::from(1_000_000_000u64),
-            UnixNanos::from(2_000_000_000u64),
+            UnixNanos::from(1_000_000_000_u64),
+            UnixNanos::from(2_000_000_000_u64),
         )
         .unwrap();
 
@@ -3248,7 +3249,7 @@ mod tests {
         assert_eq!(leg.last_qty.as_decimal(), dec!(25));
         assert_eq!(leg.last_px.as_decimal(), dec!(0.5));
         // The venue match time, not the message timestamp or the local clock
-        assert_eq!(leg.ts_event, UnixNanos::from(1_704_067_200_000_000_000u64));
+        assert_eq!(leg.ts_event, UnixNanos::from(1_704_067_200_000_000_000_u64));
     }
 
     fn admission_context_for(
@@ -4007,7 +4008,7 @@ mod tests {
         let mut invalid_instrument = valid_instrument.clone();
         set_taker_fee_rate(
             &mut invalid_instrument,
-            Decimal::from_i128_with_scale(100_000_000_000_000_000_000_000_000i128, 0),
+            Decimal::from_i128_with_scale(100_000_000_000_000_000_000_000_000_i128, 0),
         );
 
         let token_instruments = AtomicMap::new();
@@ -4120,7 +4121,7 @@ mod tests {
         assert_eq!(filled.commission, Some(Money::from("0.12240 pUSD")));
         assert_eq!(
             filled.ts_event,
-            UnixNanos::from(1_704_067_200_000_000_000u64)
+            UnixNanos::from(1_704_067_200_000_000_000_u64)
         );
         assert_eq!(
             fill_tracker.get_cumulative_filled(&venue_order_id),
@@ -5508,7 +5509,7 @@ mod tests {
         let market: GammaMarket = load("gamma_market_sports_market_money_line.json");
         let defs = parse_gamma_market(&market).unwrap();
         let instrument = bind_instrument(
-            create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap(),
+            create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000_u64)).unwrap(),
             trade.market.as_str(),
             trade.outcome,
         );
@@ -5770,7 +5771,7 @@ mod tests {
 
         let clock = Box::leak(Box::new(AtomicTime::new(
             false,
-            UnixNanos::from(2_000_000_000u64),
+            UnixNanos::from(2_000_000_000_u64),
         )));
 
         let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
@@ -5805,9 +5806,9 @@ mod tests {
             ExecutionEvent::Order(OrderEventAny::Updated(updated)) => {
                 assert_eq!(
                     updated.ts_event,
-                    UnixNanos::from(1_703_875_201_000_000_000u64)
+                    UnixNanos::from(1_703_875_201_000_000_000_u64)
                 );
-                assert_eq!(updated.ts_init, UnixNanos::from(2_000_000_000u64));
+                assert_eq!(updated.ts_init, UnixNanos::from(2_000_000_000_u64));
                 assert_eq!(updated.quantity, Quantity::new(99.995, 6));
                 assert!(updated.reconciliation);
             }

@@ -524,7 +524,6 @@ impl UnixNanos {
     pub fn to_rfc3339(&self) -> String {
         let datetime = self.to_datetime_utc();
         let display = datetime.display_with_offset(Offset::UTC);
-
         match datetime.subsec_nanosecond() {
             0 => format!("{display:.0}"),
             nanos if nanos % 1_000_000 == 0 => format!("{display:.3}"),
@@ -668,7 +667,6 @@ fn f64_seconds_to_nanos(value: f64) -> Result<u64, String> {
     // We perform the multiplication in `f64`, then validate the
     // result fits inside `u64` *before* rounding / casting.
     let nanos_f64 = value * 1_000_000_000.0;
-
     if nanos_f64 >= U64_UPPER_BOUND_F64 {
         return Err(format!("Unix timestamp {value} seconds is out of range"));
     }
@@ -1113,6 +1111,7 @@ fn parse_ascii_digits(bytes: &[u8]) -> Option<u64> {
         if word & HIGH_BITS != 0 || lower & upper & HIGH_BITS != HIGH_BITS {
             return None;
         }
+
         let digits = word ^ 0x3030_3030_3030_3030;
         let pairs = (digits & DIGIT_MASK) * 10 + ((digits >> 8) & DIGIT_MASK);
         let quads = (pairs & PAIR_MASK) * 100 + ((pairs >> 16) & PAIR_MASK);
@@ -1124,8 +1123,10 @@ fn parse_ascii_digits(bytes: &[u8]) -> Option<u64> {
         if !digit.is_ascii_digit() {
             return None;
         }
+
         value = value * 10 + u64::from(digit - b'0');
     }
+
     Some(value)
 }
 
@@ -1578,10 +1579,10 @@ mod tests {
     #[rstest]
     fn test_u64_comparison_and_deref() {
         let nanos = UnixNanos::from(100);
-        assert_eq!(100u64, nanos);
-        assert_eq!(99u64.partial_cmp(&nanos), Some(Ordering::Less));
-        assert_eq!(nanos.partial_cmp(&Some(100u64)), Some(Ordering::Equal));
-        assert_eq!(*nanos, 100u64);
+        assert_eq!(100_u64, nanos);
+        assert_eq!(99_u64.partial_cmp(&nanos), Some(Ordering::Less));
+        assert_eq!(nanos.partial_cmp(&Some(100_u64)), Some(Ordering::Equal));
+        assert_eq!(*nanos, 100_u64);
     }
 
     #[rstest]
@@ -1992,6 +1993,7 @@ mod tests {
         let deserializer = serde::de::value::F64Deserializer::<serde::de::value::Error>::new(
             18_446_744_073.709_553,
         );
+
         let err = UnixNanos::deserialize(deserializer).unwrap_err();
         assert!(err.to_string().contains("out of range"));
     }
@@ -2039,19 +2041,19 @@ mod tests {
     fn unix_nanos_strategy() -> impl Strategy<Value = UnixNanos> {
         prop_oneof![
             // Small values
-            0u64..1_000_000u64,
+            0_u64..1_000_000_u64,
             // Medium values (microseconds range)
-            1_000_000u64..1_000_000_000_000u64,
+            1_000_000_u64..1_000_000_000_000_u64,
             // Large values (nanoseconds since 1970)
-            1_000_000_000_000u64..=i64::MAX.cast_unsigned(),
+            1_000_000_000_000_u64..=i64::MAX.cast_unsigned(),
             // Values above i64::MAX (sentinel range, GTC/infinity)
             (i64::MAX.cast_unsigned() + 1)..=u64::MAX,
             // Edge cases
-            Just(0u64),
-            Just(1u64),
-            Just(1_000_000_000u64),               // 1 second in nanos
-            Just(1_000_000_000_000u64),           // ~2001 timestamp
-            Just(1_700_000_000_000_000_000u64),   // ~2023 timestamp
+            Just(0_u64),
+            Just(1_u64),
+            Just(1_000_000_000_u64),              // 1 second in nanos
+            Just(1_000_000_000_000_u64),          // ~2001 timestamp
+            Just(1_700_000_000_000_000_000_u64),  // ~2023 timestamp
             Just((i64::MAX / 2).cast_unsigned()), // Safe for doubling
             Just(i64::MAX.cast_unsigned()),       // i64 boundary
             Just(u64::MAX),                       // Sentinel / max value

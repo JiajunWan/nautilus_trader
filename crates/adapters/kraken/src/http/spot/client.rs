@@ -2446,6 +2446,7 @@ impl KrakenSpotHttpClient {
 
             for (trade_id, trade) in &trades {
                 let resolved = self.get_instrument_by_raw_symbol(trade.pair.as_str());
+
                 if let Some(ref target_id) = instrument_id
                     && resolved.as_ref().is_none_or(|inst| inst.id() != *target_id)
                 {
@@ -3900,7 +3901,7 @@ mod tests {
     #[case::gtd_limit_with_expire(
         true,
         TimeInForce::Gtd,
-        Some(1_704_067_200_000_000_000u64),
+        Some(1_704_067_200_000_000_000_u64),
         Some("GTD"),
         Some("1704067200")
     )]

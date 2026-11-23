@@ -3214,13 +3214,14 @@ fn create_fill_report(
     ))
 }
 
+const AX_SUPPORTED_ORDER_TYPES: &[OrderType] = &[OrderType::Market, OrderType::Limit];
+
 fn validate_order_for_ax_submit(order: &OrderAny) -> anyhow::Result<()> {
-    if !matches!(order.order_type(), OrderType::Market | OrderType::Limit) {
-        anyhow::bail!(
-            "Unsupported order type: {:?}, the Architect AX adapter accepts Nautilus MARKET and LIMIT orders",
-            order.order_type(),
-        );
-    }
+    let order_type = order.order_type();
+    anyhow::ensure!(
+        AX_SUPPORTED_ORDER_TYPES.contains(&order_type),
+        OrderDeniedReason::UnsupportedOrderType { order_type }
+    );
 
     // AX accepts only GTC, IOC, and DAY; deny others locally to avoid an opaque venue error
     if !matches!(
@@ -3546,7 +3547,7 @@ mod tests {
             o: AxOrderStatus::Accepted,
             d: AxOrderSide::Buy,
             tif: AxTimeInForce::Gtc,
-            ts: 1609459200,
+            ts: 1_609_459_200,
             tn: 0,
             cid: None,
             tag: None,
@@ -3576,7 +3577,7 @@ mod tests {
             &new_order,
             &old_order,
             new_venue_order_id,
-            (1609459200, 0),
+            (1_609_459_200, 0),
             &caches,
             account_id,
             clock,
@@ -3680,7 +3681,7 @@ mod tests {
             &new_order,
             &old_order,
             child,
-            (1609459200, 0),
+            (1_609_459_200, 0),
             &caches,
             AccountId::from("AX-001"),
             get_atomic_clock_realtime(),
@@ -3749,7 +3750,7 @@ mod tests {
             &new_order,
             &old_order,
             child,
-            (if invalid == 0 { -1 } else { 1609459200 }, 0),
+            (if invalid == 0 { -1 } else { 1_609_459_200 }, 0),
             &caches,
             AccountId::from("AX-001"),
             get_atomic_clock_realtime(),
@@ -3913,7 +3914,7 @@ mod tests {
         let mut metadata = test_metadata(client_order_id, instrument_id);
         metadata.is_accepted = false;
         caches.orders_metadata.insert(client_order_id, metadata);
-        let cid_value = 7u64;
+        let cid_value = 7_u64;
         caches
             .cid_to_client_order_id
             .insert(cid_value, client_order_id);
@@ -3921,8 +3922,9 @@ mod tests {
         let mut ws_order = test_ws_order(venue_order_id.as_str(), dec!(50500.00), 100);
         ws_order.cid = Some(cid_value);
 
-        let event = create_order_accepted(&ws_order, 1609459200, 500, &caches, account_id, clock)
-            .expect("should produce OrderAccepted");
+        let event =
+            create_order_accepted(&ws_order, 1_609_459_200, 500, &caches, account_id, clock)
+                .expect("should produce OrderAccepted");
 
         assert_eq!(event.venue_order_id, venue_order_id);
         assert_eq!(event.client_order_id, client_order_id);
@@ -3932,7 +3934,7 @@ mod tests {
         assert_eq!(event.strategy_id, StrategyId::from("S-001"));
         assert_eq!(
             event.ts_event,
-            UnixNanos::from(1_609_459_200_000_000_500u64)
+            UnixNanos::from(1_609_459_200_000_000_500_u64)
         );
 
         // Side effects on caches
@@ -4177,7 +4179,10 @@ mod tests {
             }))
         );
         assert_eq!(fill.liquidity_side, LiquiditySide::Maker);
-        assert_eq!(fill.ts_event, UnixNanos::from(1_609_459_200_123_456_789u64));
+        assert_eq!(
+            fill.ts_event,
+            UnixNanos::from(1_609_459_200_123_456_789_u64)
+        );
         assert_eq!(
             rx.try_recv().unwrap_err(),
             tokio::sync::mpsc::error::TryRecvError::Empty
@@ -4207,7 +4212,7 @@ mod tests {
             &child_order,
             &parent_order,
             child_id,
-            (1609459201, 0),
+            (1_609_459_201, 0),
             &caches,
             account_id,
             clock,
@@ -4489,7 +4494,7 @@ mod tests {
         let account_id = AccountId::from("AX-001");
         let ws_order = test_ws_order("OID-UNKNOWN", dec!(100.00), 10);
 
-        let result = create_order_accepted(&ws_order, 1609459200, 0, &caches, account_id, clock);
+        let result = create_order_accepted(&ws_order, 1_609_459_200, 0, &caches, account_id, clock);
         assert!(result.is_none());
         assert!(caches.venue_to_client_id.is_empty());
     }
@@ -4540,7 +4545,7 @@ mod tests {
         let event = create_order_filled(
             &order,
             &execution,
-            1609459200,
+            1_609_459_200,
             0,
             &caches,
             account_id,
@@ -4772,7 +4777,7 @@ mod tests {
         emitter.set_sender(tx);
 
         let event = AxWsOrderEvent::Filled(AxWsOrderFilled {
-            ts: 1609459200,
+            ts: 1_609_459_200,
             tn: 0,
             eid: "E-FILL".to_owned(),
             o: order.clone(),
@@ -4825,7 +4830,7 @@ mod tests {
             .insert(venue_order_id, client_order_id);
 
         let order = test_ws_order(venue_order_id.as_str(), dec!(100.00), 10);
-        let event = create_order_canceled(&order, 1609459200, 0, &caches, account_id, clock)
+        let event = create_order_canceled(&order, 1_609_459_200, 0, &caches, account_id, clock)
             .expect("should produce OrderCanceled");
 
         assert_eq!(event.venue_order_id, Some(venue_order_id));
@@ -4852,7 +4857,7 @@ mod tests {
             .insert(venue_order_id, client_order_id);
 
         let order = test_ws_order(venue_order_id.as_str(), dec!(100.00), 10);
-        let event = create_order_expired(&order, 1609459200, 0, &caches, account_id, clock)
+        let event = create_order_expired(&order, 1_609_459_200, 0, &caches, account_id, clock)
             .expect("should produce OrderExpired");
 
         assert_eq!(event.venue_order_id, Some(venue_order_id));
@@ -4894,7 +4899,7 @@ mod tests {
         let mut order = test_ws_order("OID-EXP", dec!(100.00), 10);
         order.tif = tif;
         let event = AxWsOrderEvent::Expired(AxWsOrderExpired {
-            ts: 1609459200,
+            ts: 1_609_459_200,
             tn: 0,
             eid: "E-EXP".to_string(),
             o: order,
@@ -4938,7 +4943,7 @@ mod tests {
         // Use the literal venue reason text so this guards the AX_POST_ONLY_REJECT constant
         let reason = "post-only order would cross the book";
         let event =
-            create_order_rejected(&order, reason, 1609459200, 0, &caches, account_id, clock)
+            create_order_rejected(&order, reason, 1_609_459_200, 0, &caches, account_id, clock)
                 .expect("should produce OrderRejected");
 
         assert!(event.due_post_only, "post-only reason should set flag");
@@ -4965,7 +4970,7 @@ mod tests {
         let event = create_order_rejected(
             &order,
             "INSUFFICIENT_MARGIN",
-            1609459200,
+            1_609_459_200,
             0,
             &caches,
             account_id,
@@ -4984,7 +4989,7 @@ mod tests {
         let instrument_id = InstrumentId::from("BTC-PERP.AX");
         let venue_order_id = VenueOrderId::new("OID-CLEAN");
         let stale_venue_order_id = VenueOrderId::new("OID-CLEAN-OLD");
-        let cid_value = 123u64;
+        let cid_value = 123_u64;
 
         caches.orders_metadata.insert(
             client_order_id,
@@ -5015,7 +5020,7 @@ mod tests {
         let caches = test_caches();
         let client_order_id = ClientOrderId::from("O-CLEAN-CID");
         let instrument_id = InstrumentId::from("BTC-PERP.AX");
-        let cid_value = 321u64;
+        let cid_value = 321_u64;
 
         caches.orders_metadata.insert(
             client_order_id,
@@ -5103,7 +5108,7 @@ mod tests {
         let client_order_id = ClientOrderId::from("O-RECON-CANCEL");
         let venue_order_id = VenueOrderId::new("OID-RECON-CANCEL");
         let stale_venue_order_id = VenueOrderId::new("OID-RECON-CANCEL-OLD");
-        let cid_value = 654u64;
+        let cid_value = 654_u64;
 
         seed_terminal_tracking(
             &caches,
@@ -5259,7 +5264,7 @@ mod tests {
 
         let err = validate_order_for_ax_submit(&order).unwrap_err();
 
-        assert!(err.to_string().contains("Unsupported order type"));
+        assert_eq!(err.to_string(), "UNSUPPORTED_ORDER_TYPE: STOP_MARKET");
     }
 
     #[rstest]
@@ -5270,7 +5275,7 @@ mod tests {
             .quantity(Quantity::from("10"))
             .price(Price::from("1.10"))
             .time_in_force(TimeInForce::Gtd)
-            .expire_time(UnixNanos::from(2_000_000_000_000_000_000u64))
+            .expire_time(UnixNanos::from(2_000_000_000_000_000_000_u64))
             .build();
 
         let err = validate_order_for_ax_submit(&order).unwrap_err();
@@ -5290,7 +5295,7 @@ mod tests {
 
         let err = validate_order_for_ax_submit(&order).unwrap_err();
 
-        assert!(err.to_string().contains("Unsupported order type"));
+        assert_eq!(err.to_string(), "UNSUPPORTED_ORDER_TYPE: STOP_LIMIT");
     }
 
     #[rstest]
@@ -5447,7 +5452,7 @@ mod tests {
         assert_eq!(fill.trade_id.as_str(), "T-01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(fill.last_qty.as_decimal(), dec!(100));
         assert_eq!(fill.last_px.as_decimal(), dec!(50000));
-        assert_eq!(fill.ts_event, UnixNanos::from(1609459200123456789));
+        assert_eq!(fill.ts_event, UnixNanos::from(1_609_459_200_123_456_789));
         assert!(rx.try_recv().is_err());
         assert!(caches.orders_metadata.is_empty());
         assert!(caches.venue_to_client_id.is_empty());

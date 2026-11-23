@@ -1386,55 +1386,6 @@ impl BlockchainCacheDatabase {
         .map_err(|e| anyhow::anyhow!("Failed to load pool {pool_identifier}: {e}"))
     }
 
-    /// Toggles performance optimization settings for sync operations.
-    ///
-    /// When enabled (true), applies settings for maximum write performance:
-    /// - `synchronous_commit` = OFF
-    /// - `work_mem` increased for bulk operations
-    ///
-    /// When disabled (false), restores default safe settings:
-    /// - `synchronous_commit` = ON (data safety)
-    /// - `work_mem` back to default
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operations fail.
-    pub async fn toggle_perf_sync_settings(&self, enable: bool) -> anyhow::Result<()> {
-        if enable {
-            log::debug!("Enabling performance sync settings for bulk operations");
-
-            // Set synchronous_commit to OFF for maximum write performance
-            sqlx::query("SET synchronous_commit = OFF")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to set synchronous_commit OFF: {e}"))?;
-
-            // Increase work_mem for bulk operations
-            sqlx::query("SET work_mem = '256MB'")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to set work_mem: {e}"))?;
-
-            log::debug!("Performance settings enabled: synchronous_commit=OFF, work_mem=256MB");
-        } else {
-            log::debug!("Restoring default safe database performance settings");
-
-            // Restore synchronous_commit to ON for data safety
-            sqlx::query("SET synchronous_commit = ON")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to set synchronous_commit ON: {e}"))?;
-
-            // Reset work_mem to default
-            sqlx::query("RESET work_mem")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to reset work_mem: {e}"))?;
-        }
-
-        Ok(())
-    }
-
     /// Saves the checkpoint block number indicating the last completed pool synchronization for a specific DEX.
     ///
     /// # Errors
@@ -2039,6 +1990,67 @@ impl BlockchainCacheDatabase {
         pool_identifier: &PoolIdentifier,
         snapshot: &PoolSnapshot,
     ) -> anyhow::Result<()> {
+        Self::insert_pool_snapshot(&self.pool, chain_id, dex_name, pool_identifier, snapshot).await
+    }
+
+    pub(crate) async fn add_pool_snapshot_atomic(
+        &self,
+        chain_id: u32,
+        dex_name: &DexType,
+        pool_identifier: &PoolIdentifier,
+        snapshot: &PoolSnapshot,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        Self::insert_pool_snapshot(
+            &mut *transaction,
+            chain_id,
+            dex_name,
+            pool_identifier,
+            snapshot,
+        )
+        .await?;
+
+        let positions: Vec<(PoolIdentifier, PoolPosition)> = snapshot
+            .positions
+            .iter()
+            .map(|position| (*pool_identifier, position.clone()))
+            .collect();
+        Self::insert_pool_positions_batch(
+            &mut *transaction,
+            chain_id,
+            snapshot.block_position.number,
+            snapshot.block_position.transaction_index,
+            snapshot.block_position.log_index,
+            &positions,
+        )
+        .await?;
+
+        let ticks: Vec<(PoolIdentifier, &PoolTick)> = snapshot
+            .ticks
+            .iter()
+            .map(|tick| (*pool_identifier, tick))
+            .collect();
+        Self::insert_pool_ticks_batch(
+            &mut *transaction,
+            chain_id,
+            snapshot.block_position.number,
+            snapshot.block_position.transaction_index,
+            snapshot.block_position.log_index,
+            &ticks,
+        )
+        .await?;
+
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_pool_snapshot<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
+        chain_id: u32,
+        dex_name: &DexType,
+        pool_identifier: &PoolIdentifier,
+        snapshot: &PoolSnapshot,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "
             INSERT INTO pool_snapshot (
@@ -2110,7 +2122,7 @@ impl BlockchainCacheDatabase {
         .bind(snapshot.analytics.total_fee_collects as i32)
         .bind(snapshot.analytics.total_flashes as i32)
         .bind(snapshot.analytics.liquidity_utilization_rate)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to insert into pool_snapshot table: {e}"))
@@ -2123,6 +2135,25 @@ impl BlockchainCacheDatabase {
     /// Returns an error if the database operation fails.
     pub async fn add_pool_positions_batch(
         &self,
+        chain_id: u32,
+        snapshot_block: u64,
+        snapshot_transaction_index: u32,
+        snapshot_log_index: u32,
+        positions: &[(PoolIdentifier, PoolPosition)],
+    ) -> anyhow::Result<()> {
+        Self::insert_pool_positions_batch(
+            &self.pool,
+            chain_id,
+            snapshot_block,
+            snapshot_transaction_index,
+            snapshot_log_index,
+            positions,
+        )
+        .await
+    }
+
+    async fn insert_pool_positions_batch<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
         chain_id: u32,
         snapshot_block: u64,
         snapshot_transaction_index: u32,
@@ -2223,7 +2254,7 @@ impl BlockchainCacheDatabase {
         .bind(&total_amount1_depositeds as &[Option<String>])
         .bind(&total_amount0_collecteds as &[Option<String>])
         .bind(&total_amount1_collecteds as &[Option<String>])
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_position table: {e}"))
@@ -2236,6 +2267,25 @@ impl BlockchainCacheDatabase {
     /// Returns an error if the database operation fails.
     pub async fn add_pool_ticks_batch(
         &self,
+        chain_id: u32,
+        snapshot_block: u64,
+        snapshot_transaction_index: u32,
+        snapshot_log_index: u32,
+        ticks: &[(PoolIdentifier, &PoolTick)],
+    ) -> anyhow::Result<()> {
+        Self::insert_pool_ticks_batch(
+            &self.pool,
+            chain_id,
+            snapshot_block,
+            snapshot_transaction_index,
+            snapshot_log_index,
+            ticks,
+        )
+        .await
+    }
+
+    async fn insert_pool_ticks_batch<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
         chain_id: u32,
         snapshot_block: u64,
         snapshot_transaction_index: u32,
@@ -2308,7 +2358,7 @@ impl BlockchainCacheDatabase {
         .bind(&fee_growth_outside_1s[..])
         .bind(&initializeds[..])
         .bind(&last_updated_blocks[..])
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_tick table: {e}"))
@@ -4283,6 +4333,7 @@ impl BlockchainCacheDatabase {
                         .execute(&mut *transaction)
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to reconstruct migrated intent: {e}"))?;
+
                         if current_status != status.as_str() {
                             sqlx::query(
                                 "
@@ -4797,6 +4848,7 @@ impl BlockchainCacheDatabase {
         .fetch_optional(&mut *transaction)
         .await
         .context("failed to recheck execution payload marker")?;
+
         if marker.is_some() {
             transaction
                 .rollback()
@@ -6372,6 +6424,7 @@ impl BlockchainCacheDatabase {
         .fetch_one(&mut *transaction)
         .await
         .context("failed to number replacement scan evidence")?;
+
         for (index, decision) in scan.decisions.iter().enumerate() {
             let height_start = decision
                 .height_start

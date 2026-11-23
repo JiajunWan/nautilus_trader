@@ -28,9 +28,16 @@ fn test_expiration_settles_final_tick_fills(
     #[values(false, true)] explicit_close: bool,
     #[values(OmsType::Netting, OmsType::Hedging)] oms_type: OmsType,
 ) {
-    let expiry = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let expiry = UnixNanos::from(2_000_000_000_000_000_000_u64);
+
     let instrument = if option {
-        InstrumentAny::OptionContract(option_contract("SPX", "OPRA", expiry, OptionKind::Call))
+        InstrumentAny::OptionContract(option_contract(
+            InstrumentId::from("SPX.OPRA"),
+            "OPRA",
+            expiry,
+            OptionKind::Call,
+            SettlementType::Cash,
+        ))
     } else {
         InstrumentAny::FuturesContract(futures_contract_es(Some(0.into()), Some(expiry)))
     };
@@ -245,7 +252,7 @@ fn test_expiration_settles_final_tick_fills(
 
 #[rstest]
 fn test_expiration_bar_settles_at_first_trade_tick() {
-    let expiry = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let expiry = UnixNanos::from(2_000_000_000_000_000_000_u64);
     let instrument =
         InstrumentAny::FuturesContract(futures_contract_es(Some(0.into()), Some(expiry)));
     let account_id = AccountId::from("ACCOUNT-001");
@@ -279,6 +286,7 @@ fn test_expiration_bar_settles_at_first_trade_tick() {
 
     // No orders are working, but expiration still settles on the bar's first trade tick
     let bar_type = BarType::from(format!("{}-1-MINUTE-LAST-EXTERNAL", instrument.id()).as_str());
+
     for (open, high, low, close, ts) in [
         ("5.00", "5.50", "4.50", "5.25", UnixNanos::from(2)),
         ("6.00", "8.00", "5.00", "7.00", expiry),
@@ -311,9 +319,16 @@ fn test_expiration_waits_for_position_after_order_acknowledgement(
     #[values(false, true)] option: bool,
     #[values(1, 2)] fill_qty: u64,
 ) {
-    let expiry = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let expiry = UnixNanos::from(2_000_000_000_000_000_000_u64);
+
     let instrument = if option {
-        InstrumentAny::OptionContract(option_contract("SPX", "OPRA", expiry, OptionKind::Call))
+        InstrumentAny::OptionContract(option_contract(
+            InstrumentId::from("SPX.OPRA"),
+            "OPRA",
+            expiry,
+            OptionKind::Call,
+            SettlementType::Cash,
+        ))
     } else {
         InstrumentAny::FuturesContract(futures_contract_es(Some(0.into()), Some(expiry)))
     };
@@ -446,7 +461,7 @@ fn test_expiration_waits_for_position_after_order_acknowledgement(
 
 #[rstest]
 fn test_expiration_settles_deferred_virtual_hedging_reversal() {
-    let expiry = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let expiry = UnixNanos::from(2_000_000_000_000_000_000_u64);
     let instrument =
         InstrumentAny::FuturesContract(futures_contract_es(Some(0.into()), Some(expiry)));
     let account_id = AccountId::from("ACCOUNT-001");

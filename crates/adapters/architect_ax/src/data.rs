@@ -734,7 +734,7 @@ impl DataClient for AxDataClient {
                                         log::warn!(
                                             "No funding rates returned for {symbol}"
                                         );
-                                    } else if let Some(update) = funding_rates.last() {
+                                    } else if let Some(update) = funding_rates.first() {
                                         // Only emit if rate changed
                                         let should_emit = cache.lock()
                                             .get(&instrument_id) != Some(update);
@@ -1061,7 +1061,7 @@ impl DataClient for AxDataClient {
 
         self.spawn_task(async move {
             match http
-                .request_trade_ticks(symbol, limit, start_nanos, end_nanos)
+                .request_trades(symbol, limit, start_nanos, end_nanos)
                 .await
             {
                 Ok(ticks) => {

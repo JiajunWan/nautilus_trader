@@ -180,8 +180,7 @@ where
         + 'static,
 {
     let mut delay_ms = RECOVERY_RETRY_INITIAL_MS;
-    let mut attempt = 0u32;
-
+    let mut attempt = 0_u32;
     loop {
         attempt += 1;
 
@@ -240,6 +239,7 @@ where
 
     // Drain queued events from the old stream while the replacement buffers new events.
     let mut task_slot = ctx.ws_task.lock().await;
+
     if let Some(outcome) = finish_task(
         &mut task_slot,
         Duration::from_secs(2),
@@ -319,7 +319,7 @@ async fn emit_open_order_reports(ctx: &RecoveryCtx) -> anyhow::Result<()> {
     let ts_init = ctx.dispatch_ctx.clock.get_time_ns();
     let instruments = ctx.http_client.instruments_cache();
     let product_type = ctx.dispatch_ctx.product_type;
-    let mut emitted = 0usize;
+    let mut emitted = 0_usize;
 
     let open_ok = match open_orders_result {
         Ok(orders) => {

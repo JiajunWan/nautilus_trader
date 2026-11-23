@@ -2505,6 +2505,18 @@ mod tests {
             &[],
         ),
         cache_mutation(
+            // Reapplied by execution client registration on every node start
+            "add_client_execution_settings",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            // Reapplied by strategy OMS registration on every node start
+            "set_strategy_oms_type",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
             // Reapplied by execution client routing setup on every node start
             "add_client_route",
             CacheMutationRecoveryClass::SnapshotOwned,
@@ -2543,6 +2555,7 @@ mod tests {
             &[],
         ),
         cache_mutation("cache_all", CacheMutationRecoveryClass::SnapshotOwned, &[]),
+        cache_mutation("reload", CacheMutationRecoveryClass::SnapshotOwned, &[]),
         cache_mutation(
             "cache_currencies",
             CacheMutationRecoveryClass::SnapshotOwned,
@@ -2630,6 +2643,11 @@ mod tests {
         ),
         cache_mutation(
             "clear_index",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            "clear_own_order_books",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
         ),

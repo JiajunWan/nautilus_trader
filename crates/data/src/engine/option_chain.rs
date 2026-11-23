@@ -13,17 +13,19 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use indexmap::IndexMap;
 use nautilus_core::correctness::check_valid_string_utf8;
+use nautilus_model::enums::GreeksConvention;
 
 use super::{
-    ClientId, DataEngine, Debug, DeferredCommand, DurationNanos, Instrument, InstrumentAny,
-    InstrumentClass, InstrumentId, OptionChainManager, OptionChainReferencePriceResponse,
-    OptionGreeks, OptionSeriesId, Price, Rc, RefCell, RequestCommand,
-    RequestOptionChainReferencePrice, StrikeRange, SubscribeCommand, SubscribeOptionChain,
-    SubscribeOptionGreeks, SubscriptionKey, TimeEvent, TimeEventCallback, TypedHandler, UUID4,
-    UnixNanos, UnsubscribeCommand, UnsubscribeInstrumentStatus, UnsubscribeOptionChain,
-    UnsubscribeOptionGreeks, UnsubscribeQuotes, VecDeque, Venue, WeakCell, mem, msgbus,
-    publish_external_data_command, switchboard,
+    AHashSet, ClientId, DataEngine, Debug, DeferredCommand, DurationNanos, Instrument,
+    InstrumentAny, InstrumentClass, InstrumentId, OptionChainManager,
+    OptionChainReferencePriceResponse, OptionGreeks, OptionSeriesId, Params, Price, Rc, RefCell,
+    RequestCommand, RequestOptionChainReferencePrice, StrikeRange, SubscribeCommand,
+    SubscribeOptionChain, SubscribeOptionGreeks, SubscriptionKey, TimeEvent, TimeEventCallback,
+    TypedHandler, UUID4, UnixNanos, UnsubscribeCommand, UnsubscribeOptionChain,
+    UnsubscribeOptionGreeks, VecDeque, Venue, WeakCell, mem, msgbus, publish_external_data_command,
+    switchboard,
 };
 
 const OPTION_CHAIN_REFERENCE_PRICE_TIMEOUT: DurationNanos = DurationNanos::from_secs(30);
@@ -47,53 +49,73 @@ impl DataEngine {
         client_id: ClientId,
         command: &SubscribeOptionChain,
         subscribe: &SubscribeCommand,
-    ) {
-        let owner_id = command.correlation_id.unwrap_or(command.command_id);
-        let current_key = (client_id, SubscriptionKey::OptionChain(command.series_id));
+    ) -> bool {
+        let owner_id = command.owner_id();
 
-        let previous_key = self
-            .subscriptions_external
-            .iter()
-            .find_map(|(key, active)| {
-                (matches!(
-                    &key.1,
-                    SubscriptionKey::OptionChain(series_id) if *series_id == command.series_id
-                ) && active.acquisitions.contains(&owner_id))
-                .then(|| key.clone())
-            });
+        let current_key = (
+            client_id,
+            SubscriptionKey::OptionChain(command.series_id, owner_id),
+        );
 
-        if let Some(previous_key) = previous_key
-            && previous_key != current_key
-        {
-            let release = {
-                let active = self
-                    .subscriptions_external
-                    .get_mut(&previous_key)
-                    .expect("external option chain owner was present");
-                active.acquisitions.remove(&owner_id);
-                active.owners = active.owners.saturating_sub(1);
-                active.owners == 0
-            };
+        if self.subscriptions_external.contains(&current_key) {
+            return false;
+        }
 
-            if release {
-                let active = self
-                    .subscriptions_external
-                    .remove(&previous_key)
-                    .expect("external option chain was present for final release");
-                let unsubscribe =
-                    active
-                        .command
-                        .into_unsubscribe(UUID4::new(), command.ts_init, Some(owner_id));
-                publish_external_data_command(previous_key.0, &unsubscribe);
-            }
+        let previous_key = self.subscriptions_external.iter().find_map(|(key, _)| {
+            matches!(&key.1, SubscriptionKey::OptionChain(series, owner)
+                if *series == command.series_id && *owner == owner_id)
+            .then(|| key.clone())
+        });
+
+        if let Some(previous_key) = previous_key {
+            let active = self
+                .subscriptions_external
+                .remove(&previous_key)
+                .expect("external option chain owner was present");
+            let unsubscribe =
+                active
+                    .command
+                    .into_unsubscribe(UUID4::new(), command.ts_init, Some(owner_id));
+            publish_external_data_command(previous_key.0, &unsubscribe);
         }
 
         self.subscriptions_external
-            .retain(current_key.clone(), owner_id, subscribe.clone());
-        self.subscriptions_external
-            .get_mut(&current_key)
-            .expect("external option chain was retained")
-            .command = subscribe.clone();
+            .retain(current_key, owner_id, subscribe.clone())
+    }
+
+    pub(super) fn unsubscribe_external_option_chain(
+        &mut self,
+        client_id: ClientId,
+        command: &UnsubscribeOptionChain,
+    ) {
+        let owner_id = if let Some(owner_id) = command.correlation_id {
+            owner_id
+        } else {
+            let owners = self.option_chain_owners(command.series_id);
+            if owners.len() != 1 {
+                log::warn!(
+                    "Cannot unsubscribe external option chain {} without an unambiguous owner",
+                    command.series_id
+                );
+                return;
+            }
+
+            *owners.iter().next().expect("one owner")
+        };
+
+        let key = (
+            client_id,
+            SubscriptionKey::OptionChain(command.series_id, owner_id),
+        );
+
+        if let Some(active) = self.subscriptions_external.remove(&key) {
+            let unsubscribe = active.command.into_unsubscribe(
+                command.command_id,
+                command.ts_init,
+                Some(owner_id),
+            );
+            publish_external_data_command(client_id, &unsubscribe);
+        }
     }
 
     pub(super) fn feed_option_greeks_to_pre_bootstrap_chain(&mut self, greeks: &OptionGreeks) {
@@ -105,32 +127,32 @@ impl DataEngine {
             return;
         };
 
-        let Some(manager_rc) = self.option_chain_managers.get(&series_id).cloned() else {
+        let Some(managers) = self.option_chain_managers.get(&series_id) else {
             return;
         };
 
-        if manager_rc.borrow().is_bootstrapped() {
-            return;
-        }
+        let managers: Vec<_> = managers
+            .iter()
+            .filter(|(_, manager)| !manager.borrow().is_bootstrapped())
+            .map(|(owner_id, manager)| (*owner_id, Rc::clone(manager)))
+            .collect();
 
-        manager_rc.borrow_mut().handle_greeks(greeks);
-
-        if manager_rc.borrow().is_bootstrapped() {
-            // Apply the chain's own subscribes before releasing the bootstrap owner, so a sample
-            // inside the active window keeps its feed without a physical unsubscribe.
-            self.drain_deferred_commands();
-            self.stop_option_chain_greeks_bootstrap(series_id);
+        for (owner_id, manager) in managers {
+            manager.borrow_mut().handle_greeks(greeks);
+            if manager.borrow().is_bootstrapped() {
+                self.drain_deferred_commands();
+                self.stop_option_chain_greeks_bootstrap(series_id, owner_id);
+            }
         }
     }
 
-    pub(super) fn update_option_chains(&mut self, instrument: &InstrumentAny) {
-        let Some(underlying) = instrument.underlying() else {
+    pub(super) fn update_option_chains(&mut self, instrument: &InstrumentAny, is_live: bool) {
+        if self
+            .option_chain_instruments_expired
+            .contains(&instrument.id())
+        {
             return;
-        };
-
-        let Some(expiration_ns) = instrument.expiration_ns() else {
-            return;
-        };
+        }
 
         let Some(strike) = instrument.strike_price() else {
             return;
@@ -140,31 +162,46 @@ impl DataEngine {
             return;
         };
 
-        if let Err(e) = check_valid_string_utf8(underlying, "underlying") {
-            log::warn!("Skipping option-chain update for {}: {e}", instrument.id());
+        let Some(series_id) = Self::option_chain_series(instrument) else {
             return;
-        }
+        };
 
-        let venue = instrument.id().venue;
-        let settlement = instrument.settlement_currency().code;
-        let series_id = OptionSeriesId::new_derived(venue, underlying, settlement, expiration_ns);
-
-        // Clone Rc to release borrow on self.option_chain_managers before accessing self.clients
-        let Some(manager_rc) = self.option_chain_managers.get(&series_id).cloned() else {
+        let Some(managers) = self.option_chain_managers.get(&series_id).cloned() else {
             return;
         };
 
         let clock = Rc::clone(&self.clock);
-        let client_id = manager_rc.borrow().client_id();
-        let client = self.get_command_client(client_id.as_ref(), Some(&venue));
 
-        if manager_rc
-            .borrow_mut()
-            .add_instrument(instrument.id(), strike, kind, client, &clock)
-        {
-            self.option_chain_instrument_index
-                .insert(instrument.id(), series_id);
+        for manager in managers.into_values() {
+            let mut manager = manager.borrow_mut();
+            if !is_live && manager.is_delta() {
+                continue;
+            }
+
+            let client_id = manager.client_id();
+            let client = client_id.and_then(|client_id| self.clients.get_mut(&client_id));
+            if manager.add_instrument(instrument.id(), strike, kind, client, &clock) {
+                self.option_chain_instrument_index
+                    .insert(instrument.id(), series_id);
+            }
         }
+    }
+
+    fn option_chain_series(instrument: &InstrumentAny) -> Option<OptionSeriesId> {
+        let underlying = instrument.underlying()?;
+        let expiration_ns = instrument.expiration_ns()?;
+
+        if let Err(e) = check_valid_string_utf8(underlying, "underlying") {
+            log::warn!("Skipping option-chain update for {}: {e}", instrument.id());
+            return None;
+        }
+
+        Some(OptionSeriesId::new_derived(
+            instrument.id().venue,
+            underlying,
+            instrument.settlement_currency().code,
+            expiration_ns,
+        ))
     }
 
     /// Removes a settled/expired instrument from its option chain manager.
@@ -174,38 +211,82 @@ impl DataEngine {
     /// unsubscribes), then drains those commands. When the series catalog
     /// becomes empty, the entire manager is torn down.
     pub(super) fn expire_option_chain_instrument(&mut self, instrument_id: InstrumentId) {
-        let Some(series_id) = self.option_chain_instrument_index.remove(&instrument_id) else {
-            return;
-        };
-
+        // Status events can arrive before their instrument definitions
         if self
-            .option_chain_greeks_bootstraps
-            .get(&series_id)
-            .is_some_and(|bootstrap| bootstrap.instrument_id == instrument_id)
+            .cache
+            .borrow()
+            .instrument(&instrument_id)
+            .is_none_or(|instrument| instrument.option_kind().is_some())
         {
-            self.stop_option_chain_greeks_bootstrap(series_id);
+            self.option_chain_instruments_expired.insert(instrument_id);
         }
 
-        let Some(manager_rc) = self.option_chain_managers.get(&series_id).cloned() else {
+        let series_id = self
+            .option_chain_instrument_index
+            .remove(&instrument_id)
+            .or_else(|| {
+                self.cache
+                    .borrow()
+                    .instrument(&instrument_id)
+                    .filter(|instrument| instrument.option_kind().is_some())
+                    .and_then(Self::option_chain_series)
+            });
+
+        let Some(series_id) = series_id else {
             return;
         };
 
-        let series_empty = manager_rc
-            .borrow_mut()
-            .handle_instrument_expired(&instrument_id);
+        let managers = self
+            .option_chain_managers
+            .get(&series_id)
+            .cloned()
+            .unwrap_or_default();
 
-        // Drain deferred unsubscribe commands pushed by the manager
-        self.drain_deferred_commands();
+        for (owner_id, manager) in managers {
+            if self
+                .option_chain_greeks_bootstraps
+                .get(&(series_id, owner_id))
+                .is_some_and(|bootstrap| bootstrap.instrument_id == instrument_id)
+            {
+                self.stop_option_chain_greeks_bootstrap(series_id, owner_id);
+            }
 
-        log::info!(
-            "Expired instrument {instrument_id} from option chain {series_id} (series_empty={series_empty})",
-        );
+            if !manager.borrow().contains_instrument(&instrument_id) {
+                continue;
+            }
 
-        if series_empty {
-            manager_rc.borrow_mut().teardown(&self.clock);
+            if manager
+                .borrow_mut()
+                .handle_instrument_expired(&instrument_id)
+            {
+                manager.borrow_mut().teardown(&self.clock);
+                self.option_chain_managers
+                    .get_mut(&series_id)
+                    .expect("series managers were present")
+                    .shift_remove(&owner_id);
+            }
+        }
+
+        if self
+            .option_chain_managers
+            .get(&series_id)
+            .is_some_and(IndexMap::is_empty)
+        {
             self.option_chain_managers.remove(&series_id);
+        }
 
-            log::info!("Torn down empty option chain manager for {series_id}");
+        if self
+            .pending_option_chain_requests
+            .values()
+            .any(|pending| pending.command.series_id == series_id)
+            && OptionChainManager::resolve_instruments(
+                &self.cache,
+                &series_id,
+                &self.option_chain_instruments_expired,
+            )
+            .is_empty()
+        {
+            self.cancel_pending_option_chain_requests(Some(series_id), None);
         }
     }
 
@@ -214,26 +295,27 @@ impl DataEngine {
     /// data client.
     pub(super) fn drain_deferred_commands(&mut self) {
         // Loop because expire_series pushes Unsubscribe commands; converges in <= 3 iterations
-        loop {
-            let commands: VecDeque<DeferredCommand> =
+        while !self.deferred_cmd_queue.borrow().is_empty() {
+            let mut commands: VecDeque<DeferredCommand> =
                 std::mem::take(&mut *self.deferred_cmd_queue.borrow_mut());
 
-            if commands.is_empty() {
-                break;
+            if commands
+                .iter()
+                .any(|command| matches!(command, DeferredCommand::ExpireSeries(_)))
+            {
+                // Series retirement supersedes contract refreshes queued by other handlers
+                commands
+                    .make_contiguous()
+                    .sort_by_key(|command| !matches!(command, DeferredCommand::ExpireSeries(_)));
             }
 
             for cmd in commands {
                 match cmd {
                     DeferredCommand::Subscribe(sub) => {
-                        let client = self.get_command_client(sub.client_id(), sub.venue());
-                        if let Some(client) = client {
-                            client.execute_subscribe(sub);
-                        }
+                        self.subscribe_option_chain_feed(sub);
                     }
                     DeferredCommand::Unsubscribe(unsub) => {
-                        if let Err(e) = self.execute_unsubscribe(&unsub) {
-                            log::error!("Failed to execute deferred unsubscribe: {e}");
-                        }
+                        self.unsubscribe_option_chain_feed(&unsub);
                     }
                     DeferredCommand::ExpireInstrument(instrument_id) => {
                         self.expire_option_chain_instrument(instrument_id);
@@ -246,37 +328,65 @@ impl DataEngine {
         }
     }
 
-    /// Proactively expires all instruments for a series and tears down the manager.
-    ///
-    /// `handle_instrument_expired` removes each instrument from the aggregator and pushes
-    /// deferred unsubscribe commands. `teardown` then cancels the snapshot timer and clears
-    /// the handler lists (the aggregator is already empty at that point).
-    fn expire_series(&mut self, series_id: OptionSeriesId) {
-        self.stop_option_chain_greeks_bootstrap(series_id);
+    fn subscribe_option_chain_feed(&mut self, command: SubscribeCommand) {
+        let retired = command.instrument_ids().is_some_and(|ids| {
+            ids.iter()
+                .any(|id| self.option_chain_instruments_expired.contains(id))
+        });
 
-        let Some(manager_rc) = self.option_chain_managers.get(&series_id).cloned() else {
+        let Some(client) = self.get_client(command.client_id(), command.venue()) else {
             return;
         };
 
-        let instrument_ids: Vec<InstrumentId> = self
-            .option_chain_instrument_index
-            .iter()
-            .filter(|(_, sid)| **sid == series_id)
-            .map(|(id, _)| *id)
+        if retired {
+            // Match the release already queued by teardown without subscribing on the wire
+            client.retain_intent(&command);
+        } else {
+            client.execute_subscribe_intent(command);
+        }
+    }
+
+    /// Proactively expires all instruments for a series and tears down the manager.
+    fn expire_series(&mut self, series_id: OptionSeriesId) {
+        self.cancel_pending_option_chain_requests(Some(series_id), None);
+        let mut owners: Vec<_> = self
+            .option_chain_greeks_bootstraps
+            .keys()
+            .filter_map(|(series, owner)| (*series == series_id).then_some(*owner))
             .collect();
 
-        for id in &instrument_ids {
-            self.option_chain_instrument_index.remove(id);
-            manager_rc.borrow_mut().handle_instrument_expired(id);
+        owners.sort_unstable_by_key(UUID4::as_bytes);
+        for owner_id in owners {
+            self.stop_option_chain_greeks_bootstrap(series_id, owner_id);
         }
 
-        manager_rc.borrow_mut().teardown(&self.clock);
-        self.option_chain_managers.remove(&series_id);
+        let Some(managers) = self.option_chain_managers.remove(&series_id) else {
+            return;
+        };
+
+        self.option_chain_instrument_index
+            .retain(|_, series| *series != series_id);
+
+        for manager in managers.into_values() {
+            let mut manager = manager.borrow_mut();
+            self.option_chain_instruments_expired
+                .extend(manager.all_instrument_ids());
+
+            let commands = manager.unsubscribe_commands();
+            manager.teardown(&self.clock);
+            self.deferred_cmd_queue
+                .borrow_mut()
+                .extend(commands.into_iter().map(DeferredCommand::Unsubscribe));
+        }
 
         log::info!("Proactively torn down expired option chain {series_id}");
     }
 
-    pub(super) fn subscribe_option_chain(&mut self, cmd: &SubscribeOptionChain) {
+    pub(super) fn subscribe_option_chain(
+        &mut self,
+        cmd: &SubscribeOptionChain,
+        greeks_convention: GreeksConvention,
+    ) {
         if !cmd.series_id.is_derived() {
             log::error!(
                 "Cannot subscribe option chain {}: explicit reference instruments are unsupported",
@@ -287,27 +397,25 @@ impl DataEngine {
 
         self.drain_deferred_commands();
         let series_id = cmd.series_id;
-        self.stop_option_chain_greeks_bootstrap(series_id);
-
-        // Handle edits to existing subscriptions by tearing down and re-setting up the OptionChainManager.
-        if let Some(old) = self.option_chain_managers.remove(&series_id) {
-            log::info!("Re-subscribing option chain for {series_id}, tearing down previous");
-
-            let (active_ids, old_venue, old_client_id) = {
-                let old = old.borrow();
-                let active_ids = old
-                    .all_instrument_ids()
-                    .into_iter()
-                    .filter(|instrument_id| old.is_instrument_active(instrument_id))
-                    .collect::<Vec<_>>();
-                (active_ids, old.venue(), old.client_id())
-            };
-
-            old.borrow_mut().teardown(&self.clock);
-            self.forward_option_chain_unsubscribes(&active_ids, old_venue, old_client_id);
+        if self.option_chain_expired(series_id) {
+            return;
         }
 
-        self.cancel_pending_option_chain_requests(Some(series_id));
+        let owner_id = cmd.owner_id();
+
+        if self
+            .option_chain_managers
+            .get(&series_id)
+            .is_some_and(|managers| managers.contains_key(&owner_id))
+            || self.pending_option_chain_requests.values().any(|pending| {
+                pending.command.series_id == series_id && pending.command.owner_id() == owner_id
+            })
+        {
+            log::warn!(
+                "Ignoring duplicate option chain subscription for {series_id}, owner={owner_id}"
+            );
+            return;
+        }
 
         // For dynamic strike ranges, request a reference price from the adapter
         // to enable instant bootstrap without waiting for the first WebSocket tick.
@@ -322,6 +430,7 @@ impl DataEngine {
                     .iter()
                     .filter(|i| {
                         i.instrument_class() == InstrumentClass::Option
+                            && !self.option_chain_instruments_expired.contains(&i.id())
                             && i.expiration_ns() == Some(series_id.expiration_ns)
                             && i.settlement_currency().code == series_id.settlement_currency
                     })
@@ -329,6 +438,9 @@ impl DataEngine {
                     .map(|i| i.id())
             }
         {
+            // A payload-free failure can remove the in-flight request before client cleanup
+            let mut command = cmd.clone();
+            command.client_id = Some(client_id);
             let request_id = UUID4::new();
             let ts_init = self.clock.borrow().timestamp_ns();
 
@@ -338,15 +450,15 @@ impl DataEngine {
                 Some(client_id),
                 request_id,
                 ts_init,
-                None,
+                cmd.params.clone(),
             );
             let deadline_ns = ts_init.saturating_add(OPTION_CHAIN_REFERENCE_PRICE_TIMEOUT);
             self.pending_option_chain_requests.insert(
                 request_id,
                 PendingOptionChainRequest {
-                    command: cmd.clone(),
-                    sample_instrument_id: instrument_id,
+                    command,
                     deadline_ns,
+                    greeks_convention,
                 },
             );
 
@@ -357,9 +469,11 @@ impl DataEngine {
 
             let req_cmd = RequestCommand::OptionChainReferencePrice(request);
             if let Err(e) = self.execute_request(req_cmd) {
+                self.inflight_requests.remove(&request_id);
                 log::warn!("Failed to request option-chain reference price for {series_id}: {e}");
 
-                if let Some(pending) = self.pending_option_chain_requests.remove(&request_id) {
+                if let Some(pending) = self.pending_option_chain_requests.shift_remove(&request_id)
+                {
                     self.maintain_option_chain_reference_price_timeout();
                     self.create_option_chain_manager_with_greeks_bootstrap(pending);
                 }
@@ -368,7 +482,11 @@ impl DataEngine {
             return;
         }
 
-        self.create_option_chain_manager(cmd, None);
+        let _ = self.create_option_chain_manager(cmd, None, greeks_convention);
+    }
+
+    fn option_chain_expired(&self, series_id: OptionSeriesId) -> bool {
+        self.clock.borrow().timestamp_ns() >= series_id.expiration_ns
     }
 
     fn schedule_option_chain_reference_price_timeout(&self) -> bool {
@@ -429,11 +547,17 @@ impl DataEngine {
         self.clock
             .borrow_mut()
             .cancel_timer(OPTION_CHAIN_REFERENCE_PRICE_TIMEOUT_TIMER);
+
         let mut pending: Vec<PendingOptionChainRequest> =
             mem::take(&mut self.pending_option_chain_requests)
-                .into_values()
+                .into_iter()
+                .map(|(request_id, pending)| {
+                    self.inflight_requests.remove(&request_id);
+                    pending
+                })
                 .collect();
-        pending.sort_unstable_by_key(|pending| pending.command.series_id);
+
+        pending.sort_by_key(|pending| pending.command.series_id);
         for pending in pending {
             self.create_option_chain_manager_with_greeks_bootstrap(pending);
         }
@@ -442,18 +566,21 @@ impl DataEngine {
     pub(super) fn cancel_pending_option_chain_requests(
         &mut self,
         series_id: Option<OptionSeriesId>,
+        owner_id: Option<UUID4>,
     ) -> bool {
         let request_ids: Vec<UUID4> = self
             .pending_option_chain_requests
             .iter()
             .filter_map(|(request_id, pending)| {
-                (series_id.is_none() || series_id == Some(pending.command.series_id))
-                    .then_some(*request_id)
+                ((series_id.is_none() || series_id == Some(pending.command.series_id))
+                    && (owner_id.is_none() || owner_id == Some(pending.command.owner_id())))
+                .then_some(*request_id)
             })
             .collect();
 
         for request_id in &request_ids {
-            self.pending_option_chain_requests.remove(request_id);
+            self.pending_option_chain_requests.shift_remove(request_id);
+            self.inflight_requests.remove(request_id);
         }
 
         self.maintain_option_chain_reference_price_timeout();
@@ -472,13 +599,13 @@ impl DataEngine {
             })
             .collect();
 
-        requests.sort_unstable_by_key(|(series_id, _)| *series_id);
-
+        requests.sort_by_key(|(series_id, _)| *series_id);
         for (_, request_id) in requests {
-            let Some(pending) = self.pending_option_chain_requests.remove(&request_id) else {
+            let Some(pending) = self.pending_option_chain_requests.shift_remove(&request_id) else {
                 continue;
             };
 
+            self.inflight_requests.remove(&request_id);
             let series_id = pending.command.series_id;
             log::warn!(
                 "Option-chain reference price request timed out for {series_id}; bootstrapping from live data"
@@ -494,24 +621,52 @@ impl DataEngine {
         &mut self,
         cmd: &SubscribeOptionChain,
         initial_atm_price: Option<Price>,
-    ) -> Rc<RefCell<OptionChainManager>> {
+        greeks_convention: GreeksConvention,
+    ) -> Option<Rc<RefCell<OptionChainManager>>> {
         let series_id = cmd.series_id;
-        let cache = Rc::clone(&self.cache);
+        if self.option_chain_expired(series_id) {
+            return None;
+        }
+
+        let instruments = OptionChainManager::resolve_instruments(
+            &self.cache,
+            &series_id,
+            &self.option_chain_instruments_expired,
+        );
         let clock = Rc::clone(&self.clock);
         let priority = self.msgbus_priority;
         let deferred_cmd_queue = Rc::clone(&self.deferred_cmd_queue);
+
+        let capacity = self
+            .option_chain_managers
+            .get(&series_id)
+            .map_or(0, IndexMap::len);
+
+        let slot = (0..=capacity)
+            .find(|slot| {
+                self.option_chain_managers
+                    .get(&series_id)
+                    .is_none_or(|managers| {
+                        managers
+                            .values()
+                            .all(|manager| manager.borrow().slot() != *slot)
+                    })
+            })
+            .expect("a free manager slot exists");
 
         let manager_rc = {
             let client = self.get_command_client(cmd.client_id.as_ref(), Some(&series_id.venue));
             OptionChainManager::create_and_setup(
                 series_id,
-                &cache,
+                instruments,
                 cmd,
                 &clock,
                 priority,
                 client,
                 initial_atm_price,
+                greeks_convention,
                 deferred_cmd_queue,
+                slot,
             )
         };
 
@@ -521,8 +676,10 @@ impl DataEngine {
         }
 
         self.option_chain_managers
-            .insert(series_id, Rc::clone(&manager_rc));
-        manager_rc
+            .entry(series_id)
+            .or_default()
+            .insert(cmd.owner_id(), Rc::clone(&manager_rc));
+        Some(manager_rc)
     }
 
     fn create_option_chain_manager_with_greeks_bootstrap(
@@ -531,14 +688,27 @@ impl DataEngine {
     ) {
         let cmd = pending.command;
         let series_id = cmd.series_id;
-        let instrument_id = pending.sample_instrument_id;
-        let manager = self.create_option_chain_manager(&cmd, None);
+        let owner_id = cmd.owner_id();
+
+        let Some(manager) = self.create_option_chain_manager(&cmd, None, pending.greeks_convention)
+        else {
+            return;
+        };
+
+        let Some(instrument_id) = manager.borrow().all_instrument_ids().into_iter().min() else {
+            return;
+        };
 
         let Some(client_id) = manager.borrow().client_id() else {
             return;
         };
 
-        let ownership_handler = TypedHandler::from(|_: &OptionGreeks| {});
+        let slot = manager.borrow().slot();
+        let greeks_feed_params = manager.borrow().greeks_feed_params().cloned();
+        let ownership_handler = TypedHandler::from_with_id(
+            format!("OptionChainBootstrap({series_id},{slot})"),
+            |_: &OptionGreeks| {},
+        );
         let topic = switchboard::get_option_greeks_topic(instrument_id);
         msgbus::subscribe_option_greeks(
             topic.into(),
@@ -547,39 +717,44 @@ impl DataEngine {
         );
 
         let replaced = self.option_chain_greeks_bootstraps.insert(
-            series_id,
+            (series_id, owner_id),
             OptionChainGreeksBootstrap {
                 instrument_id,
                 client_id,
                 venue: series_id.venue,
+                params: greeks_feed_params.clone(),
                 ownership_handler,
             },
         );
 
         debug_assert!(
             replaced.is_none(),
-            "Invariant: each option series has at most one Greeks bootstrap subscription"
+            "Invariant: each option chain owner has at most one Greeks bootstrap subscription"
         );
 
         let ts_init = self.clock.borrow().timestamp_ns();
 
-        if let Err(e) =
-            self.execute_subscribe(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks::new(
-                instrument_id,
-                Some(client_id),
-                Some(series_id.venue),
-                UUID4::new(),
-                ts_init,
-                None,
-                None,
-            )))
-        {
-            log::error!("Failed to subscribe option-chain bootstrap Greeks for {series_id}: {e}");
+        let command = SubscribeCommand::OptionGreeks(SubscribeOptionGreeks::new(
+            instrument_id,
+            Some(client_id),
+            Some(series_id.venue),
+            UUID4::new(),
+            ts_init,
+            None,
+            greeks_feed_params,
+        ));
+
+        if let Some(client) = self.get_client(Some(&client_id), Some(&series_id.venue)) {
+            client.execute_subscribe_intent(command);
         }
     }
 
-    fn stop_option_chain_greeks_bootstrap(&mut self, series_id: OptionSeriesId) -> bool {
-        let Some(bootstrap) = self.remove_option_chain_greeks_bootstrap(series_id) else {
+    fn stop_option_chain_greeks_bootstrap(
+        &mut self,
+        series_id: OptionSeriesId,
+        owner_id: UUID4,
+    ) -> bool {
+        let Some(bootstrap) = self.remove_option_chain_greeks_bootstrap(series_id, owner_id) else {
             return false;
         };
 
@@ -590,8 +765,11 @@ impl DataEngine {
     fn remove_option_chain_greeks_bootstrap(
         &mut self,
         series_id: OptionSeriesId,
+        owner_id: UUID4,
     ) -> Option<OptionChainGreeksBootstrap> {
-        let bootstrap = self.option_chain_greeks_bootstraps.remove(&series_id)?;
+        let bootstrap = self
+            .option_chain_greeks_bootstraps
+            .remove(&(series_id, owner_id))?;
         let topic = switchboard::get_option_greeks_topic(bootstrap.instrument_id);
         msgbus::unsubscribe_option_greeks(topic.into(), &bootstrap.ownership_handler);
         Some(bootstrap)
@@ -605,15 +783,10 @@ impl DataEngine {
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
             None,
-            None,
+            bootstrap.params.clone(),
         ));
 
-        if let Err(e) = self.execute_unsubscribe(&cmd) {
-            log::error!(
-                "Failed to unsubscribe option-chain bootstrap Greeks for {}: {e}",
-                bootstrap.instrument_id
-            );
-        }
+        self.unsubscribe_option_chain_feed(&cmd);
     }
 
     pub(super) fn clear_option_chain_greeks_bootstraps(&mut self) {
@@ -627,103 +800,186 @@ impl DataEngine {
     pub(super) fn clear_option_chain_managers(&mut self) {
         // Tear down option chain managers to unregister their msgbus handlers
         let managers: Vec<_> = self.option_chain_managers.drain().collect();
-        for (_, manager) in managers {
-            manager.borrow_mut().teardown(&self.clock);
+        for (_, owners) in managers {
+            for manager in owners.into_values() {
+                manager.borrow_mut().teardown(&self.clock);
+            }
         }
 
         self.option_chain_instrument_index.clear();
-        self.cancel_pending_option_chain_requests(None);
+        self.option_chain_instruments_expired.clear();
+        self.cancel_pending_option_chain_requests(None, None);
         self.clear_option_chain_greeks_bootstraps();
     }
 
     pub(super) fn unsubscribe_option_chain(&mut self, cmd: &UnsubscribeOptionChain) {
         self.drain_deferred_commands();
         let series_id = cmd.series_id;
-        let topic = switchboard::get_option_chain_topic(series_id);
-        if msgbus::exact_subscriber_count_option_chain(topic) > 0 {
-            return;
-        }
-
-        let canceled_pending = self.cancel_pending_option_chain_requests(Some(series_id));
-        let canceled_greeks_bootstrap = self.stop_option_chain_greeks_bootstrap(series_id);
-
-        let Some(manager_rc) = self.option_chain_managers.remove(&series_id) else {
-            if !canceled_pending && !canceled_greeks_bootstrap {
-                log::warn!("Cannot unsubscribe option chain for {series_id}: not subscribed");
+        let owner_id = if let Some(owner_id) = cmd.correlation_id {
+            owner_id
+        } else {
+            let owners = self.option_chain_owners(series_id);
+            if owners.len() != 1 {
+                log::warn!(
+                    "Cannot unsubscribe option chain for {series_id} without an unambiguous owner"
+                );
+                return;
             }
 
+            *owners.iter().next().expect("one owner was present")
+        };
+
+        self.cancel_pending_option_chain_requests(Some(series_id), Some(owner_id));
+        self.stop_option_chain_greeks_bootstrap(series_id, owner_id);
+        let manager = self
+            .option_chain_managers
+            .get_mut(&series_id)
+            .and_then(|managers| managers.shift_remove(&owner_id));
+
+        let Some(manager) = manager else {
             return;
         };
 
-        // Extract info before teardown
-        let (all_ids, active_ids, venue, client_id) = {
-            let manager = manager_rc.borrow();
-            let all_ids = manager.all_instrument_ids();
-            let active_ids = all_ids
-                .iter()
-                .filter(|instrument_id| manager.is_instrument_active(instrument_id))
-                .copied()
-                .collect::<Vec<_>>();
-            (all_ids, active_ids, manager.venue(), manager.client_id())
-        };
-
-        // Remove all instruments from reverse index
-        for id in &all_ids {
-            self.option_chain_instrument_index.remove(id);
+        if self
+            .option_chain_managers
+            .get(&series_id)
+            .is_some_and(IndexMap::is_empty)
+        {
+            self.option_chain_managers.remove(&series_id);
+            self.option_chain_instrument_index
+                .retain(|_, series| *series != series_id);
         }
 
-        manager_rc.borrow_mut().teardown(&self.clock);
+        let commands = manager.borrow().unsubscribe_commands();
+        manager.borrow_mut().teardown(&self.clock);
 
-        // Forward wire-level unsubscribes to the data client
-        self.forward_option_chain_unsubscribes(&active_ids, venue, client_id);
+        for command in commands {
+            self.unsubscribe_option_chain_feed(&command);
+        }
 
-        log::info!("Unsubscribed option chain for {series_id}");
+        log::info!("Unsubscribed option chain for {series_id}, owner={owner_id}");
     }
 
-    /// Forwards wire-level unsubscribe commands for all option chain instruments.
-    fn forward_option_chain_unsubscribes(
-        &mut self,
-        instrument_ids: &[InstrumentId],
-        venue: Venue,
-        client_id: Option<ClientId>,
-    ) {
-        let ts_init = self.clock.borrow().timestamp_ns();
+    fn unsubscribe_option_chain_feed(&mut self, command: &UnsubscribeCommand) {
+        if let Some(client_id) = command.client_id()
+            && let Some(client) = self.clients.get_mut(client_id)
+        {
+            client.execute_unsubscribe(command);
+        }
+    }
 
-        for instrument_id in instrument_ids {
-            let quote_cmd = UnsubscribeCommand::Quotes(UnsubscribeQuotes::new(
-                *instrument_id,
-                client_id,
-                Some(venue),
+    fn option_chain_owners(&self, series_id: OptionSeriesId) -> AHashSet<UUID4> {
+        let mut owners: AHashSet<_> = self
+            .option_chain_managers
+            .get(&series_id)
+            .into_iter()
+            .flat_map(|managers| managers.keys().copied())
+            .collect();
+        owners.extend(
+            self.pending_option_chain_requests
+                .values()
+                .filter_map(|pending| {
+                    (pending.command.series_id == series_id).then_some(pending.command.owner_id())
+                }),
+        );
+
+        owners.extend(
+            self.subscriptions_external
+                .iter()
+                .filter_map(|(key, _)| match key.1 {
+                    SubscriptionKey::OptionChain(series, owner) if series == series_id => {
+                        Some(owner)
+                    }
+                    _ => None,
+                }),
+        );
+
+        owners
+    }
+
+    pub(super) fn unsubscribe_option_chains_for_client(&mut self, client_id: ClientId) {
+        self.drain_deferred_commands();
+
+        let mut owners: Vec<_> = self
+            .option_chain_managers
+            .iter()
+            .flat_map(|(series_id, managers)| {
+                managers.iter().filter_map(move |(owner_id, manager)| {
+                    (manager.borrow().client_id() == Some(client_id))
+                        .then_some((*series_id, *owner_id))
+                })
+            })
+            .collect();
+
+        owners.extend(
+            self.pending_option_chain_requests
+                .values()
+                .filter_map(|pending| {
+                    (pending.command.client_id == Some(client_id))
+                        .then_some((pending.command.series_id, pending.command.owner_id()))
+                }),
+        );
+
+        owners.sort_unstable_by_key(|(series_id, owner_id)| (*series_id, owner_id.as_bytes()));
+        owners.dedup();
+        for (series_id, owner_id) in owners {
+            let mut command = UnsubscribeOptionChain::new(
+                series_id,
                 UUID4::new(),
-                ts_init,
-                None,
-                None,
-            ));
-            let greeks_cmd = UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks::new(
-                *instrument_id,
-                client_id,
-                Some(venue),
-                UUID4::new(),
-                ts_init,
-                None,
-                None,
-            ));
-            let status_cmd =
-                UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus::new(
-                    *instrument_id,
-                    client_id,
-                    Some(venue),
+                self.clock.borrow().timestamp_ns(),
+                Some(client_id),
+                Some(series_id.venue),
+            );
+
+            command.correlation_id = Some(owner_id);
+            self.unsubscribe_option_chain(&command);
+        }
+    }
+
+    pub(super) fn unsubscribe_all_option_chains(&mut self) {
+        let mut series_ids: AHashSet<_> = self.option_chain_managers.keys().copied().collect();
+        series_ids.extend(
+            self.pending_option_chain_requests
+                .values()
+                .map(|pending| pending.command.series_id),
+        );
+
+        let mut series_ids: Vec<_> = series_ids.into_iter().collect();
+        series_ids.sort_unstable();
+        for series_id in series_ids {
+            let mut owners: Vec<_> = self.option_chain_owners(series_id).into_iter().collect();
+            owners.sort_unstable_by_key(UUID4::as_bytes);
+            for owner_id in owners {
+                let mut command = UnsubscribeOptionChain::new(
+                    series_id,
                     UUID4::new(),
-                    ts_init,
+                    self.clock.borrow().timestamp_ns(),
                     None,
-                    None,
-                ));
+                    Some(series_id.venue),
+                );
 
-            for cmd in [&quote_cmd, &greeks_cmd, &status_cmd] {
-                if let Err(e) = self.execute_unsubscribe(cmd) {
-                    log::error!("Failed to execute option chain unsubscribe: {e}");
-                }
+                command.correlation_id = Some(owner_id);
+                self.unsubscribe_option_chain(&command);
             }
+        }
+
+        let mut external: Vec<_> = self
+            .subscriptions_external
+            .iter()
+            .filter(|(key, _)| matches!(&key.1, SubscriptionKey::OptionChain(_, _)))
+            .map(|(key, active)| (key.clone(), active.command.clone()))
+            .collect();
+
+        external.sort_unstable_by_key(|(key, _)| match key.1 {
+            SubscriptionKey::OptionChain(series, owner) => (key.0, series, owner.as_bytes()),
+            _ => unreachable!("filtered to option chains"),
+        });
+
+        for (key, command) in external {
+            self.subscriptions_external.remove(&key);
+            let unsubscribe =
+                command.into_unsubscribe(UUID4::new(), self.clock.borrow().timestamp_ns(), None);
+            publish_external_data_command(key.0, &unsubscribe);
         }
     }
 
@@ -750,7 +1006,7 @@ impl DataEngine {
 
         let pending = self
             .pending_option_chain_requests
-            .remove(correlation_id)
+            .shift_remove(correlation_id)
             .expect("checked above");
         self.maintain_option_chain_reference_price_timeout();
         let series_id = pending.command.series_id;
@@ -764,7 +1020,11 @@ impl DataEngine {
         }
 
         if resp.price.is_some() {
-            self.create_option_chain_manager(&pending.command, resp.price);
+            let _ = self.create_option_chain_manager(
+                &pending.command,
+                resp.price,
+                pending.greeks_convention,
+            );
         } else {
             self.create_option_chain_manager_with_greeks_bootstrap(pending);
         }
@@ -795,8 +1055,8 @@ impl OptionChainBootstrapper {
 #[derive(Debug)]
 pub(super) struct PendingOptionChainRequest {
     command: SubscribeOptionChain,
-    sample_instrument_id: InstrumentId,
     deadline_ns: UnixNanos,
+    greeks_convention: GreeksConvention,
 }
 
 #[derive(Debug)]
@@ -804,5 +1064,142 @@ pub(super) struct OptionChainGreeksBootstrap {
     instrument_id: InstrumentId,
     client_id: ClientId,
     venue: Venue,
+    params: Option<Params>,
     ownership_handler: TypedHandler<OptionGreeks>,
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_common::{
+        cache::Cache,
+        clock::{Clock, VirtualClock},
+        messages::data::{DataResponse, InstrumentResponse},
+    };
+    use nautilus_model::{
+        data::{Data, InstrumentStatus},
+        enums::MarketStatusAction,
+        identifiers::Venue,
+        instruments::{BinaryOption, stubs::binary_option},
+    };
+    use rstest::rstest;
+    use ustr::Ustr;
+
+    use super::*;
+
+    #[rstest]
+    #[case::known(false, false)]
+    #[case::streamed_definition(true, false)]
+    #[case::requested_definition(true, true)]
+    fn test_option_chain_retirement_excludes_binary_markets(
+        binary_option: BinaryOption,
+        #[case] close_before_definition: bool,
+        #[case] request_definition: bool,
+    ) {
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let instrument_id = binary_option.id();
+        let mut engine = DataEngine::new(clock, Rc::clone(&cache), None);
+        if !close_before_definition {
+            engine.process(&InstrumentAny::from(binary_option.clone()));
+        }
+
+        let status = InstrumentStatus::new(
+            instrument_id,
+            MarketStatusAction::Close,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+        );
+
+        engine.process_data(Data::InstrumentStatus(status));
+
+        if close_before_definition {
+            let instrument = InstrumentAny::from(binary_option);
+
+            if request_definition {
+                engine.response(DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                    UUID4::new(),
+                    ClientId::from("BINARY"),
+                    instrument_id,
+                    instrument,
+                    None,
+                    None,
+                    UnixNanos::from(3),
+                    None,
+                ))));
+            } else {
+                engine.process(&instrument);
+            }
+        }
+
+        assert_eq!(
+            cache.borrow().instrument_status(&instrument_id),
+            Some(&status)
+        );
+        cache.borrow_mut().purge_instrument(instrument_id);
+        assert!(cache.borrow().instrument(&instrument_id).is_none());
+        assert!(engine.option_chain_instruments_expired.is_empty());
+    }
+
+    #[rstest]
+    fn test_option_chain_fallback_releases_inflight_request(#[values(false, true)] timeout: bool) {
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let mut engine = DataEngine::new(clock, Rc::new(RefCell::new(Cache::default())), None);
+        let series_id = OptionSeriesId::new_derived(
+            Venue::from("DERIBIT"),
+            Ustr::from("BTC"),
+            Ustr::from("BTC"),
+            UnixNanos::from(1_704_067_200_000_000_000_u64),
+        );
+        let instrument_id = InstrumentId::from("BTC-20240101-50000-C.DERIBIT");
+        let request_id = UUID4::new();
+        let command = SubscribeOptionChain::new(
+            series_id,
+            StrikeRange::Fixed(vec![]),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(series_id.venue),
+            None,
+        )
+        .unwrap();
+
+        let request = RequestOptionChainReferencePrice::new(
+            series_id,
+            instrument_id,
+            None,
+            request_id,
+            UnixNanos::default(),
+            None,
+        );
+
+        engine.inflight_requests.insert(
+            request_id,
+            RequestCommand::OptionChainReferencePrice(request),
+        );
+        engine.pending_option_chain_requests.insert(
+            request_id,
+            PendingOptionChainRequest {
+                command,
+                deadline_ns: UnixNanos::default(),
+                greeks_convention: GreeksConvention::BlackScholes,
+            },
+        );
+
+        if timeout {
+            engine.handle_option_chain_reference_price_timeout();
+        } else {
+            engine.bootstrap_all_pending_option_chains();
+        }
+
+        assert!(engine.inflight_requests.is_empty());
+        assert!(engine.pending_option_chain_requests.is_empty());
+        engine.unsubscribe_all_option_chains();
+        assert!(engine.option_chain_managers.is_empty());
+    }
 }

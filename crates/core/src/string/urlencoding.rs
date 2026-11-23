@@ -37,16 +37,19 @@ const UNRESERVED: [bool; 256] = {
         table[i as usize] = true;
         i += 1;
     }
+
     i = b'A';
     while i <= b'Z' {
         table[i as usize] = true;
         i += 1;
     }
+
     i = b'a';
     while i <= b'z' {
         table[i as usize] = true;
         i += 1;
     }
+
     table[b'-' as usize] = true;
     table[b'.' as usize] = true;
     table[b'_' as usize] = true;
@@ -56,29 +59,32 @@ const UNRESERVED: [bool; 256] = {
 
 const ENCODE_PAIR: [[u8; 2]; 256] = {
     const NIBBLE: [u8; 16] = *b"0123456789ABCDEF";
-    let mut table = [[0u8; 2]; 256];
-    let mut i = 0u16;
+    let mut table = [[0_u8; 2]; 256];
+    let mut i = 0_u16;
     while i < 256 {
         table[i as usize] = [NIBBLE[(i >> 4) as usize], NIBBLE[(i & 0x0f) as usize]];
         i += 1;
     }
+
     table
 };
 
 // 0xFF sentinel marks non-hex characters
 const DECODE_NIBBLE: [u8; 256] = {
-    let mut table = [0xFFu8; 256];
-    let mut i = 0u8;
+    let mut table = [0xff_u8; 256];
+    let mut i = 0_u8;
     while i < 10 {
         table[(b'0' + i) as usize] = i;
         i += 1;
     }
+
     i = 0;
     while i < 6 {
         table[(b'a' + i) as usize] = 10 + i;
         table[(b'A' + i) as usize] = 10 + i;
         i += 1;
     }
+
     table
 };
 
@@ -131,6 +137,7 @@ pub fn encode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
             rest = &rest[1..];
         }
     }
+
     Cow::Owned(out)
 }
 
@@ -172,6 +179,7 @@ pub fn decode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
             while i < input.len() && input[i] != b'%' {
                 i += 1;
             }
+
             out.extend_from_slice(&input[run_start..i]);
             continue;
         }
@@ -179,7 +187,7 @@ pub fn decode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
         if i + 2 < input.len() {
             let hi = DECODE_NIBBLE[input[i + 1] as usize];
             let lo = DECODE_NIBBLE[input[i + 2] as usize];
-            if (hi | lo) & 0xF0 == 0 {
+            if (hi | lo) & 0xf0 == 0 {
                 out.push((hi << 4) | lo);
                 i += 3;
                 continue;
@@ -190,6 +198,7 @@ pub fn decode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
         out.push(b'%');
         i += 1;
     }
+
     Cow::Owned(out)
 }
 
@@ -250,6 +259,7 @@ mod tests {
         let out = encode(RESERVED_CHARS);
         // Each of the 18 chars becomes a 3-byte `%HH` sequence.
         assert_eq!(out.len(), RESERVED_CHARS.len() * 3);
+
         // None of the unreserved chars, `%`, or digits A-F should appear raw
         // in the output except as part of a `%HH` triple.
         for byte in out.bytes() {
@@ -272,7 +282,7 @@ mod tests {
     fn test_encode_every_byte_position() {
         // For each byte 0x00..=0xFF, encode a one-byte slice and verify that
         // the output matches the spec expectation.
-        for byte in 0u8..=255 {
+        for byte in 0_u8..=255 {
             let input = [byte];
             let out = encode_bytes(&input);
 
@@ -378,7 +388,7 @@ mod tests {
     fn test_decode_invalid_utf8_bytes_ok() {
         // `decode_bytes` does not validate UTF-8.
         let out = decode_bytes(b"%FF");
-        assert_eq!(out.as_ref(), &[0xFF]);
+        assert_eq!(out.as_ref(), &[0xff]);
     }
 
     #[rstest]
@@ -398,7 +408,7 @@ mod tests {
     fn test_roundtrip_every_byte() {
         // For every byte 0x00..=0xFF, encoding then decoding must recover
         // the original byte exactly.
-        for byte in 0u8..=255 {
+        for byte in 0_u8..=255 {
             let input = [byte];
             let encoded = encode_bytes(&input);
             let decoded = decode_bytes(encoded.as_ref());
@@ -435,7 +445,7 @@ mod tests {
     fn test_encode_bytes_arbitrary_binary() {
         // Encoding arbitrary bytes (including non-UTF-8) yields a valid
         // percent-encoded ASCII sequence.
-        let input: Vec<u8> = (0u8..=255).collect();
+        let input: Vec<u8> = (0_u8..=255).collect();
         let encoded = encode_bytes(&input);
         assert!(encoded.iter().all(u8::is_ascii));
         let decoded = decode_bytes(encoded.as_ref());
@@ -466,6 +476,7 @@ mod tests {
                 out.extend_from_slice(format!("{b:02X}").as_bytes());
             }
         }
+
         out
     }
 
@@ -482,19 +493,23 @@ mod tests {
                     } else {
                         (a | 0x20) - b'a' + 10
                     };
+
                     let lo = if b.is_ascii_digit() {
                         b - b'0'
                     } else {
                         (b | 0x20) - b'a' + 10
                     };
+
                     out.push((hi << 4) | lo);
                     i += 3;
                     continue;
                 }
             }
+
             out.push(input[i]);
             i += 1;
         }
+
         out
     }
 

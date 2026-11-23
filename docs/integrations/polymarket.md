@@ -1727,9 +1727,9 @@ time. The taker fee formula stays the same.
 See the [November fee and rebate changes](https://docs.polymarket.com/programs/fee-and-rebate-changes-november-2026).
 
 Quote-quantity market buys and newly admitted taker fills can use the prior coefficient while
-the adapter holds stale instrument metadata. When enabled, periodic refresh covers the
-instrument configuration and registered filters. For retained fills, see
-[Fee basis across instrument updates](#fee-basis-across-instrument-updates).
+the adapter holds stale instrument metadata. See [Periodic instrument refresh](#periodic-instrument-refresh)
+for refresh coverage and [Fee basis across instrument updates](#fee-basis-across-instrument-updates)
+for retained fills.
 
 The table shows the published schedule before that change.
 
@@ -2413,10 +2413,11 @@ snapshots leave the book gated until a valid snapshot arrives or recovery starts
 A zero timeout disables initial and reconnect deadlines, plus per-attempt snapshot deadlines
 within the 180-second retry budget. The budget still ends a pending attempt; later attempts time out after one minute.
 
-The venue sends a `book` snapshot on first subscribe and ignores duplicate subscribes. A book-delta
-subscription can join an asset held by quotes, trades, or resolution watches. Without an accepted
-snapshot, it starts recovery unless an armed deadline or running recovery already covers the book.
-Recovery cycles the asset's subscription until a valid snapshot arrives.
+On first subscribe, the venue sends a `book` snapshot if the book is available. The venue ignores
+duplicate subscribes. A book-delta subscription can join an asset held by quotes, trades, or
+resolution watches. Without an accepted snapshot, it starts recovery unless an armed deadline or
+running recovery already covers the book. Recovery cycles the asset's subscription until a valid
+snapshot arrives.
 
 A single `price_change` payload can contain interleaved updates for several assets. The adapter
 groups book updates by instrument, then splits consecutive updates by hash. Quote processing remains
@@ -2501,15 +2502,21 @@ exact wire values and level order. It logs and rejects a mismatch before the sna
 - Emit snapshot-derived deltas or quotes.
 - Resume gated book deltas.
 
-For book-delta subscribers, a hash rejection drops the comparison book and gates `price_change` deltas:
+For book-delta subscribers, rejecting a decoded `book` message gates `price_change` deltas. Rejections
+include hash mismatches, invalid timestamps or levels, and snapshots the adapter cannot apply. A
+hash mismatch also drops the comparison book.
 
 - An armed initial or reconnect deadline starts recovery at expiry.
-- During recovery, a mismatch fails the attempt and resubscribes immediately, without waiting for its snapshot deadline.
-- Otherwise, recovery starts immediately.
+- After a confirmed recovery resubscribe, rejection fails the attempt before its snapshot deadline.
+  A stale snapshot can also fail that attempt.
+- With no recovery owner or armed deadline, recovery starts immediately.
 
-The next accepted snapshot emits a full `CLEAR` reseed, including with effective deltas.
+After a hash mismatch, the next accepted snapshot emits a full `CLEAR` reseed, including with effective deltas.
 
-After exhausting its retry budget, recovery retries at intervals that double from one to fifteen minutes.
+After exhausting its retry budget, recovery retries at intervals that double from one to fifteen
+minutes. For a book with no accepted snapshot in its current book-delta subscription, a confirmed
+resubscribe followed by a snapshot timeout skips the rest of the retry budget. A valid snapshot can
+complete recovery between attempts.
 
 [Polymarket book messages](https://docs.polymarket.com/market-data/realtime-data) can omit hash inputs
 such as `tick_size` and `last_trade_price`. Instrument metadata supplies missing `min_order_size` and
@@ -2832,9 +2839,14 @@ These scopes compose rather than override each other: filter-driven queries run 
 explicit slug or series scope, and `load_ids` loads additively on top. Only the unfiltered
 full-universe fetch is suppressed once an explicit scope is present.
 
-The same composition applies to periodic refreshes driven by `update_instruments_interval_mins`.
-Scopes configured at startup keep refreshing for the client's lifetime, so bootstrap and refresh
-universes match.
+#### Periodic instrument refresh
+
+Set `update_instruments_interval_mins` to a positive value to enable periodic refresh.
+
+- **Discovery scopes** configured at startup apply to every periodic refresh.
+- **Tracked markets** include cached markets with quote, book-delta, trade, status, or close
+  subscriptions, or an active or paused resolution watch. The adapter also looks up tracked markets
+  outside the discovery results, even when discovery is unconfigured or fails.
 
 #### Markets awaiting CLOB metadata
 
@@ -2864,8 +2876,12 @@ subscriptions without further retries or a terminal-miss error. It logs the reje
 
 The Rust data client tracks Polymarket exposure by `condition_id` so both YES and NO legs
 close together when the venue resolves the market. Position events add open Polymarket binary
-option instruments to an internal watchlist. Data clients can also watch an instrument without a
-position by subscribing to `InstrumentStatus`, `InstrumentClose`, or both.
+option instruments to an internal watchlist. The data client takes a position's instrument from its loaded
+set or, failing that, from the shared cache, so wallet positions outside discovery filters also enter the
+watchlist. Periodic metadata refresh does not cover a watch taken from the shared cache: it keeps the cached
+end date, so a postponed market can time out before it resolves. To keep its deadline current, include the
+market in the data client's discovery filters or `load_ids`. Data clients can also watch an instrument
+without a position by subscribing to `InstrumentStatus`, `InstrumentClose`, or both.
 
 The subscriptions are independent: a status subscription emits only the status close, while a close
 subscription emits only the settlement price. Unsubscribing from one does not remove the other.
@@ -2955,18 +2971,24 @@ users can redeem CTF and V2 positions with [Position operations](#position-opera
 
 #### Closure and subscription release
 
-Gamma's positive `closed=true` evidence stops normal quote, trade, and book-delta streams for both outcome
-siblings, even when the payload cannot produce usable instruments. For `v2`, `resolutionStatus="resolved"`
-also stops these streams when `closed=false`. Closure alone does not establish a winner
-or emit settlement events. Existing resolution owners remain available for polling or manual recovery. An
-enabled, unpaused resolution WebSocket may remain until resolution or timeout. Later live subscriptions cannot
-reopen the closed condition.
-
-The same apply path handles auto-load outcomes, WebSocket `market_resolved` events, automatic polling, and
-manual requests. Successful resolution emits each admitted owner's event types once, removes those owners and
-the condition's watch, and releases its WebSocket subscriptions. Existing pending data intents retain their
-outcome until admission or cancellation. New subscriptions cannot re-enroll the resolved condition. Automatic
-delivery never bypasses instrument-filter admission.
+- **Metadata refresh** preserves a tracked market's trading state. If Gamma reports closure before
+  the adapter records it and moves an overdue outcome's expiry into the future, the adapter keeps
+  the cached expiry so the closure probe can check the market. A later refresh can apply the new
+  expiry once closure is recorded.
+- **Scheduled expiry** makes an open market eligible for the closure probe. Normal subscriptions can
+  stay active until the probe or a resolution path confirms closure.
+- **Confirmed closure** stops normal quote, trade, and book-delta streams for both outcomes. Gamma's
+  `closed=true` confirms closure even if the payload cannot produce usable instruments. For `v2`,
+  `resolutionStatus="resolved"` also stops these streams when `closed=false`. Closure alone does not
+  establish a winner or emit settlement events. Existing resolution owners remain available for polling
+  or manual recovery. An enabled, unpaused resolution WebSocket may remain until resolution or timeout.
+  Later live subscriptions cannot reopen the closed condition.
+- **Resolution** uses the same apply path for auto-load outcomes, WebSocket `market_resolved` events,
+  automatic polling, and manual requests. Successful resolution emits each admitted owner's event
+  types once, removes those owners and the condition's watch, and releases its WebSocket subscriptions.
+  Existing pending data intents retain their outcome until admission or cancellation. New subscriptions
+  cannot re-enroll the resolved condition. Automatic delivery for pending data subscriptions requires
+  instrument-filter admission.
 
 #### Timeout, reconnect, and reset
 
@@ -2974,6 +2996,9 @@ After `resolve_poll_max_wait_secs`, the watch pauses and releases resolution-onl
 including when polling is disabled. An open market's independent quote, trade, or book subscriptions are
 unaffected by this pause. The client retains settlement metadata and ownership for manual recovery. A manual
 request does not restart the automatic deadline.
+
+An **expiry correction** updates the watch deadline, including for closed markets awaiting settlement.
+If the corrected deadline is in the future, a paused watch can resume its configured automatic resolution paths.
 
 - **Disconnect**: Stops network work.
 - **Reconnect**: Resumes unfinished loading and replays cached, active resolution WebSocket subscriptions.
@@ -3284,6 +3309,7 @@ Class/struct: `PolymarketExecutionClientConfig`.
 | `signature_type`                                    | `Eoa`                 | `Eoa`, `PolyProxy`, `PolyGnosisSafe`, or `Poly1271`.                                                                  |
 | `signer_type`                                       | `Owner`               | `Owner` or `Session`; sessions require explicit credentials and `Poly1271`.                                           |
 | `base_url_http`, `base_url_ws`, `base_url_data_api` | `None`                | Override the respective production endpoint.                                                                          |
+| `base_url_gamma`                                    | `None`                | Override the Gamma endpoint used to load wallet instruments during connect.                                           |
 | `proxy_url`                                         | `None`                | HTTP or HTTPS proxy for every execution transport.                                                                    |
 | `http_timeout_secs`                                 | `60`                  | HTTP timeout in seconds.                                                                                              |
 | `max_retries`                                       | `3`                   | Retries for single-order submit/cancel requests and for each batch-cancel chunk.                                      |
@@ -3323,7 +3349,7 @@ After such a failure, explicitly disconnect and reconnect the client to restore 
 
 Set `proxy_url` to apply one HTTP or HTTPS proxy to every transport owned by that client. The data
 client routes CLOB HTTP, Gamma HTTP, Data API HTTP, the market WebSocket pool, and PolyBolt through the
-proxy. The execution client routes authenticated CLOB HTTP, Data API HTTP, and the authenticated
+proxy. The execution client routes authenticated CLOB HTTP, Gamma HTTP, Data API HTTP, and the authenticated
 user WebSocket through it. Configure the same value on both clients when running data and execution
 together.
 
@@ -3351,6 +3377,24 @@ For unmapped open orders and positions inside either scope, the adapter checks t
 CLOB after applying account ownership, instrument filters, and position dust and resolved-balance
 exclusions. It skips rows for unsupported markets with a warning. An unmapped supported `v1` or `v2` row
 or a failed version lookup still fails the report request.
+
+During each connection setup, including when startup reconciliation is disabled, the execution client reads
+the wallet's open orders and, for `Owner` signers, its positions, and applies these scope rules. It loads
+missing supported `v1` and `v2` instruments by condition ID from open and closed Gamma markets, independently
+of discovery filters, and emits them as instrument events. `LiveNode::run()` caches them before startup
+reconciliation, and instrument subscribers receive them. The adapter does not subscribe to market data for
+them.
+
+- **Failures**: A failed lookup, a lookup that exceeds 15 seconds, or missing Gamma metadata logs a warning
+  and does not fail the connection. Startup reconciliation fails for an in-scope open order or position whose
+  instrument is still missing. If the node's `timeout_connection` expires during the lookup, startup fails with
+  an `exec-connect timeout` instead.
+- **Large wallets**: The client checks each missing market on CLOB in turn, so a wallet with many markets
+  outside discovery can exceed the budget. Set `load_ids` or widen discovery to cover those markets.
+- **Timing**: The client loads instruments only for records that exist at connect.
+
+The cache includes metadata needed to understand existing exposure. Strategies must apply their own
+entry scope rather than treating every cached or published instrument as an entry candidate.
 
 Cached open orders and positions without explicit supported protocol metadata are skipped with a warning.
 Confirmed trades on those instruments fail fill-report generation. Reload old cached instruments before trading.

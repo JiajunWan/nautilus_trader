@@ -54,16 +54,18 @@ use crate::{
     common::{
         consts::{OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE},
         enums::{
-            OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXGreeksType,
-            OKXInstrumentStatus, OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
-            OKXSide, OKXTargetCurrency, OKXTriggerType,
+            OKXAdvanceOrderType, OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction,
+            OKXCandleConfirm, OKXGreeksType, OKXInstrumentStatus, OKXInstrumentType,
+            OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXSide, OKXTargetCurrency,
+            OKXTriggerType,
         },
         models::OKXInstrument,
         parse::{
-            determine_order_type_with_alt, is_market_price, okx_channel_to_bar_spec,
-            okx_status_to_market_action, parse_fee, parse_fee_currency, parse_funding_rate_msg,
-            parse_instrument_any, parse_instrument_id, parse_message_vec,
-            parse_millisecond_timestamp, parse_parent_client_order_id, parse_price, parse_quantity,
+            decode_messages, determine_order_type_with_alt, is_market_price,
+            okx_channel_to_bar_spec, okx_status_to_market_action, parse_decoded_messages,
+            parse_fee, parse_fee_currency, parse_funding_rate_msg, parse_instrument_any,
+            parse_instrument_id, parse_message_vec, parse_millisecond_timestamp,
+            parse_parent_client_order_id, parse_price, parse_quantity,
             parse_spread_order_status_report as parse_common_spread_order_status_report,
             venue_position_id,
         },
@@ -765,17 +767,26 @@ pub fn parse_trade_msg_vec(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<Data>> {
-    parse_message_vec(
-        data,
-        |msg| {
-            parse_trade_msg(
-                msg,
-                *instrument_id,
-                price_precision,
-                size_precision,
-                ts_init,
-            )
-        },
+    let messages = decode_messages(data)?;
+    parse_trades(
+        &messages,
+        *instrument_id,
+        price_precision,
+        size_precision,
+        ts_init,
+    )
+}
+
+pub(crate) fn parse_trades(
+    messages: &[OKXTradeMsg],
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<Data>> {
+    parse_decoded_messages(
+        messages,
+        |msg| parse_trade_msg(msg, instrument_id, price_precision, size_precision, ts_init),
         Data::Trade,
     )
 }
@@ -809,9 +820,19 @@ pub fn parse_index_price_msg_vec(
     price_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<Data>> {
-    parse_message_vec(
-        data,
-        |msg| parse_index_price_msg(msg, *instrument_id, price_precision, ts_init),
+    let messages = decode_messages(data)?;
+    parse_index_prices(&messages, *instrument_id, price_precision, ts_init)
+}
+
+pub(crate) fn parse_index_prices(
+    messages: &[OKXIndexPriceMsg],
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<Data>> {
+    parse_decoded_messages(
+        messages,
+        |msg| parse_index_price_msg(msg, instrument_id, price_precision, ts_init),
         Data::IndexPrice,
     )
 }
@@ -1749,6 +1770,14 @@ fn parse_algo_order_fields(msg: &OKXAlgoOrderMsg) -> anyhow::Result<AlgoOrderFie
                     ord_px,
                 })
             }
+        }
+        OKXAlgoOrderType::Trigger if msg.advance_ord_type == Some(OKXAdvanceOrderType::Chase) => {
+            Ok(AlgoOrderFields {
+                order_type: OrderType::StopMarket,
+                trigger_px: msg.trigger_px.as_str(),
+                trigger_px_type: msg.trigger_px_type,
+                ord_px: "",
+            })
         }
         OKXAlgoOrderType::Trigger => Ok(AlgoOrderFields {
             order_type: if is_market_price(&msg.ord_px) {
@@ -6219,7 +6248,7 @@ mod tests {
         let instrument = create_stub_instrument();
         let inst = InstrumentAny::CryptoPerpetual(instrument);
         let account_id = AccountId::new("OKX-001");
-        let ts_init = UnixNanos::from(999_000_000_000u64);
+        let ts_init = UnixNanos::from(999_000_000_000_u64);
 
         let mut msg = create_stub_order_msg("", Some("0".to_string()), "123456", "");
         msg.avg_px = String::new();
@@ -6317,7 +6346,7 @@ mod tests {
         let instrument = create_stub_instrument();
         let inst = InstrumentAny::CryptoPerpetual(instrument);
         let account_id = AccountId::new("OKX-001");
-        let ts_init = UnixNanos::from(999_000_000_000u64);
+        let ts_init = UnixNanos::from(999_000_000_000_u64);
 
         let msg = OKXAlgoOrderMsg {
             algo_id: "algo_1".to_string(),
@@ -6361,6 +6390,8 @@ mod tests {
             fee: None,
             fee_ccy: None,
             advance_ord_type: None,
+            adv_chase_params: Vec::new(),
+            sub_algo_id_list: Vec::new(),
         };
 
         let report = parse_algo_order_status_report(&msg, &inst, account_id, ts_init).unwrap();
@@ -6415,6 +6446,8 @@ mod tests {
             fee: None,
             fee_ccy: None,
             advance_ord_type: None,
+            adv_chase_params: Vec::new(),
+            sub_algo_id_list: Vec::new(),
         }
     }
 
@@ -7183,7 +7216,7 @@ mod tests {
         assert_eq!(msgs.len(), 2);
 
         let instrument_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
-        let ts_init = UnixNanos::from(1_711_612_900_000_000_000u64);
+        let ts_init = UnixNanos::from(1_711_612_900_000_000_000_u64);
         let greeks =
             parse_option_summary_greeks(&msgs[0], &instrument_id, OKXGreeksType::Bs, ts_init)
                 .expect("parse failed");
@@ -7202,7 +7235,7 @@ mod tests {
         assert_eq!(greeks.convention, GreeksConvention::BlackScholes);
         assert_eq!(
             greeks.ts_event,
-            UnixNanos::from(1_711_612_800_000_000_000u64)
+            UnixNanos::from(1_711_612_800_000_000_000_u64)
         );
         assert_eq!(greeks.ts_init, ts_init);
     }
@@ -7240,7 +7273,7 @@ mod tests {
             serde_json::from_str(&json_str).expect("Failed to deserialize opt-summary fixture");
 
         let instrument_id = InstrumentId::from("BTC-USD-250328-92000-P.OKX");
-        let ts_init = UnixNanos::from(1_711_612_900_000_000_000u64);
+        let ts_init = UnixNanos::from(1_711_612_900_000_000_000_u64);
         let greeks =
             parse_option_summary_greeks(&msgs[1], &instrument_id, OKXGreeksType::Bs, ts_init)
                 .expect("parse failed");
@@ -7256,7 +7289,7 @@ mod tests {
         assert_eq!(msgs.len(), 2);
 
         let instrument_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
-        let ts_init = UnixNanos::from(1_711_612_900_000_000_000u64);
+        let ts_init = UnixNanos::from(1_711_612_900_000_000_000_u64);
         let greeks =
             parse_option_summary_greeks(&msgs[0], &instrument_id, OKXGreeksType::Pa, ts_init)
                 .expect("parse failed");
@@ -7281,7 +7314,7 @@ mod tests {
             serde_json::from_str(&json_str).expect("Failed to deserialize opt-summary fixture");
 
         let instrument_id = InstrumentId::from("BTC-USD-250328-92000-P.OKX");
-        let ts_init = UnixNanos::from(1_711_612_900_000_000_000u64);
+        let ts_init = UnixNanos::from(1_711_612_900_000_000_000_u64);
         let greeks =
             parse_option_summary_greeks(&msgs[1], &instrument_id, OKXGreeksType::Pa, ts_init)
                 .expect("parse failed");
@@ -7299,7 +7332,7 @@ mod tests {
 
         let call_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
         let put_id = InstrumentId::from("BTC-USD-250328-92000-P.OKX");
-        let ts_init = UnixNanos::from(1_711_612_900_000_000_000u64);
+        let ts_init = UnixNanos::from(1_711_612_900_000_000_000_u64);
 
         // Subscribe to CALL only
         let mut subs = AHashSet::new();

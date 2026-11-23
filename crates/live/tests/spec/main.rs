@@ -21,6 +21,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    ops::{Deref, DerefMut},
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
     sync::atomic::Ordering,
@@ -76,9 +77,18 @@ use startup::{
 const AAPL_ACCOUNT_ID: &str = "XNAS-001";
 const AAPL_STRATEGY_ID: &str = "AAPL-001";
 
+// Cucumber moves the world by value through nested futures
 #[derive(Debug, World)]
 #[world(init = Self::new)]
-struct StartupWorld {
+struct StartupWorld(Box<StartupState>);
+
+const _: () = assert!(
+    size_of::<StartupWorld>() == size_of::<usize>(),
+    "Cucumber world must remain pointer-sized"
+);
+
+#[derive(Debug)]
+struct StartupState {
     config: LiveNodeConfig,
     instrument: Option<InstrumentAny>,
     behavior: StartupMassStatusBehavior,
@@ -100,7 +110,7 @@ struct StartupWorld {
 
 impl StartupWorld {
     fn new() -> Self {
-        Self {
+        Self(Box::new(StartupState {
             config: LiveNodeConfig {
                 logging: LoggerConfig {
                     stdout_level: log::LevelFilter::Off,
@@ -126,7 +136,21 @@ impl StartupWorld {
             observation: Rc::new(RefCell::new(None)),
             result: None,
             position_count: None,
-        }
+        }))
+    }
+}
+
+impl Deref for StartupWorld {
+    type Target = StartupState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for StartupWorld {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -1188,7 +1212,7 @@ impl Drop for StartupNodeGuard {
 
 #[tokio::test(flavor = "current_thread")]
 async fn node_disposes_after_panicking_step() {
-    let config = StartupWorld::new().config;
+    let config = StartupWorld::new().0.config;
     let node = LiveNodeBuilder::from_config(config)
         .unwrap()
         .build()

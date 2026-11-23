@@ -22,7 +22,7 @@ The Rust crate also exposes `CoinApiHttpClient` and `CoinApiWebSocketClient` for
 
 ## Examples
 
-- [Backtest with Pre-IPO Order Book Data (CoinAPI)](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/backtest_orderbook_coinapi.py)
+- [Backtest with Pre-IPO Order Book Data (CoinAPI)](../tutorials/backtest_orderbook_coinapi.md)
 - [Python examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/coinapi/)
 - [Rust examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/coinapi/examples/)
 
@@ -460,8 +460,27 @@ throughout the client's lifetime and is separate from CoinAPI billing. Each REST
 
 CoinAPI bills historical requests per 100 returned records. Thus, a successful historical page refunds the
 unused reservation above `ceil(records / 100)`. The local minimum charge is one credit. Failed, retried, and
-canceled attempts are not refunded. The client backs off on HTTP 429 and fails promptly on HTTP 403. See the
-[API limits reference](https://www.coinapi.io/products/market-data-api/docs/api-limits-and-billing-metrics?ref=nautilus).
+canceled attempts are not refunded.
+See the [API limits reference](https://www.coinapi.io/products/market-data-api/docs/api-limits-and-billing-metrics?ref=nautilus).
+
+### REST request pacing
+
+Set a positive `min_request_interval_ms` to space REST attempts across endpoints, retries, and
+history pages on one client. Pacing is off by default. With a 10-request-per-minute organization
+limit, `7_000` ms allows at most nine starts per rolling minute per client. Divide that limit among
+clients and jobs.
+
+The client backs off on HTTP 429 and fails promptly on HTTP 403. For HTTP 429, 500, 502, 503, or 504,
+`Retry-After` in seconds or HTTP-date format starts a REST cooldown if the deadline fits the local
+clock. The cooldown starts at header arrival and gates later attempts on the same client, even with
+retries disabled or a failed body read or decode.
+
+Attempts wait until both pacing and cooldown allow them. These waits use the total call budget. The
+client sleeps without a concurrency slot and reserves credits on admission. Flat Files use separate
+retry delays, and WebSocket uses its own controls.
+
+After the HTTP wait returns, `DEBUG` logs the admission wait (concurrency, pacing, and cooldown), HTTP
+time, status if available, and remaining local credits.
 
 ### Backfills
 
@@ -576,6 +595,7 @@ The loader accepts these optional HTTP keywords:
 | `proxy_url`               | Explicit HTTP(S) proxy for REST and Flat Files.               |
 | `timeout_secs`            | Per-attempt deadline, including admission and body streaming. |
 | `max_concurrent_requests` | Shared limit for REST requests and file downloads.            |
+| `min_request_interval_ms` | Optional minimum spacing between REST attempt starts.         |
 | `credit_budget`           | Lifetime local REST credit allowance.                         |
 | `max_retries`             | Maximum retries for each HTTP request or download.            |
 | `retry_delay_initial_ms`  | Initial retry delay.                                          |
@@ -594,8 +614,11 @@ and size precision and reject values requiring rounding. Consolidated bar volume
 - `download_flat_file(bucket, object_key, filepath)` streams a selected S3 object to disk without
   requiring instrument definitions. Authentication and HTTP controls come from the loader constructor.
 - `request_book_snapshot`, `request_quotes`, `request_trades`, and `request_bars` fetch Nautilus objects
-  directly. Historical methods take integer UNIX nanoseconds with `[start, end)` bounds and an optional
-  positive limit. Bars must close within the window and by the current time.
+  directly. Historical methods take timezone-aware `datetime` bounds in `[start, end)` and an optional
+  positive limit. Bounds keep microsecond precision; use a `datetime.timezone` offset, such as
+  `datetime.UTC`, or a `zoneinfo.ZoneInfo` zone. A naive bound raises `TypeError` and a pre-epoch
+  bound raises `ValueError`, before any request. Bars must close within the window and by the
+  current time.
 
 REST history raises if the credit budget truncates retrieval or any record fails conversion. It returns
 no partial result. Each loader shares its configured credit allowance across all REST calls.
@@ -606,6 +629,8 @@ The loader does not provide historical book deltas through REST.
 CoinAPI [Flat Files](https://www.coinapi.io/products/flat-files?ref=nautilus) are daily or hourly `.csv.gz`
 exports served over an S3-compatible API. `CoinApiDataLoader` downloads selected objects and reads local
 files using registered instrument definitions. It does not list S3 objects.
+A registered definition can describe an exchange outside the [symbol mappings](#symbol-mappings),
+such as Lighter. See the [pre-IPO order book tutorial](../tutorials/backtest_orderbook_coinapi.md).
 Each `load_*` method returns a whole file, and each `stream_*` method yields chunks. Both accept a record
 `limit`.
 
@@ -708,6 +733,15 @@ hold one symbol under
 `T-{SCHEMA}/D-{YYYYMMDD|YYYYMMDDHH}/E-{EXCHANGE}/IDDI-{ID}+SC-{SYMBOL_ID}+S-{EXCHANGE_SYMBOL}.csv.gz`.
 Pass an explicit `instrument_id` for each file.
 
+| Key part              | Example                         | Meaning                                                         |
+| --------------------- | ------------------------------- | --------------------------------------------------------------- |
+| `T-{SCHEMA}`          | `T-LIMITBOOK_FULL`              | Full-book dataset: a snapshot followed by all recorded updates. |
+| `D-{YYYYMMDDHH}`      | `D-2026100100`                  | UTC date and hour: `[00:00, 01:00)` on 2026-10-01.              |
+| `E-{EXCHANGE}`        | `E-LIGHTER`                     | Exchange.                                                       |
+| `IDDI-{ID}`           | `IDDI-47534074`                 | CoinAPI numeric symbol ID.                                      |
+| `SC-{SYMBOL_ID}`      | `SC-LIGHTER_PERP_ANTHROPIC_USD` | CoinAPI symbol ID.                                              |
+| `S-{EXCHANGE_SYMBOL}` | `S-ANTHROPIC`                   | Exchange symbol.                                                |
+
 The loaders accept named book updates and numeric codes: `0=ADD`, `1=SUB`, `2=SET`, `3=DELETE`, and
 `4=MATCH`. Snapshots require the named `SNAPSHOT` update. CoinAPI also documents export variants with comma
 delimiters or full date-time book timestamps. These loaders require semicolon delimiters and time-of-day
@@ -739,9 +773,11 @@ deltas. For example, Coinbase spot files contain order IDs, while Binance spot f
 Use the corresponding `BookType` when applying the deltas.
 
 The initial snapshot emits a `Clear` followed by `Add` deltas, all flagged `F_SNAPSHOT`. Subsequent updates at
-one exchange timestamp form one event ending in `F_LAST`. Streaming chunks normally end at event boundaries
-and can exceed `chunk_size`. A record `limit` can cut the final event short. Its last delta still carries
-`F_LAST`, so a limited load can leave an incomplete book.
+one exchange timestamp form one event ending in `F_LAST`. Level updates can have separate timestamps,
+so `F_LAST` marks the end of a loader event, not an atomic venue update. Streaming chunks normally end at
+event boundaries and can exceed `chunk_size`, which defaults to 100,000 deltas in Python. A record `limit`
+can cut the final event short. Its last delta still carries `F_LAST`, so a limited load can leave an
+incomplete book.
 
 L3 fill updates reduce an order's remaining size and remove it at zero. A later add can reuse an
 order ID after deletion. Updates to unknown orders, other than deletes, are logged and skipped.
@@ -789,6 +825,7 @@ is `COINAPI`. A custom client name becomes its client ID.
 | `max_retries`                | `3`       | Maximum retries for a failed REST request.                  |
 | `http_timeout_secs`          | `30`      | Per-attempt REST timeout, including concurrency admission.  |
 | `max_concurrent_requests`    | `1`       | Maximum simultaneous REST requests.                         |
+| `min_request_interval_ms`    | `None`    | Minimum spacing between REST attempt starts.                |
 | `retry_delay_initial_ms`     | 1,000     | Initial REST retry delay.                                   |
 | `retry_delay_max_ms`         | 10,000    | Maximum REST backoff; provider retry delays can exceed it.  |
 | `retry_max_elapsed_ms`       | 120,000   | Total budget per REST GET, including admission and retries. |
@@ -807,9 +844,9 @@ reports whether an explicit proxy is configured.
 
 `credit_budget`, `max_concurrent_requests`, `retry_max_elapsed_ms`, and `http_timeout_secs` must be positive.
 Each historical page has its own REST retry budget. The initial retry delay must be positive, and the maximum
-must be at least the initial delay. Invalid backoff settings fail at client construction. The per-attempt
-timeout includes waiting for concurrency admission and does not include retry delays. The total elapsed budget
-includes both.
+must be at least the initial delay. Invalid backoff or pacing settings fail at client construction. The
+per-attempt timeout covers concurrency admission and HTTP. Pacing, cooldown, and retry waits count toward
+the total elapsed budget.
 
 ### Python configuration
 

@@ -23,15 +23,17 @@ use nautilus_core::UnixNanos;
 pub(super) fn bench_integer_corpus(c: &mut Criterion) {
     let mut group = c.benchmark_group("nanos_corpus/integer");
 
-    for width in 16..=19usize {
-        let modulus = 10u64.pow(u32::try_from(width).unwrap());
-        let inputs: Vec<String> = (0..64u64)
+    for width in 16..=19_usize {
+        let modulus = 10_u64.pow(u32::try_from(width).unwrap());
+
+        let inputs: Vec<String> = (0..64_u64)
             .map(|seed| {
                 let value = if seed.is_multiple_of(8) {
                     seed
                 } else {
                     (1_707_578_323_456_789_123 + seed * 982_451_653) % modulus
                 };
+
                 format!("{value:0width$}")
             })
             .collect();
@@ -43,6 +45,7 @@ pub(super) fn bench_integer_corpus(c: &mut Criterion) {
                 input.parse::<u64>().unwrap()
             );
         }
+
         group.throughput(Throughput::Elements(width as u64));
         group.bench_with_input(BenchmarkId::from_parameter(width), &inputs, |b, inputs| {
             let mut cursor = 0;
@@ -53,6 +56,7 @@ pub(super) fn bench_integer_corpus(c: &mut Criterion) {
             });
         });
     }
+
     group.finish();
 }
 
@@ -98,5 +102,6 @@ pub(super) fn bench_fallback_controls(c: &mut Criterion) {
             b.iter(|| black_box(black_box(input).parse::<UnixNanos>()));
         });
     }
+
     group.finish();
 }

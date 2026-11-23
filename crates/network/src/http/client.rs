@@ -20,7 +20,7 @@ use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc, time::Dura
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use http::{
-    Method,
+    Method, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use http_body_util::Full;
@@ -363,6 +363,35 @@ impl HttpClient {
             .await
     }
 
+    /// Sends a GET request with query parameters and optional request headers.
+    ///
+    /// Calls `on_headers` with the final response status and headers before reading the body.
+    /// The buffered response uses the client's body size limits and content decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or times out, or if the body cannot be read or decoded.
+    pub async fn get_with_params_on_headers<P: serde::Serialize>(
+        &self,
+        url: &str,
+        params: &P,
+        headers: Option<HashMap<String, String>>,
+        on_headers: impl FnOnce(StatusCode, &HeaderMap),
+    ) -> Result<HttpResponse, HttpClientError> {
+        self.await_rate_limits(None).await;
+        // Keep the callback out of the shared buffered request future to limit its size
+        let headers = self.client.buffered_request_headers(headers);
+        let stream = self
+            .client
+            .send_stream_internal(Method::GET, url, Some(params), Some(headers), None, None)
+            .await?;
+        on_headers(stream.status(), stream.headers());
+        self.client
+            .consume_response(stream.response, stream.deadline, false)
+            .await
+            .map_err(|e| response_error(e, stream.origin.as_deref()))
+    }
+
     /// Sends a GET request and returns its response body as a stream.
     ///
     /// Returns raw body chunks without content decoding or adding `Accept-Encoding`.
@@ -639,6 +668,21 @@ impl InnerHttpClient {
         body: Option<RequestBody>,
         timeout_secs: Option<u64>,
     ) -> Result<HttpResponse, HttpClientError> {
+        let headers = self.buffered_request_headers(headers);
+        let is_head = method == Method::HEAD;
+        let stream = self
+            .send_stream_internal(method, url, query, Some(headers), body, timeout_secs)
+            .await?;
+        let result = self
+            .consume_response(stream.response, stream.deadline, is_head)
+            .await;
+        result.map_err(|e| response_error(e, stream.origin.as_deref()))
+    }
+
+    fn buffered_request_headers(
+        &self,
+        headers: Option<HashMap<String, String>>,
+    ) -> HashMap<String, String> {
         let mut headers = headers.unwrap_or_default();
         let has_accept_encoding = headers
             .keys()
@@ -649,14 +693,7 @@ impl InnerHttpClient {
             headers.insert(http::header::ACCEPT_ENCODING.to_string(), GZIP.to_string());
         }
 
-        let is_head = method == Method::HEAD;
-        let stream = self
-            .send_stream_internal(method, url, query, Some(headers), body, timeout_secs)
-            .await?;
-        let result = self
-            .consume_response(stream.response, stream.deadline, is_head)
-            .await;
-        result.map_err(|e| response_error(e, stream.origin.as_deref()))
+        headers
     }
 
     async fn send_stream_internal<Q: serde::Serialize>(
@@ -1360,7 +1397,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
+            let mut chunk = [0_u8; 1024];
             loop {
                 let read = stream.read(&mut chunk).await.unwrap();
                 if read == 0 {
@@ -1393,7 +1430,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
+            let mut chunk = [0_u8; 1024];
             loop {
                 let read = stream.read(&mut chunk).await.unwrap();
                 if read == 0 {

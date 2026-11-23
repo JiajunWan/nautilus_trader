@@ -359,6 +359,7 @@ pub struct SimulatedVenueConfig {
     #[builder(default = false)]
     pub liquidation_enabled: bool,
     /// The equity-to-maintenance-margin ratio at or below which liquidation triggers.
+    /// The comparison uses the ratio's shortest round-trip decimal representation.
     #[builder(default = 1.0)]
     pub liquidation_trigger_ratio: f64,
     /// If open orders are canceled before liquidating positions.
@@ -544,6 +545,7 @@ pub struct BacktestVenueConfig {
     liquidation_enabled: bool,
     /// The ratio of equity to maintenance margin at which liquidation is triggered.
     /// A value of 1.0 means liquidation triggers when equity <= `maintenance_margin`.
+    /// The comparison uses the ratio's shortest round-trip decimal representation.
     #[builder(default = 1.0)]
     liquidation_trigger_ratio: f64,
     /// If open orders should be canceled before closing positions during liquidation.
@@ -1730,8 +1732,8 @@ mod tests {
     fn test_inverted_time_range_rejected() {
         let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
-            .start_time(UnixNanos::from(5_000_000_000u64))
-            .end_time(UnixNanos::from(1_000_000_000u64))
+            .start_time(UnixNanos::from(5_000_000_000_u64))
+            .end_time(UnixNanos::from(1_000_000_000_u64))
             .build();
         assert!(matches!(result, Err(ConfigError::Range { field, .. }) if field == "start_time"));
     }
@@ -1740,8 +1742,8 @@ mod tests {
     fn test_equal_time_range_accepted() {
         let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
-            .start_time(UnixNanos::from(1_000_000_000u64))
-            .end_time(UnixNanos::from(1_000_000_000u64))
+            .start_time(UnixNanos::from(1_000_000_000_u64))
+            .end_time(UnixNanos::from(1_000_000_000_u64))
             .build();
         assert!(result.is_ok());
     }
@@ -1771,8 +1773,8 @@ mod tests {
     #[rstest]
     fn test_data_config_multiple_violations_collected() {
         let result = data_builder!(NautilusDataType::QuoteTick, String::new())
-            .start_time(UnixNanos::from(5_000_000_000u64))
-            .end_time(UnixNanos::from(1_000_000_000u64))
+            .start_time(UnixNanos::from(5_000_000_000_u64))
+            .end_time(UnixNanos::from(1_000_000_000_u64))
             .build();
         let ConfigError::Multiple { errors } = result.unwrap_err() else {
             panic!("expected ConfigError::Multiple");
@@ -1980,8 +1982,8 @@ mod tests {
         let result = BacktestRunConfig::builder()
             .venues(vec![minimal_venue()])
             .data(vec![])
-            .start(UnixNanos::from(5_000_000_000u64))
-            .end(UnixNanos::from(1_000_000_000u64))
+            .start(UnixNanos::from(5_000_000_000_u64))
+            .end(UnixNanos::from(1_000_000_000_u64))
             .build();
         assert!(matches!(result, Err(ConfigError::Range { field, .. }) if field == "start"));
     }
@@ -1991,8 +1993,8 @@ mod tests {
         let result = BacktestRunConfig::builder()
             .venues(vec![minimal_venue()])
             .data(vec![])
-            .start(UnixNanos::from(1_000_000_000u64))
-            .end(UnixNanos::from(1_000_000_000u64))
+            .start(UnixNanos::from(1_000_000_000_u64))
+            .end(UnixNanos::from(1_000_000_000_u64))
             .build();
         assert!(result.is_ok());
     }
@@ -2048,8 +2050,8 @@ mod tests {
         let result = BacktestRunConfig::builder()
             .venues(vec![])
             .data(vec![])
-            .start(UnixNanos::from(5_000_000_000u64))
-            .end(UnixNanos::from(1_000_000_000u64))
+            .start(UnixNanos::from(5_000_000_000_u64))
+            .end(UnixNanos::from(1_000_000_000_u64))
             .build();
         let ConfigError::Multiple { errors } = result.unwrap_err() else {
             panic!("expected ConfigError::Multiple");

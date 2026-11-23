@@ -29,13 +29,13 @@ impl DataEngine {
         !self.config.disable_historical_cache
     }
 
-    pub(crate) fn handle_instrument(&mut self, instrument: &InstrumentAny) {
+    pub(crate) fn handle_instrument(&mut self, instrument: &InstrumentAny, is_live: bool) {
         if self.cache_instrument(instrument) {
-            self.publish_instrument(instrument);
+            self.publish_instrument(instrument, is_live);
         }
     }
 
-    pub(crate) fn cache_instrument(&self, instrument: &InstrumentAny) -> bool {
+    pub(crate) fn cache_instrument(&mut self, instrument: &InstrumentAny) -> bool {
         log::debug!("Handling instrument: {}", instrument.id());
 
         if let Err(e) = self
@@ -55,15 +55,20 @@ impl DataEngine {
             }
         }
 
+        if instrument.option_kind().is_none() {
+            self.option_chain_instruments_expired
+                .remove(&instrument.id());
+        }
+
         true
     }
 
-    pub(crate) fn publish_instrument(&mut self, instrument: &InstrumentAny) {
+    pub(crate) fn publish_instrument(&mut self, instrument: &InstrumentAny, is_live: bool) {
         let topic = switchboard::get_instrument_topic(instrument.id());
         log::debug!("Publishing instrument to topic: {topic}");
         msgbus::publish_instrument(topic, instrument);
 
-        self.update_option_chains(instrument);
+        self.update_option_chains(instrument, is_live);
     }
 
     pub(super) fn handle_delta(&mut self, delta: OrderBookDelta) {
@@ -203,16 +208,15 @@ impl DataEngine {
 
         let topic = switchboard::get_instrument_status_topic(status.instrument_id);
         msgbus::publish_any(topic, &status);
-
-        if self
-            .option_chain_instrument_index
-            .contains_key(&status.instrument_id)
-            && matches!(
-                status.action,
-                MarketStatusAction::Close | MarketStatusAction::NotAvailableForTrading
-            )
-        {
+        if matches!(
+            status.action,
+            MarketStatusAction::Close | MarketStatusAction::NotAvailableForTrading
+        ) {
             self.expire_option_chain_instrument(status.instrument_id);
+            self.drain_deferred_commands();
+        } else if status.action == MarketStatusAction::Trading {
+            self.option_chain_instruments_expired
+                .remove(&status.instrument_id);
         }
     }
 

@@ -62,6 +62,7 @@ pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
     inferred_reconciliation_trade_ids, is_inferred_reconciliation_trade_id_format,
 };
+pub(crate) use orders::needs_external_order_price_placeholder;
 pub use orders::{
     create_incremental_inferred_fill, create_inferred_fill_for_qty, create_reconciliation_rejected,
     create_reconciliation_triggered, generate_external_order_status_events,
@@ -69,20 +70,27 @@ pub use orders::{
     generate_reconciliation_order_pre_fill_events, generate_reconciliation_order_snapshot_events,
     generate_reconciliation_order_snapshot_events_with_commission,
     incremental_inferred_fill_price_and_liquidity, inferred_fill_price_and_liquidity,
-    preserve_order_amendment, reconcile_fill_report, reconcile_order_report,
-    reconcile_order_report_with_commission, should_reconciliation_update,
+    initialize_external_order_price, preserve_order_amendment, reconcile_fill_report,
+    reconcile_order_report, reconcile_order_report_with_commission, should_reconciliation_update,
 };
-pub(crate) use positions::fill_precedes_reconciled_position;
 pub use positions::{
-    calculate_reconciliation_price, check_position_reconciliation,
-    fill_precedes_snapshot_reconciled_position, position_prices_match,
+    bound_inverse_reconciliation_price, calculate_reconciliation_price,
+    check_position_reconciliation, fill_precedes_snapshot_reconciled_position,
+    inverse_reconciliation_price_ceiling, mark_lifecycle_replacement_fill, position_prices_match,
     process_mass_status_for_reconciliation,
     process_mass_status_for_reconciliation_without_synthetic_reports,
+};
+pub(crate) use positions::{
+    fill_precedes_reconciled_position, is_lifecycle_replacement_fill, is_synthetic_position_fill,
+    snapshot_covering_fill,
 };
 pub use types::ReconciliationResult;
 
 /// Order tag marking a synthetic order that reconciliation creates to align a position.
 pub const RECONCILIATION_ORDER_TAG: &str = "RECONCILIATION";
+
+// Empty records distinguish fills without snapshot coverage from legacy order events
+pub(crate) const SNAPSHOT_COVERING_FILL_ID: &str = "nautilus.snapshot_covering_fill_id";
 
 fn reconciliation_price(value: Decimal, instrument: &InstrumentAny) -> CorrectnessResult<Price> {
     // Reconstructed averages need not lie on price ticks, keep their representable precision

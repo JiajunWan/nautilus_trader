@@ -186,17 +186,18 @@ impl BacktestNode {
                 }
             };
 
-            if let Err(e) = run_result {
-                if config.raise_exception() {
-                    return Err(e);
+            match run_result.and_then(|()| engine.try_get_result()) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    if config.raise_exception() {
+                        return Err(e);
+                    }
+
+                    log::error!("Error running backtest '{}': {e:#}", config.id());
+                    engine.clear_data();
+                    continue;
                 }
-
-                log::error!("Error running backtest '{}': {e:#}", config.id());
-                engine.clear_data();
-                continue;
             }
-
-            results.push(engine.get_result());
 
             if config.dispose_on_completion() {
                 engine.dispose();
@@ -581,6 +582,7 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     loop {
         let chunk = take_aligned_chunk(&mut iter, chunk_size)
             .map_err(|e| end_after_load_failure(engine, started, e))?;
+
         if chunk.is_empty() {
             break;
         }
@@ -1044,8 +1046,8 @@ mod tests {
     fn merge_streams_leaves_its_streams_undrained() {
         // Unbounded streams, so a merge that materialized its input would never return
         let ok_quote: fn(u64) -> anyhow::Result<Data> = |ts_init| Ok(quote(ts_init));
-        let evens = (0u64..).step_by(2).map(ok_quote);
-        let odds = (1u64..).step_by(2).map(ok_quote);
+        let evens = (0_u64..).step_by(2).map(ok_quote);
+        let odds = (1_u64..).step_by(2).map(ok_quote);
 
         let merged: Vec<u64> = merge_rows(vec![evens.peekable(), odds.peekable()])
             .take(4)

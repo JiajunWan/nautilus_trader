@@ -24,9 +24,9 @@ use std::{
     time::Duration,
 };
 
-use jiff::Timestamp;
-use nautilus_common::live::dst::task::JoinError;
-use nautilus_core::{UnixNanos, string::secret::SecretString};
+use jiff::{Timestamp, fmt::rfc2822::DateTimePrinter};
+use nautilus_common::{clients::DataClient, live::dst::task::JoinError};
+use nautilus_core::{UnixNanos, string::secret::SecretString, time::wall_clock_now};
 use nautilus_finfeed::{
     common::symbol::to_instrument_id,
     config::FinFeedDataClientConfig,
@@ -54,6 +54,8 @@ use nautilus_network::{
 };
 use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::polling::capture_diagnostics;
 
 const EXCHANGES: &str = include_str!("../../test_data/exchanges.json");
 pub(super) const POLL_SILENCE: Duration = Duration::from_millis(1_200);
@@ -535,7 +537,7 @@ async fn published_examples_preserve_discovery_and_raw_response_fields() {
                 period_id: Some("10DAY".into()),
                 unit_name: Some("day".into()),
                 unit_count: Some(10),
-                length_seconds: 864000,
+                length_seconds: 864_000,
                 length_months: 0,
                 display_name: Some("10 Days".into()),
             },
@@ -741,6 +743,433 @@ async fn retries_preserve_headers_and_honor_retry_after_and_local_spacing() {
     for request in requests {
         assert_request(&request, "/v1/exchanges", &config);
     }
+}
+
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn retry_after_delays_other_finfeed_requests_without_retries() {
+    let logs = capture_diagnostics();
+    let first_message = logs.lock().unwrap().len();
+    let response_delay = Duration::from_millis(200);
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut released = Some(released);
+    let (peer, mut config, mut observed) = start_peer_waiting(
+        vec![(429, "Retry-After: 1\r\n", EMPTY), (200, "", PERIODS)],
+        move |index| {
+            let released = (index == 0).then(|| released.take().unwrap());
+            async move {
+                if let Some(released) = released {
+                    released.await.unwrap();
+                } else {
+                    time::sleep(response_delay).await;
+                }
+            }
+        },
+        true,
+    )
+    .await;
+
+    config.attempt_budget = 103;
+    config.retry.max_retries = 0;
+    let client = Arc::new(new_client(config.clone()));
+
+    let first = task::spawn({
+        let client = Arc::clone(&client);
+        async move { client.get_exchanges().await }
+    });
+
+    assert_eq!(next_request(&mut observed).await, 0);
+
+    let second = client.get_periods();
+    tokio::pin!(second);
+    poll_fn(|cx| {
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    assert_eq!(client.attempts_remaining(), 102);
+    let started = time::Instant::now();
+    release.send(()).unwrap();
+
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(Error::Http {
+            status: 429,
+            retry_after_secs: Some(1)
+        })
+    ));
+    second.await.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(client.attempts_remaining(), 101);
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_request(&requests[0], "/v1/exchanges", &config);
+    assert_request(&requests[1], "/v1/ohlcv/periods", &config);
+    let logs = logs.lock().unwrap();
+    let logs = &logs[first_message..];
+    assert!(logs.contains(&(
+        log::Level::Warn,
+        "FinFeed received HTTP 429, retry_after_secs=Some(1)".to_owned(),
+    )));
+
+    let (level, diagnostic) = logs
+        .iter()
+        .find(|(_, message)| {
+            message.contains("endpoint=ohlcv-periods ")
+                && message.ends_with("attempts_remaining=101")
+        })
+        .unwrap();
+
+    let fields = diagnostic.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(*level, log::Level::Debug);
+    assert_eq!(
+        fields[..3],
+        ["GET", "provider=FinFeed", "endpoint=ohlcv-periods"]
+    );
+    assert!(
+        fields[3]
+            .strip_prefix("admission_wait_ms=")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 900
+    );
+    let http_elapsed_ms = fields[4]
+        .strip_prefix("http_elapsed_ms=")
+        .unwrap()
+        .parse::<u128>()
+        .unwrap();
+    assert!(
+        (response_delay.as_millis()..900).contains(&http_elapsed_ms),
+        "HTTP elapsed {http_elapsed_ms} ms"
+    );
+    assert_eq!(fields[5..], ["status=Some(200)", "attempts_remaining=101"]);
+}
+
+#[rstest]
+#[case::rate_limit_seconds(429, false)]
+#[case::service_unavailable_date(503, true)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn retry_after_gates_requests_before_a_failed_body_read(
+    #[case] status: u16,
+    #[case] http_date: bool,
+) {
+    let (listener, address) = bind_peer().await;
+    let mut config = FinFeedHttpConfig::builder()
+        .base_url(format!("http://{address}/v1/"))
+        .min_request_interval_ms(1)
+        .max_concurrent_requests(2)
+        .build();
+    config.retry.max_retries = 0;
+    config.retry.operation_timeout_ms = Some(3_500);
+    let client = new_client(config.clone());
+
+    let peer = task::spawn(async move {
+        let (mut stalled, _) = listener.accept().await.unwrap();
+        let first = read_request(&mut stalled).await;
+        let sent = time::Instant::now();
+
+        let (header, delay) = if http_date {
+            let now = Timestamp::try_from(wall_clock_now()).unwrap();
+            let retry_at = Timestamp::from_second(now.as_second() + 2).unwrap();
+            let mut date = String::new();
+            DateTimePrinter::new()
+                .print_timestamp_rfc9110(&retry_at, &mut date)
+                .unwrap();
+            (date, retry_at.duration_since(now).unsigned_abs())
+        } else {
+            ("1".to_owned(), Duration::from_secs(1))
+        };
+
+        let response = format!(
+            "HTTP/1.1 {status} Retry\r\nRetry-After: {header}\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\nConnection: close\r\n\r\n"
+        );
+        stalled.write_all(response.as_bytes()).await.unwrap();
+        stalled.flush().await.unwrap();
+
+        let (mut next, _) = listener.accept().await.unwrap();
+        let second = read_request(&mut next).await;
+        let elapsed = sent.elapsed();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PERIODS}",
+            PERIODS.len()
+        );
+        next.write_all(response.as_bytes()).await.unwrap();
+        next.flush().await.unwrap();
+        stalled.write_all(b"nope").await.unwrap();
+        stalled.flush().await.unwrap();
+        (first, second, elapsed, delay)
+    });
+
+    let second = async {
+        wait_for_condition(|| format!("{client:?}").contains("cooldown: Some(")).await;
+        assert_eq!(client.attempts_remaining(), 99);
+        client.get_periods().await
+    };
+
+    let (first, second) = tokio::join!(client.get_exchanges(), second);
+    assert!(matches!(first, Err(Error::Configuration)));
+    second.unwrap();
+
+    let (first, second, elapsed, delay) = peer.await.unwrap();
+    assert!(
+        elapsed >= delay,
+        "request started after {elapsed:?}, expected {delay:?}"
+    );
+    assert_request(&first, "/v1/exchanges", &config);
+    assert_request(&second, "/v1/ohlcv/periods", &config);
+    assert_eq!(client.attempts_remaining(), 98);
+}
+
+#[cfg(all(feature = "simulation", madsim))]
+#[rstest]
+#[case::completed_body(false)]
+#[case::timed_out_body(true)]
+#[madsim::test]
+async fn retry_after_uses_only_the_delay_remaining_after_the_body(#[case] body_timeout: bool) {
+    let (listener, address) = bind_peer().await;
+    let mut config = FinFeedHttpConfig::builder()
+        .base_url(format!("http://{address}/v1/"))
+        .min_request_interval_ms(1)
+        .build();
+    config.retry.max_retries = 1;
+    config.retry.initial_delay_ms = 10;
+    config.retry.max_elapsed_ms = Some(1_250);
+    if body_timeout {
+        config.retry.operation_timeout_ms = Some(300);
+    }
+
+    let client = new_client(config.clone());
+
+    let peer = task::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let initial = read_request(&mut first).await;
+        let sent = time::Instant::now();
+        first
+            .write_all(b"HTTP/1.1 503 Busy\r\nRetry-After: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        first.flush().await.unwrap();
+
+        if !body_timeout {
+            time::sleep(Duration::from_millis(700)).await;
+            first.write_all(b"busy").await.unwrap();
+            first.flush().await.unwrap();
+        }
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        let retry = read_request(&mut second).await;
+        let elapsed = sent.elapsed();
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+            .await
+            .unwrap();
+        second.flush().await.unwrap();
+        (initial, retry, elapsed)
+    });
+
+    assert_eq!(client.get_exchanges().await.unwrap(), vec![]);
+    let (initial, retry, elapsed) = peer.await.unwrap();
+    assert!((Duration::from_secs(1)..Duration::from_millis(1_250)).contains(&elapsed));
+    assert_request(&initial, "/v1/exchanges", &config);
+    assert_request(&retry, "/v1/exchanges", &config);
+    assert_eq!(client.attempts_remaining(), 98);
+}
+
+#[cfg(all(feature = "simulation", madsim))]
+#[rstest]
+#[case::shorter_then_longer([("Retry-After: 1\r\n", 1), ("Retry-After: 3\r\n", 3)])]
+#[case::longer_then_shorter([("Retry-After: 3\r\n", 3), ("Retry-After: 1\r\n", 1)])]
+fn overlapping_rate_limits_keep_the_later_deadline(#[case] limits: [(&'static str, u64); 2]) {
+    retry_runtime().block_on(async move {
+        let [(first_header, first_secs), (second_header, second_secs)] = limits;
+        let (release_first, first_released) = tokio::sync::oneshot::channel();
+        let (release_second, second_released) = tokio::sync::oneshot::channel();
+        let mut releases = [Some(first_released), Some(second_released)];
+        let (arrival, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+
+        let (peer, mut config, mut observed) = start_peer_waiting(
+            vec![
+                (429, first_header, EMPTY),
+                (429, second_header, EMPTY),
+                (200, "", PERIODS),
+            ],
+            move |index| {
+                arrival.send(time::Instant::now()).unwrap();
+                let released = releases.get_mut(index).and_then(Option::take);
+                async move {
+                    if let Some(released) = released {
+                        released.await.unwrap();
+                    }
+                }
+            },
+            true,
+        )
+        .await;
+
+        config.max_concurrent_requests = 2;
+        config.retry.max_retries = 0;
+        let client = Arc::new(new_client(config.clone()));
+
+        let first = task::spawn({
+            let client = Arc::clone(&client);
+            async move { client.get_exchanges().await }
+        });
+
+        assert_eq!(next_request(&mut observed).await, 0);
+
+        let second = task::spawn({
+            let client = Arc::clone(&client);
+            async move { client.get_exchanges().await }
+        });
+
+        assert_eq!(next_request(&mut observed).await, 1);
+        assert_eq!(client.attempts_remaining(), 98);
+
+        let first_sent = time::Instant::now();
+        release_first.send(()).unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(Error::Http { status: 429, retry_after_secs: Some(seconds) }) if seconds == first_secs
+        ));
+
+        let third = client.get_periods();
+        tokio::pin!(third);
+
+        // Drive the waiter past ordinary pacing before extending its cooldown
+        if first_secs < second_secs {
+            assert!(
+                time::timeout(Duration::from_millis(100), third.as_mut())
+                    .await
+                    .is_err()
+            );
+        }
+
+        assert_eq!(client.attempts_remaining(), 98);
+        let second_sent = time::Instant::now();
+        release_second.send(()).unwrap();
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(Error::Http { status: 429, retry_after_secs: Some(seconds) }) if seconds == second_secs
+        ));
+
+        assert_eq!(client.attempts_remaining(), 98);
+        third.await.unwrap();
+        let requests = peer.await.unwrap();
+        let arrivals: Vec<_> = std::iter::from_fn(|| arrivals.try_recv().ok()).collect();
+        let deadline = (first_sent + Duration::from_secs(first_secs))
+            .max(second_sent + Duration::from_secs(second_secs));
+
+        assert_eq!(client.attempts_remaining(), 97);
+        assert_eq!(requests.len(), 3);
+        assert_request(&requests[0], "/v1/exchanges", &config);
+        assert_request(&requests[1], "/v1/exchanges", &config);
+        assert_request(&requests[2], "/v1/ohlcv/periods", &config);
+        assert_eq!(arrivals.len(), 3);
+        assert!(
+            (deadline..deadline + Duration::from_millis(10)).contains(&arrivals[2]),
+            "third request reached the peer at {:?}, expected {deadline:?}",
+            arrivals[2]
+        );
+    });
+}
+
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn exhausted_budget_takes_precedence_over_cooldown() {
+    let (peer, mut config) = start_peer(vec![(429, "Retry-After: 60\r\n", EMPTY)]).await;
+    config.attempt_budget = 1;
+    config.retry.max_retries = 0;
+    config.retry.operation_timeout_ms = Some(250);
+    let client = new_client(config);
+
+    assert!(matches!(
+        client.get_exchanges().await,
+        Err(Error::Http {
+            status: 429,
+            retry_after_secs: Some(60)
+        })
+    ));
+    assert!(matches!(
+        client.get_periods().await,
+        Err(Error::AttemptBudget)
+    ));
+    assert_eq!(client.attempts_remaining(), 0);
+    assert_eq!(peer.await.unwrap().len(), 1);
+}
+
+#[rstest]
+#[case::cooldown(429, "Retry-After: 1\r\n", Some(1), 1)]
+#[case::spacing(503, "", None, 1_000)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+async fn connect_preserves_the_finfeed_request_deadline_after_bootstrap_failure(
+    #[case] status: u16,
+    #[case] header: &'static str,
+    #[case] retry_after_secs: Option<u64>,
+    #[case] min_request_interval_ms: u64,
+) {
+    let (peer, mut http, mut observed) = start_peer_waiting(
+        vec![
+            (status, header, EMPTY),
+            (200, "", EXCHANGES),
+            (
+                200,
+                "",
+                include_str!("../../test_data/polymarket-market.json"),
+            ),
+        ],
+        |_| std::future::ready(()),
+        false,
+    )
+    .await;
+    http.retry.max_retries = 0;
+    http.min_request_interval_ms = min_request_interval_ms;
+
+    let config = FinFeedDataClientConfig {
+        api_key: Some("test-api-key".into()),
+        http: http.clone(),
+        instruments: vec![FinFeedInstrumentSelection {
+            exchange_id: "POLYMARKET".into(),
+            market_ids: vec!["TEST-OUTCOME_NO".into()],
+        }],
+        ..Default::default()
+    };
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut client =
+        FinFeedDataClient::new(ClientId::new("FINFEED"), config, sender.into()).unwrap();
+    let error = client.connect().await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::Http { status: actual, retry_after_secs: delay })
+            if *actual == status && *delay == retry_after_secs
+    ));
+    assert!(client.is_disconnected());
+    assert_eq!(next_request(&mut observed).await, 0);
+    #[cfg(all(feature = "simulation", madsim))]
+    let started = time::Instant::now();
+    let (result, ()) = tokio::join!(client.connect(), async {
+        assert_eq!(next_request(&mut observed).await, 1);
+        #[cfg(all(feature = "simulation", madsim))]
+        assert!(started.elapsed() >= Duration::from_millis(900));
+    });
+    result.unwrap();
+    assert!(client.is_connected());
+    receiver.try_recv().unwrap();
+    client.disconnect().await.unwrap();
+
+    let requests = peer.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_request(&requests[0], "/v1/exchanges", &http);
+    assert_request(&requests[1], "/v1/exchanges", &http);
+    assert_request(
+        &requests[2],
+        "/v1/markets/POLYMARKET/TEST-OUTCOME_NO",
+        &http,
+    );
 }
 
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
@@ -1768,7 +2197,7 @@ async fn explicit_https_proxy_uses_tls_and_http_proxy_tunnels_https() {
     let (listener, address) = bind_peer().await;
     let tls = task::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut header = [0u8; 5];
+        let mut header = [0_u8; 5];
         stream.read_exact(&mut header).await.unwrap();
         header
     });

@@ -1016,10 +1016,15 @@ snapshot parsing. The shared types describe the result of validation and monitor
   unsubscribe/subscribe pair on the existing socket. See
   [Deribit sequence gap recovery](../integrations/deribit.md#sequence-gap-recovery) for timer
   defaults and live validation.
+- **Kraken**: replaces subscriptions with an unsubscribe/subscribe pair. Spot matches
+  acknowledgements by request ID and queues all book commands and replay in connection order.
+  A confirmed replay can satisfy an in-flight recovery. Futures matches by feed and product,
+  binds writes to the observed connection, and confirms each transition before proceeding. See
+  [Kraken order book recovery](../integrations/kraken.md#order-book-recovery) for defaults and validation.
 
 Adapters fall into two recovery families, which determine the oracle a stress harness can use:
 
-- Push (OKX, Polymarket, Lighter, Hyperliquid, Bybit, Betfair, AX Exchange, Derive, Deribit,
+- Push (OKX, Polymarket, Lighter, Hyperliquid, Bybit, Betfair, AX Exchange, Derive, Deribit, Kraken,
   Coinbase): a replacement resubscribes, and the venue stream delivers the snapshot.
 - Pull (Binance): diff streams stay subscribed. A replacement fetches a REST snapshot, and the
   adapter accepts it only when the buffered diffs continue from its `lastUpdateId` without a gap.
@@ -1126,8 +1131,9 @@ applying them would misstate a position, for example when they miss balance chan
 Pass the venue's average entry price through unrounded as `avg_px_open`, and state how
 reconciliation may use it:
 
-- Nautilus computes a quantity-weighted average of opening fills. Reductions do not change it, and reversal
-  resets it. If the venue average follows those rules, keep the defaults.
+- Nautilus computes a quantity-weighted average of opening fills. For non-premium inverse instruments
+  it uses the harmonic mean. Reductions preserve the average and reversals reset it. Keep the defaults
+  when the venue follows those rules.
 - Call `with_avg_px_open_reconciliation(AvgPxReconciliation::OpeningOnly)` when the venue computes
   the average another way, such as over FIFO lots. Reconciliation then uses it only to open a
   position from flat and never compares it with the cached average.
@@ -1380,6 +1386,8 @@ Do not request an instrument from the venue while generating reports:
   the venue's rate limits.
 - Hidden requests make reconciliation timing and results irreproducible.
 - A failed request cannot be distinguished from an instrument the venue does not have.
+- Startup reconciliation leaves instrument events emitted during report generation queued until it
+  finishes, so it applies the reports without those instruments.
 
 Load what the adapter needs during connect instead.
 
@@ -1413,6 +1421,38 @@ instrument would withhold every other record it returned, so record incompletene
 `reconciliation_instrument_ids` filters reports after the execution engine receives them, so it
 cannot prevent a resolution failure inside an adapter. Keep the adapter's scope in its instrument
 provider configuration.
+
+#### Load account instruments during connect
+
+The data client loads instruments by its discovery settings, which can exclude instruments that the account
+holds. Startup reconciliation skips orders and fills whose instrument is not in the cache. To cover open
+orders and positions outside discovery, load their instruments in the execution client's `connect`:
+
+1. Read the account's open orders and positions, and apply the same scope rules as report generation.
+1. Collect the in-scope records whose instruments the client has not loaded.
+1. Request their definitions in bounded batches by identity, such as market or contract ID. Do not request
+   one definition per record.
+1. Add the definitions to the client's own lookups. Then emit each one as
+   `DataEvent::Data(Data::Instrument(_))` through the data event sender.
+
+Execution clients have a read-only cache view, so emit definitions instead of writing them to the cache.
+`LiveNode::run()` buffers data events while execution clients connect. After every execution client connects,
+it applies the buffered events to the cache and then runs startup reconciliation, so each instrument emitted
+during `connect` is in the cache before the engine applies reports. Return from `connect` without waiting for
+the cache to contain an emitted instrument: the node applies buffered events only after `connect` returns, so
+the wait cannot succeed.
+
+- **Publication**: The data engine publishes emitted instruments to instrument subscribers. Do not subscribe
+  to market data for them, and expect strategies to apply their own entry scope.
+- **Failures**: A failed lookup need not fail `connect`. Bound the lookup well below the node's connection
+  timeout, which also covers data client connection, and log a warning on failure or expiry. Report
+  generation still applies the scope rules above to the missing instrument.
+- **Timing**: The lookup sees only records that exist at connect. A later record whose instrument is not
+  loaded is a miss like any other.
+- **Examples**: [Polymarket](../../crates/adapters/polymarket/src/execution/lifecycle.rs) loads wallet
+  instruments from Gamma, and
+  [Interactive Brokers](../../crates/adapters/interactive_brokers/src/execution/order_state.rs) publishes
+  position instruments.
 
 ### Tracked and external execution updates
 
@@ -2291,6 +2331,10 @@ Shared repository test policy uses `#[rstest]` for Rust test functions, permits
 `#[tokio::test]` for async tests, and rejects arrange/act/assert comments. The
 [testing conventions hook](../../.pre-commit-hooks/check_testing_conventions.sh) enforces these
 repository-wide rules.
+
+Exercise adapter behavior through the same entry points production uses. Keep fixtures and private
+state probes in test-only modules. Use a child test module when a test needs private access, and keep
+production visibility as narrow as its callers require.
 
 #### Fixtures and parser assertions
 

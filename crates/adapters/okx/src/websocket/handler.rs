@@ -53,7 +53,7 @@ use super::{
     error::OKXWsError,
     messages::{
         OKXOrderMsg, OKXSubscription, OKXSubscriptionArg, OKXWebSocketArg, OKXWebSocketError,
-        OKXWsFrame, OKXWsMessage,
+        OKXWsFrame, OKXWsInbound, OKXWsMessage,
     },
     subscription::{is_topic_subscribed, topic_from_subscription_arg, topic_from_websocket_arg},
 };
@@ -146,7 +146,7 @@ pub(super) struct OKXWsFeedHandler {
     inner: Option<Arc<WebSocketClient>>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
-    out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsInbound<OKXWsMessage>>,
     auth_tracker: AuthTracker,
     requires_auth: bool,
     subscriptions_state: SubscriptionState,
@@ -167,7 +167,7 @@ impl OKXWsFeedHandler {
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
         raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
-        out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
+        out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsInbound<OKXWsMessage>>,
         auth_tracker: AuthTracker,
         requires_auth: bool,
         subscriptions_state: SubscriptionState,
@@ -196,8 +196,8 @@ impl OKXWsFeedHandler {
         self.signal.load(Ordering::Acquire)
     }
 
-    pub(super) fn send(&self, msg: OKXWsMessage) -> Result<(), ()> {
-        self.out_tx.send(msg).map_err(|_| ())
+    pub(super) fn send(&self, msg: impl Into<OKXWsInbound<OKXWsMessage>>) -> Result<(), ()> {
+        self.out_tx.send(msg.into()).map_err(|_| ())
     }
 
     async fn send_with_retry(
@@ -258,9 +258,12 @@ impl OKXWsFeedHandler {
         }
     }
 
-    pub(super) async fn next(&mut self) -> Option<OKXWsMessage> {
+    pub(super) async fn next_inbound(
+        &mut self,
+        market_data: bool,
+    ) -> Option<OKXWsInbound<OKXWsMessage>> {
         if let Some(message) = self.pending_messages.pop_front() {
-            return Some(message);
+            return Some(message.into());
         }
 
         let mut poll_raw_next = false;
@@ -381,13 +384,20 @@ impl OKXWsFeedHandler {
 
                 msg = self.raw_rx.recv() => {
                     let event = match msg {
-                        Some(msg) => match Self::parse_raw_message(msg) {
+                        Some(msg) => match Self::parse_raw_frame(msg, market_data) {
                             Some(event) => event,
                             None => continue,
                         },
                         None => {
                             log::debug!("WebSocket stream closed");
                             return None;
+                        }
+                    };
+
+                    let event = match event {
+                        OKXWsInbound::Standard(event) => event,
+                        OKXWsInbound::MarketData { inst_id, data } => {
+                            return Some(OKXWsInbound::MarketData { inst_id, data });
                         }
                     };
 
@@ -402,7 +412,7 @@ impl OKXWsFeedHandler {
                         } => {
                             if code == OKX_SUCCESS_CODE {
                                 self.auth_tracker.succeed();
-                                return Some(OKXWsMessage::Authenticated);
+                                return Some(OKXWsMessage::Authenticated.into());
                             }
 
                             self.auth_tracker.fail(msg.clone());
@@ -416,10 +426,10 @@ impl OKXWsFeedHandler {
                             self.pending_messages.push_back(OKXWsMessage::Error(error));
                         }
                         OKXWsFrame::BookData { arg, action, data } => {
-                            return Some(OKXWsMessage::BookData { arg, action, data });
+                            return Some(OKXWsMessage::BookData { arg, action, data }.into());
                         }
                         OKXWsFrame::RpiBookData { arg, action, data } => {
-                            return Some(OKXWsMessage::RpiBookData { arg, action, data });
+                            return Some(OKXWsMessage::RpiBookData { arg, action, data }.into());
                         }
                         OKXWsFrame::OrderResponse {
                             id, op, code, msg, data,
@@ -440,11 +450,11 @@ impl OKXWsFeedHandler {
 
                             return Some(OKXWsMessage::OrderResponse {
                                 id, op, code, msg, data, client_order_ids,
-                            });
+                            }.into());
                         }
                         OKXWsFrame::Data { arg, data } => {
                             if let Some(output) = self.route_data_message(arg, data) {
-                                return Some(output);
+                                return Some(output.into());
                             }
                         }
                         OKXWsFrame::Error { arg, code, msg } => {
@@ -458,7 +468,7 @@ impl OKXWsFeedHandler {
                                     inst_id: arg.inst_id,
                                     code,
                                     msg,
-                                });
+                                }.into());
                             }
 
                             let error = OKXWebSocketError {
@@ -467,10 +477,10 @@ impl OKXWsFeedHandler {
                                 conn_id: None,
                                 timestamp: self.clock.get_time_ns().as_u64(),
                             };
-                            return Some(OKXWsMessage::Error(error));
+                            return Some(OKXWsMessage::Error(error).into());
                         }
                         OKXWsFrame::Reconnected => {
-                            return Some(OKXWsMessage::Reconnected);
+                            return Some(OKXWsMessage::Reconnected.into());
                         }
                         OKXWsFrame::Subscription {
                             event, arg, code, msg,
@@ -485,7 +495,7 @@ impl OKXWsFeedHandler {
                                     inst_id: arg.inst_id,
                                     code: code.unwrap_or_default(),
                                     msg: msg.unwrap_or_default(),
-                                });
+                                }.into());
                             }
                         }
                         OKXWsFrame::ChannelConnCount { .. } => {}
@@ -802,9 +812,7 @@ impl OKXWsFeedHandler {
         Ok(())
     }
 
-    pub(crate) fn parse_raw_message(
-        msg: tokio_tungstenite::tungstenite::Message,
-    ) -> Option<OKXWsFrame> {
+    fn parse_raw_frame(msg: Message, market_data: bool) -> Option<OKXWsInbound<OKXWsFrame>> {
         match msg {
             tokio_tungstenite::tungstenite::Message::Text(text) => {
                 if text == TEXT_PONG {
@@ -814,17 +822,17 @@ impl OKXWsFeedHandler {
 
                 if text == TEXT_PING {
                     log::trace!("Received ping from OKX (text)");
-                    return Some(OKXWsFrame::Ping);
+                    return Some(OKXWsFrame::Ping.into());
                 }
 
                 if text == RECONNECTED {
                     log::debug!("Received WebSocket reconnection signal");
-                    return Some(OKXWsFrame::Reconnected);
+                    return Some(OKXWsFrame::Reconnected.into());
                 }
                 log::trace!("Received WebSocket message: {text}");
 
-                match serde_json::from_str(&text) {
-                    Ok(ws_event) => match &ws_event {
+                match OKXWsInbound::decode(&text, market_data) {
+                    Ok(OKXWsInbound::Standard(ws_event)) => (match &ws_event {
                         OKXWsFrame::Error { arg, code, msg } => {
                             let level = error_frame_level(arg.as_ref(), code, msg);
                             log::log!(level, "WebSocket error: {code} - {msg}");
@@ -844,6 +852,7 @@ impl OKXWsFeedHandler {
                                      event={event}, code={code}, error={msg}"
                                 );
                             }
+
                             Some(ws_event)
                         }
                         OKXWsFrame::Subscription {
@@ -898,13 +907,15 @@ impl OKXWsFeedHandler {
                                     log::debug!("Order success details: {success_msg}");
                                 }
                             }
+
                             Some(ws_event)
                         }
                         OKXWsFrame::Reconnected => {
                             log::warn!("Unexpected Reconnected event from deserialization");
                             None
                         }
-                    },
+                    }).map(OKXWsInbound::Standard),
+                    Ok(frame) => Some(frame),
                     Err(e) => {
                         log::error!("Failed to parse message: {e}: {text}");
                         None
@@ -913,7 +924,7 @@ impl OKXWsFeedHandler {
             }
             Message::Ping(_payload) => {
                 log::trace!("Received binary ping frame from OKX");
-                Some(OKXWsFrame::Ping)
+                Some(OKXWsFrame::Ping.into())
             }
             Message::Pong(payload) => {
                 log::trace!("Received pong frame from OKX ({} bytes)", payload.len());
@@ -1171,6 +1182,7 @@ mod tests {
         },
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
     use serde_json::json;
 
     use super::*;
@@ -1178,15 +1190,32 @@ mod tests {
         book::{BookChannelScope, BookSequenceOutcome, sync::BookSyncTracker},
         common::{
             consts::OKX_WS_TOPIC_DELIMITER,
-            enums::{OKXBookAction, OKXBookChannel, OKXRpiPermission},
+            enums::{
+                OKXAdvanceOrderType, OKXAlgoOrderStatus, OKXBookAction, OKXBookChannel,
+                OKXChaseType, OKXRpiPermission,
+            },
+            models::OKXChaseParams,
             testing::load_test_json,
         },
         websocket::{
             client::PendingOrderInfo,
             dispatch::{WsDispatchState, dispatch_ws_message},
+            messages::OKXAlgoOrderMsg,
             parse::{FeeCache, FilledQtyCache},
         },
     };
+
+    impl OKXWsFeedHandler {
+        async fn next(&mut self) -> Option<OKXWsMessage> {
+            self.next_inbound(false)
+                .await
+                .and_then(OKXWsInbound::into_standard)
+        }
+
+        pub(crate) fn parse_raw_message(msg: Message) -> Option<OKXWsFrame> {
+            Self::parse_raw_frame(msg, false).and_then(OKXWsInbound::into_standard)
+        }
+    }
 
     fn create_handler() -> OKXWsFeedHandler {
         let signal = Arc::new(AtomicBool::new(false));
@@ -1259,7 +1288,7 @@ mod tests {
 
         let message = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::select! {
-                message = out_rx.recv() => message,
+                message = out_rx.recv() => message.and_then(OKXWsInbound::into_standard),
                 message = handler.next() => panic!("Unexpected handler return: {message:?}"),
             }
         })
@@ -1327,10 +1356,10 @@ mod tests {
             }
 
             [
-                out_rx.recv().await,
-                out_rx.recv().await,
-                out_rx.recv().await,
-                out_rx.recv().await,
+                out_rx.recv().await.and_then(OKXWsInbound::into_standard),
+                out_rx.recv().await.and_then(OKXWsInbound::into_standard),
+                out_rx.recv().await.and_then(OKXWsInbound::into_standard),
+                out_rx.recv().await.and_then(OKXWsInbound::into_standard),
             ]
         })
         .await
@@ -2199,6 +2228,79 @@ mod tests {
     }
 
     #[rstest]
+    #[case::absent(None, None)]
+    #[case::empty(Some(""), None)]
+    #[case::fok(Some("fok"), Some(OKXAdvanceOrderType::Fok))]
+    #[case::ioc(Some("ioc"), Some(OKXAdvanceOrderType::Ioc))]
+    #[case::unknown(Some("newType"), Some(OKXAdvanceOrderType::Other("newType".to_string())))]
+    fn test_decode_algo_order_legacy_advance_type(
+        #[case] wire_type: Option<&str>,
+        #[case] expected: Option<OKXAdvanceOrderType>,
+    ) {
+        let frame: Value = serde_json::from_str(&load_test_json("ws_orders_algo.json")).unwrap();
+        let mut value = frame["data"][0].clone();
+        if let Some(wire_type) = wire_type {
+            value["advanceOrdType"] = json!(wire_type);
+        }
+
+        let order: OKXAlgoOrderMsg = serde_json::from_value(value).unwrap();
+
+        assert_eq!(order.advance_ord_type, expected);
+        assert!(order.adv_chase_params.is_empty());
+        assert!(order.sub_algo_id_list.is_empty());
+    }
+
+    #[rstest]
+    fn test_route_chase_trigger_preserves_spawned_algo_id() {
+        let handler = create_handler();
+        let text = load_test_json("ws_orders_algo_chase.json");
+        let frame = OKXWsFeedHandler::parse_raw_message(
+            tokio_tungstenite::tungstenite::Message::text(text),
+        );
+
+        let Some(OKXWsFrame::Data { arg, data }) = frame else {
+            panic!("Expected an algo orders data frame");
+        };
+
+        let Some(OKXWsMessage::AlgoOrders(orders)) = handler.route_data_message(arg, data) else {
+            panic!("Expected routed algo orders");
+        };
+
+        let [pending, triggered] = orders.as_slice() else {
+            panic!("Expected both algo orders, received {}", orders.len());
+        };
+
+        assert_eq!(pending.state, OKXAlgoOrderStatus::Live);
+        assert_eq!(pending.advance_ord_type, Some(OKXAdvanceOrderType::Chase));
+        assert!(pending.sub_algo_id_list.is_empty());
+        assert_eq!(
+            pending.adv_chase_params,
+            [OKXChaseParams {
+                chase_type: Some(OKXChaseType::Distance),
+                chase_val: Some(Decimal::ZERO),
+                max_chase_type: None,
+                max_chase_val: None,
+            }],
+        );
+
+        assert_eq!(triggered.algo_id, "706620792746729473");
+        assert_eq!(triggered.state, OKXAlgoOrderStatus::Effective);
+        assert_eq!(triggered.advance_ord_type, Some(OKXAdvanceOrderType::Chase));
+        assert_eq!(triggered.ord_id, "");
+        assert!(triggered.ord_id_list.is_empty());
+        assert_eq!(triggered.sub_algo_id_list, ["706620792746729999"]);
+        assert_eq!(
+            triggered.adv_chase_params,
+            [OKXChaseParams {
+                chase_type: Some(OKXChaseType::Ratio),
+                chase_val: Some(Decimal::new(4, 3)),
+                max_chase_type: Some(OKXChaseType::Distance),
+                max_chase_val: Some(Decimal::new(16525, 2)),
+            }],
+        );
+    }
+
+    #[rstest]
     fn test_route_instruments_keeps_valid_items_when_one_item_fails() {
         let handler = create_handler();
         let mut frame: Value =
@@ -2514,7 +2616,7 @@ mod tests {
         send.await;
         tokio::time::resume();
 
-        let failure = peer.messages.try_recv().unwrap();
+        let failure = peer.messages.try_recv().unwrap().into_standard().unwrap();
         assert!(matches!(failure, OKXWsMessage::SendFailed {
             request_id, client_order_ids, op: Some(OKXWsOperation::CancelOrder),
             error: OKXWsError::TransportSend(SendError::Timeout),
@@ -2564,7 +2666,7 @@ mod tests {
         let mut next = Box::pin(peer.handler.next());
         assert!(futures_util::poll!(next.as_mut()).is_pending());
         drop(next);
-        let overflow = peer.messages.try_recv().unwrap();
+        let overflow = peer.messages.try_recv().unwrap().into_standard().unwrap();
         assert!(
             matches!(overflow, OKXWsMessage::SendFailed { request_id, client_order_ids, op: Some(OKXWsOperation::AmendOrder), error: OKXWsError::TransportSend(SendError::BufferFull) }
             if request_id == "overflow" && client_order_ids == vec![ClientOrderId::from("OOVERFLOW")])
@@ -2592,7 +2694,7 @@ mod tests {
         peer.handler.inner.as_ref().unwrap().disconnect().await;
         drop(peer.handler);
         for index in 0..PENDING_SENDS_CAPACITY {
-            let message = peer.messages.try_recv().unwrap();
+            let message = peer.messages.try_recv().unwrap().into_standard().unwrap();
 
             let OKXWsMessage::SendFailed {
                 request_id,
@@ -2621,7 +2723,7 @@ mod tests {
             }
         }
 
-        let unread = peer.messages.try_recv().unwrap();
+        let unread = peer.messages.try_recv().unwrap().into_standard().unwrap();
         assert!(
             matches!(unread, OKXWsMessage::SendFailed { request_id, client_order_ids, op: Some(OKXWsOperation::Order), error: OKXWsError::TransportSend(SendError::Closed) }
             if request_id == "unread" && client_order_ids == vec![ClientOrderId::from("OUNREAD")])
@@ -2813,7 +2915,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            let mut header = [0u8; 1];
+            let mut header = [0_u8; 1];
             tokio::io::AsyncReadExt::read_exact(socket.get_mut(), &mut header)
                 .await
                 .unwrap();
@@ -2861,7 +2963,7 @@ mod tests {
             .pending_sends
             .push_back(order_send("x".repeat(64 * 1024 * 1024), 17));
         handler.send_pending().await;
-        let failure = messages.try_recv().unwrap();
+        let failure = messages.try_recv().unwrap().into_standard().unwrap();
 
         let OKXWsMessage::SendFailed {
             request_id,
@@ -2946,7 +3048,7 @@ mod tests {
         handler: OKXWsFeedHandler,
         commands: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
         frames: tokio::sync::mpsc::UnboundedReceiver<String>,
-        messages: tokio::sync::mpsc::UnboundedReceiver<OKXWsMessage>,
+        messages: tokio::sync::mpsc::UnboundedReceiver<OKXWsInbound<OKXWsMessage>>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -3069,6 +3171,7 @@ mod tests {
 
         let mut response =
             json!({"id":"17", "op":op, "code":code, "msg":"Venue reason", "data":[]});
+
         if omit_data {
             response.as_object_mut().unwrap().remove("data");
         }

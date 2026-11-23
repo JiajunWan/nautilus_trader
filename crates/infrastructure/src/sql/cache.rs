@@ -17,13 +17,15 @@ use std::{collections::VecDeque, fmt::Debug, ops::ControlFlow, pin::Pin, time::D
 
 use ahash::AHashMap;
 use bytes::Bytes;
+use futures::future::LocalBoxFuture;
 #[cfg(feature = "defi")]
 use nautilus_common::defi::cache::InstrumentMigration;
 use nautilus_common::{
     cache::{
         CacheConfig,
         database::{
-            CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap, register_loaded_currencies,
+            CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap, POSITION_OMS_KEY_PREFIX,
+            register_loaded_currencies,
         },
     },
     live::{block_on_nautilus_with, get_runtime},
@@ -37,6 +39,7 @@ use nautilus_model::{
         Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick,
         greeks::{GreeksData, YieldCurve},
     },
+    enums::OmsType,
     events::{
         AccountState, OrderEventAny, OrderFilled, OrderInitialized, OrderSnapshot,
         position::snapshot::PositionSnapshot,
@@ -57,8 +60,11 @@ use tokio::{time::Instant, try_join};
 use ustr::Ustr;
 
 use crate::sql::{
+    models::general::GeneralRow,
     pg::{connect_pg, get_postgres_connect_options},
-    queries::{CACHE_DATABASE_KEY_PREFIX, DatabaseQueries, trader_key_prefix},
+    queries::{
+        CACHE_DATABASE_KEY_PREFIX, DatabaseQueries, trader_general_key_prefix, trader_key_prefix,
+    },
 };
 
 // Task and connection names
@@ -166,7 +172,7 @@ mod tests {
         let database = PostgresCacheDatabase {
             pool,
             trader_id: TraderId::from("TRADER-001"),
-            tx,
+            tx: DatabaseWriter(tx),
             handle,
         };
 
@@ -190,7 +196,7 @@ mod tests {
         let database = PostgresCacheDatabase {
             pool,
             trader_id: TraderId::from("TRADER-001"),
-            tx,
+            tx: DatabaseWriter(tx),
             handle,
         };
 
@@ -263,7 +269,7 @@ impl CacheDatabaseFactory for PostgresCacheConfig {
 pub struct PostgresCacheDatabase {
     pub pool: PgPool,
     trader_id: TraderId,
-    tx: tokio::sync::mpsc::UnboundedSender<DatabaseQuery>,
+    tx: DatabaseWriter,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -292,6 +298,7 @@ pub enum DatabaseQuery {
     AddOrder(OrderInitialized, Option<ClientId>),
     AddOrderSnapshot(OrderSnapshot),
     AddPosition(PositionId, OrderFilled),
+    AddPositionWithSnapshot(PositionId, OrderFilled, Box<PositionSnapshot>),
     AddPositionSnapshot(PositionSnapshot),
     AddAccount(AccountState, bool),
     AddSignal(Signal),
@@ -336,7 +343,7 @@ impl PostgresCacheDatabase {
         let pool = connect_pg(pg_connect_options.clone().into()).await.unwrap();
         check_schema_migrated(&pool).await?;
         check_account_ownership(&pool).await?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseQuery>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         let handle = get_runtime().spawn(async move {
             Box::pin(Self::process_commands(
@@ -349,7 +356,7 @@ impl PostgresCacheDatabase {
         Ok(Self {
             pool,
             trader_id,
-            tx,
+            tx: DatabaseWriter(tx),
             handle,
         })
     }
@@ -378,7 +385,7 @@ impl PostgresCacheDatabase {
     }
 
     async fn process_commands(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseQuery>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<WriteCommand>,
         pg_connect_options: PgConnectOptions,
         trader_id: TraderId,
     ) {
@@ -387,7 +394,7 @@ impl PostgresCacheDatabase {
         let pool = connect_pg(pg_connect_options).await.unwrap();
 
         // Buffering
-        let mut buffer: VecDeque<DatabaseQuery> = VecDeque::new();
+        let mut buffer = WriteBuffer::default();
 
         // TODO: expose this via configuration once tests are fixed
         let buffer_interval = Duration::from_millis(0);
@@ -428,11 +435,78 @@ impl PostgresCacheDatabase {
             }
         }
 
-        if !buffer.is_empty() {
+        if !buffer.commands.is_empty() {
             drain_buffer(&pool, &trader_id, &mut buffer).await;
         }
 
         log_task_stopped(CACHE_PROCESS);
+    }
+
+    fn write_general(&self, key: String, value: Bytes) -> anyhow::Result<()> {
+        self.tx
+            .send(DatabaseQuery::Add(key, value.into()))
+            .map_err(|e| anyhow::anyhow!("Failed to send query to database message handler: {e}"))
+    }
+
+    async fn load_cache_without_positions(&self) -> anyhow::Result<CacheMap> {
+        let mut currencies = self.load_currencies().await?;
+        register_loaded_currencies(&mut currencies)?;
+
+        let (instruments, instrument_closes, synthetics, accounts, orders, greeks, yield_curves) =
+            try_join!(
+                self.load_instruments(),
+                self.load_instrument_closes(),
+                self.load_synthetics(),
+                self.load_accounts(),
+                self.load_orders(),
+                self.load_greeks(),
+                self.load_yield_curves()
+            )
+            .map_err(|e| {
+                let message = format!("Error loading cache data: {e}");
+                e.context(message)
+            })?;
+
+        Ok(CacheMap {
+            currencies,
+            instruments,
+            instrument_closes,
+            synthetics,
+            accounts,
+            orders,
+            greeks,
+            yield_curves,
+            ..CacheMap::default()
+        })
+    }
+
+    fn general_entries(&self, rows: Vec<GeneralRow>) -> AHashMap<String, Bytes> {
+        let trader_id = self.trader_id;
+        let trader_prefix = trader_key_prefix(trader_id);
+        let general_prefix = trader_general_key_prefix(trader_id);
+        let mut entries = AHashMap::with_capacity(rows.len());
+        let mut legacy_count = 0;
+
+        for row in rows {
+            let mut key = row.id;
+            if key.starts_with(&general_prefix) {
+                key.drain(..general_prefix.len());
+            } else if key.starts_with(&trader_prefix) {
+                key.drain(..trader_prefix.len());
+            } else if key.starts_with(POSITION_OMS_KEY_PREFIX) {
+                legacy_count += 1;
+            }
+
+            entries.insert(key, Bytes::from(row.value));
+        }
+
+        if legacy_count > 0 {
+            log::warn!(
+                "Restored unspecified OMS for {legacy_count} positions with unowned legacy metadata, trader {trader_id}"
+            );
+        }
+
+        entries
     }
 
     fn load_state(&self, key: String) -> anyhow::Result<AHashMap<String, Bytes>> {
@@ -444,6 +518,56 @@ impl PostgresCacheDatabase {
                 None => Ok(AHashMap::new()),
             }
         })
+    }
+}
+
+#[derive(Debug)]
+struct DatabaseWriter(tokio::sync::mpsc::UnboundedSender<WriteCommand>);
+
+impl DatabaseWriter {
+    fn send(&self, command: impl Into<WriteCommand>) -> anyhow::Result<()> {
+        self.0.send(command.into())?;
+        Ok(())
+    }
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the queue keeps ordinary database writes inline"
+)]
+#[derive(Debug)]
+enum WriteCommand {
+    Query(DatabaseQuery),
+    OrderReplacement(OrderReplacement),
+    OrderUpdate(OrderEventAny, UUID4),
+    Position {
+        id: PositionId,
+        event: OrderFilled,
+        snapshot: Option<Box<PositionSnapshot>>,
+        oms_type: OmsType,
+    },
+    Flush(tokio::sync::oneshot::Sender<anyhow::Result<()>>),
+}
+
+#[derive(Default)]
+struct WriteBuffer {
+    commands: VecDeque<WriteCommand>,
+    order_replacements: OrderReplacements,
+}
+
+type OrderReplacements = AHashMap<(TraderId, ClientOrderId), OrderReplacement>;
+
+#[derive(Debug)]
+struct OrderReplacement {
+    init: OrderInitialized,
+    client_id: Option<ClientId>,
+    prior_event_ids: Vec<String>,
+    first_update_id: Option<UUID4>,
+}
+
+impl From<DatabaseQuery> for WriteCommand {
+    fn from(query: DatabaseQuery) -> Self {
+        Self::Query(query)
     }
 }
 
@@ -505,7 +629,10 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
 
     check_trader_keys(pool).await?;
+    check_required_columns(pool).await
+}
 
+async fn check_required_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
     let missing: Vec<String> = sqlx::query_scalar(
         "SELECT required.table_name || '.' || required.column_name
         FROM (VALUES
@@ -517,6 +644,7 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
             ('instrument', 'tick_scheme'),
             ('instrument', 'underlying_instrument_id'),
             ('instrument', 'exercise_style'),
+            ('instrument', 'strike_currency'),
             ('instrument', 'settlement_type'),
             ('account_event', 'info'),
             ('account_event', 'trader_id'),
@@ -629,8 +757,8 @@ async fn check_account_ownership(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 async fn handle_query(
-    maybe_msg: Option<DatabaseQuery>,
-    buffer: &mut VecDeque<DatabaseQuery>,
+    maybe_msg: Option<WriteCommand>,
+    buffer: &mut WriteBuffer,
     buffer_interval: Duration,
     pool: &PgPool,
     trader_id: &TraderId,
@@ -640,10 +768,10 @@ async fn handle_query(
         return ControlFlow::Break(());
     };
 
-    #[cfg(feature = "defi")]
     let msg = match msg {
-        DatabaseQuery::DefiCurrency(currency, reply) => {
-            if !buffer.is_empty() {
+        #[cfg(feature = "defi")]
+        WriteCommand::Query(DatabaseQuery::DefiCurrency(currency, reply)) => {
+            if !buffer.commands.is_empty() {
                 drain_buffer(pool, trader_id, buffer).await;
             }
 
@@ -651,8 +779,9 @@ async fn handle_query(
             let _ = reply.send(result);
             return ControlFlow::Continue(());
         }
-        DatabaseQuery::DefiInstrument(instrument, migration, reply) => {
-            if !buffer.is_empty() {
+        #[cfg(feature = "defi")]
+        WriteCommand::Query(DatabaseQuery::DefiInstrument(instrument, migration, reply)) => {
+            if !buffer.commands.is_empty() {
                 drain_buffer(pool, trader_id, buffer).await;
             }
 
@@ -660,18 +789,26 @@ async fn handle_query(
             let _ = reply.send(result);
             return ControlFlow::Continue(());
         }
+        WriteCommand::Flush(reply) => {
+            drain_buffer(pool, trader_id, buffer).await;
+            let result = DatabaseQueries::delete_trader(pool, trader_id).await;
+            if result.is_ok() {
+                buffer
+                    .order_replacements
+                    .retain(|(owner, _), _| owner != trader_id);
+            }
+
+            let _ = reply.send(result);
+            return ControlFlow::Continue(());
+        }
+        WriteCommand::Query(DatabaseQuery::Close) => {
+            drain_buffer(pool, trader_id, buffer).await;
+            return ControlFlow::Break(());
+        }
         other => other,
     };
 
-    if matches!(msg, DatabaseQuery::Close) {
-        if !buffer.is_empty() {
-            drain_buffer(pool, trader_id, buffer).await;
-        }
-        return ControlFlow::Break(());
-    }
-
-    buffer.push_back(msg);
-
+    buffer.commands.push_back(msg);
     if buffer_interval.is_zero() {
         drain_buffer(pool, trader_id, buffer).await;
     }
@@ -680,13 +817,13 @@ async fn handle_query(
 }
 
 async fn flush_buffer(
-    buffer: &mut VecDeque<DatabaseQuery>,
+    buffer: &mut WriteBuffer,
     pool: &PgPool,
     trader_id: &TraderId,
     flush_timer: &mut Pin<&mut tokio::time::Sleep>,
     buffer_interval: Duration,
 ) {
-    if !buffer.is_empty() {
+    if !buffer.commands.is_empty() {
         drain_buffer(pool, trader_id, buffer).await;
     }
     flush_timer.as_mut().reset(Instant::now() + buffer_interval);
@@ -738,98 +875,66 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
-        let pool = self.pool.clone();
         let trader_id = self.trader_id;
-
-        tokio::task::block_in_place(|| {
-            get_runtime().block_on(DatabaseQueries::delete_trader(&pool, &trader_id))
+        block_on_nautilus_with(|| async {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            self.tx.send(WriteCommand::Flush(reply))?;
+            result.await?
         })
         .map_err(|e| anyhow::anyhow!("Failed to flush Postgres cache for {trader_id}: {e}"))
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        let mut currencies = self.load_currencies().await?;
-        register_loaded_currencies(&mut currencies)?;
+        let mut cache = self.load_cache_without_positions().await?;
+        cache.positions = self.load_positions().await?;
+        Ok(cache)
+    }
 
-        let (
-            instruments,
-            instrument_closes,
-            synthetics,
-            accounts,
-            orders,
-            positions,
-            greeks,
-            yield_curves,
-        ) = try_join!(
-            self.load_instruments(),
-            self.load_instrument_closes(),
-            self.load_synthetics(),
-            self.load_accounts(),
-            self.load_orders(),
-            self.load_positions(),
-            self.load_greeks(),
-            self.load_yield_curves()
-        )
-        .map_err(|e| anyhow::anyhow!("Error loading cache data: {e}"))?;
+    fn load_for_recovery(
+        &self,
+        positions_only: bool,
+    ) -> LocalBoxFuture<'_, anyhow::Result<(AHashMap<String, Bytes>, CacheMap)>> {
+        Box::pin(async move {
+            let mut cache = if positions_only {
+                CacheMap::default()
+            } else {
+                self.load_cache_without_positions().await?
+            };
 
-        Ok(CacheMap {
-            currencies,
-            instruments,
-            instrument_closes,
-            synthetics,
-            accounts,
-            orders,
-            positions,
-            greeks,
-            yield_curves,
+            let pool = self.pool.clone();
+            let trader_id = self.trader_id;
+            let (rows, positions) = tokio::spawn(async move {
+                DatabaseQueries::load_positions_and_general(&pool, trader_id).await
+            })
+            .await??;
+
+            cache.positions = positions
+                .into_iter()
+                .map(|position| (position.id, position))
+                .collect();
+            Ok((self.general_entries(rows), cache))
         })
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
         let pool = self.pool.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let trader_id = self.trader_id;
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
 
         tokio::spawn(async move {
-            let result = DatabaseQueries::load(&pool).await;
-            match result {
-                Ok(items) => {
-                    let mapping = items
-                        .into_iter()
-                        .filter(|(key, _)| !key.starts_with(CACHE_DATABASE_KEY_PREFIX))
-                        .map(|(k, v)| (k, Bytes::from(v)))
-                        .collect();
-
-                    if let Err(e) = tx.send(mapping) {
-                        log::error!("Failed to send general items: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load general items: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty general items: {e:?}");
-                    }
-                }
-            }
+            let rows = DatabaseQueries::load_cache_general(&pool, trader_id).await;
+            let _ = reply.send(rows);
         });
-        Ok(rx.recv()?)
+
+        Ok(self.general_entries(result.recv()??))
     }
 
     async fn load_currencies(&self) -> anyhow::Result<AHashMap<Ustr, Currency>> {
-        match DatabaseQueries::load_currencies(&self.pool).await {
-            Ok(items) => Ok(items
-                .into_iter()
-                .map(|currency| (currency.code, currency))
-                .collect()),
-            Err(e) => {
-                #[cfg(feature = "defi")]
-                if e.is::<crate::defi::IntegrityError>() {
-                    return Err(e);
-                }
-
-                log::error!("Failed to load_currencies: {e}");
-                Ok(AHashMap::new())
-            }
-        }
+        let currencies = DatabaseQueries::load_currencies(&self.pool).await?;
+        Ok(currencies
+            .into_iter()
+            .map(|currency| (currency.code, currency))
+            .collect())
     }
 
     async fn load_instruments(&self) -> anyhow::Result<AHashMap<InstrumentId, InstrumentAny>> {
@@ -869,59 +974,25 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     async fn load_accounts(&self) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
         let pool = self.pool.clone();
         let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        tokio::spawn(async move {
-            let result = DatabaseQueries::load_accounts(&pool, &trader_id).await;
-            match result {
-                Ok(accounts) => {
-                    let mapping = accounts
-                        .into_iter()
-                        .map(|account| (account.id(), account))
-                        .collect();
-
-                    if let Err(e) = tx.send(mapping) {
-                        log::error!("Failed to send accounts: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load accounts: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty accounts: {e:?}");
-                    }
-                }
-            }
-        });
-        Ok(rx.recv()?)
+        let accounts =
+            tokio::spawn(async move { DatabaseQueries::load_accounts(&pool, &trader_id).await })
+                .await??;
+        Ok(accounts
+            .into_iter()
+            .map(|account| (account.id(), account))
+            .collect())
     }
 
     async fn load_orders(&self) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
         let pool = self.pool.clone();
         let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        tokio::spawn(async move {
-            let result = DatabaseQueries::load_orders(&pool, &trader_id).await;
-            match result {
-                Ok(orders) => {
-                    let mapping = orders
-                        .into_iter()
-                        .map(|order| (order.client_order_id(), order))
-                        .collect();
-
-                    if let Err(e) = tx.send(mapping) {
-                        log::error!("Failed to send orders: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load orders: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty orders: {e:?}");
-                    }
-                }
-            }
-        });
-        Ok(rx.recv()?)
+        let orders =
+            tokio::spawn(async move { DatabaseQueries::load_orders(&pool, &trader_id).await })
+                .await??;
+        Ok(orders
+            .into_iter()
+            .map(|order| (order.client_order_id(), order))
+            .collect())
     }
 
     async fn load_positions(&self) -> anyhow::Result<AHashMap<PositionId, Position>> {
@@ -957,51 +1028,28 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
         let pool = self.pool.clone();
         let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
 
         tokio::spawn(async move {
-            let result = DatabaseQueries::load_index_order_position(&pool, &trader_id).await;
-            match result {
-                Ok(index) => {
-                    if let Err(e) = tx.send(index) {
-                        log::error!("Failed to send load_index_order_position result: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to run query load_index_order_position: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty load_index_order_position result: {e:?}");
-                    }
-                }
-            }
+            let index = DatabaseQueries::load_index_order_position(&pool, &trader_id).await;
+            let _ = reply.send(index);
         });
-        Ok(rx.recv()?)
+
+        result.recv()?
     }
 
     fn load_index_order_client(&self) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>> {
         let pool = self.pool.clone();
         let trader_id = self.trader_id;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
 
         tokio::spawn(async move {
-            let result =
+            let index =
                 DatabaseQueries::load_distinct_order_event_client_ids(&pool, &trader_id).await;
-
-            match result {
-                Ok(currency) => {
-                    if let Err(e) = tx.send(currency) {
-                        log::error!("Failed to send load_index_order_client result: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to run query load_distinct_order_event_client_ids: {e:?}");
-                    if let Err(e) = tx.send(AHashMap::new()) {
-                        log::error!("Failed to send empty load_index_order_client result: {e:?}");
-                    }
-                }
-            }
+            let _ = reply.send(index);
         });
-        Ok(rx.recv()?)
+
+        result.recv()?
     }
 
     async fn load_currency(&self, code: &Ustr) -> anyhow::Result<Option<Currency>> {
@@ -1173,10 +1221,16 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
-        let query = DatabaseQuery::Add(key, value.into());
-        self.tx
-            .send(query)
-            .map_err(|e| anyhow::anyhow!("Failed to send query to database message handler: {e}"))
+        anyhow::ensure!(
+            !key.starts_with(CACHE_DATABASE_KEY_PREFIX)
+                && !key.starts_with(POSITION_OMS_KEY_PREFIX),
+            "Postgres cache keys cannot use the {CACHE_DATABASE_KEY_PREFIX} or {POSITION_OMS_KEY_PREFIX} prefixes"
+        );
+
+        self.write_general(
+            format!("{}{key}", trader_general_key_prefix(self.trader_id)),
+            value,
+        )
     }
 
     fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
@@ -1234,7 +1288,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
-        self.add(
+        self.write_general(
             format!("{CACHE_DATABASE_KEY_PREFIX}synthetic:{}", synthetic.id),
             Bytes::from(serde_json::to_vec(synthetic)?),
         )
@@ -1248,8 +1302,27 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
-        let query = DatabaseQuery::AddOrder(order_initialized_event(order), client_id);
-        self.tx.send(query).map_err(|e| {
+        let original = order.init_event();
+        let command = match order.last_event() {
+            OrderEventAny::Initialized(init) if init.event_id != original.event_id => {
+                let prior_event_ids = order
+                    .events()
+                    .into_iter()
+                    .rev()
+                    .skip(1)
+                    .map(|event| event.clone().into_boxed().id().to_string())
+                    .collect();
+                WriteCommand::OrderReplacement(OrderReplacement {
+                    init: init.clone(),
+                    client_id,
+                    prior_event_ids,
+                    first_update_id: None,
+                })
+            }
+            _ => DatabaseQuery::AddOrder(original.clone(), client_id).into(),
+        };
+
+        self.tx.send(command).map_err(|e| {
             anyhow::anyhow!("Failed to send query add_order to database message handler: {e}")
         })
     }
@@ -1265,14 +1338,33 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn add_position(&self, position: &Position) -> anyhow::Result<()> {
         let event = position_last_event(position)?;
-        let query = DatabaseQuery::AddPosition(position.id, event);
+        let query = if let Some(snapshot) = position_replay_snapshot(position) {
+            DatabaseQuery::AddPositionWithSnapshot(position.id, event, snapshot)
+        } else {
+            DatabaseQuery::AddPosition(position.id, event)
+        };
+
         self.tx.send(query).map_err(|e| {
             anyhow::anyhow!("Failed to send query add_position to database message handler: {e}")
-        })?;
+        })
+    }
 
-        if position.requires_replay_state() {
-            self.add_position_snapshot(&PositionSnapshot::from_replay_state(position, None))?;
+    fn add_position_with_oms(&self, position: &Position, oms_type: OmsType) -> anyhow::Result<()> {
+        let event = position_last_event(position)?;
+        if position.trader_id != self.trader_id || event.trader_id != self.trader_id {
+            anyhow::bail!(
+                "Cannot persist position {} with OMS metadata for trader {}",
+                position.id,
+                self.trader_id,
+            );
         }
+
+        self.tx.send(WriteCommand::Position {
+            id: position.id,
+            event,
+            snapshot: position_replay_snapshot(position),
+            oms_type,
+        })?;
 
         Ok(())
     }
@@ -1607,7 +1699,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         actor_id: &ActorId,
         state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        self.add(
+        self.write_general(
             format!("{}actor:{actor_id}", trader_key_prefix(self.trader_id)),
             Bytes::from(serde_json::to_vec(state)?),
         )
@@ -1618,7 +1710,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         strategy_id: &StrategyId,
         state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        self.add(
+        self.write_general(
             format!(
                 "{}strategy:{strategy_id}",
                 trader_key_prefix(self.trader_id)
@@ -1637,6 +1729,13 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     fn update_order(&self, event: &OrderEventAny) -> anyhow::Result<()> {
         let query = DatabaseQuery::UpdateOrder(event.clone());
         self.tx.send(query).map_err(|e| {
+            anyhow::anyhow!("Failed to send query update_order to database message handler: {e}")
+        })
+    }
+
+    fn update_order_from_state(&self, order: &OrderAny) -> anyhow::Result<()> {
+        let command = WriteCommand::OrderUpdate(order.last_event().clone(), order.init_id());
+        self.tx.send(command).map_err(|e| {
             anyhow::anyhow!("Failed to send query update_order to database message handler: {e}")
         })
     }
@@ -1673,7 +1772,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn heartbeat(&self, timestamp: UnixNanos) -> anyhow::Result<()> {
-        self.add(
+        self.write_general(
             format!("{}health:heartbeat", trader_key_prefix(self.trader_id)),
             Bytes::from(serde_json::to_vec(&timestamp)?),
         )
@@ -1699,82 +1798,170 @@ fn account_last_event(account: &AccountAny) -> anyhow::Result<AccountState> {
         .ok_or_else(|| anyhow::anyhow!("Cannot persist account with no events: {}", account.id()))
 }
 
-fn order_initialized_event(order: &OrderAny) -> OrderInitialized {
-    order.init_event().clone()
-}
-
 fn position_last_event(position: &Position) -> anyhow::Result<OrderFilled> {
     position
         .last_event()
         .ok_or_else(|| anyhow::anyhow!("Cannot persist position with no events: {}", position.id))
 }
 
-async fn drain_buffer(pool: &PgPool, trader_id: &TraderId, buffer: &mut VecDeque<DatabaseQuery>) {
-    for cmd in buffer.drain(..) {
-        let result: anyhow::Result<()> = match cmd {
-            #[cfg(feature = "defi")]
-            DatabaseQuery::DefiCurrency(..) | DatabaseQuery::DefiInstrument(..) => {
-                unreachable!("DeFi writes execute before buffering")
+fn position_replay_snapshot(position: &Position) -> Option<Box<PositionSnapshot>> {
+    position
+        .requires_replay_state()
+        .then(|| Box::new(PositionSnapshot::from_replay_state(position, None)))
+}
+
+async fn drain_buffer(pool: &PgPool, trader_id: &TraderId, buffer: &mut WriteBuffer) {
+    for command in buffer.commands.drain(..) {
+        let result = match command {
+            WriteCommand::OrderReplacement(replacement) => {
+                // Expose the replacement only once a later event can commit with it.
+                let key = (replacement.init.trader_id, replacement.init.client_order_id);
+                if let Some(pending) = buffer.order_replacements.get_mut(&key)
+                    && pending.init.event_id == replacement.init.event_id
+                {
+                    pending.client_id = replacement.client_id.or(pending.client_id);
+                } else {
+                    buffer.order_replacements.insert(key, replacement);
+                }
+
+                Ok(())
             }
-            DatabaseQuery::Close => Ok(()),
-            DatabaseQuery::Add(key, value) => DatabaseQueries::add(pool, key, value).await,
-            DatabaseQuery::Delete(key) => DatabaseQueries::delete(pool, &key).await,
-            DatabaseQuery::DeleteOrder(id) => {
-                DatabaseQueries::delete_order(pool, *trader_id, id).await
+            WriteCommand::OrderUpdate(event, init_id) => {
+                write_order_update(pool, &mut buffer.order_replacements, event, Some(init_id)).await
             }
-            DatabaseQuery::DeletePosition(id) => {
-                DatabaseQueries::delete_position(pool, *trader_id, id).await
+            WriteCommand::Query(query) => {
+                execute_query(pool, trader_id, &mut buffer.order_replacements, query).await
             }
-            DatabaseQuery::AddCurrency(currency) => {
-                DatabaseQueries::add_currency(pool, currency).await
+            WriteCommand::Position {
+                id,
+                event,
+                snapshot,
+                oms_type,
+            } => {
+                DatabaseQueries::replace_position(
+                    pool,
+                    id,
+                    &event,
+                    snapshot.map(|snapshot| *snapshot),
+                    Some(oms_type),
+                )
+                .await
             }
-            DatabaseQuery::AddInstrument(instrument) => {
-                DatabaseQueries::add_instrument_any(pool, instrument).await
-            }
-            DatabaseQuery::AddInstrumentClose(close) => {
-                DatabaseQueries::add_instrument_close(pool, &close).await
-            }
-            DatabaseQuery::AddOrder(event, client_id) => {
-                DatabaseQueries::add_order(pool, event, client_id).await
-            }
-            DatabaseQuery::AddOrderSnapshot(snapshot) => {
-                DatabaseQueries::add_order_snapshot(pool, snapshot).await
-            }
-            DatabaseQuery::AddPosition(position_id, event) => {
-                DatabaseQueries::add_position(pool, position_id, &event).await
-            }
-            DatabaseQuery::AddPositionSnapshot(snapshot) => {
-                DatabaseQueries::add_position_snapshot(pool, snapshot).await
-            }
-            DatabaseQuery::AddAccount(event, updated) => {
-                DatabaseQueries::add_account(pool, updated, event, trader_id).await
-            }
-            DatabaseQuery::AddSignal(signal) => DatabaseQueries::add_signal(pool, &signal).await,
-            DatabaseQuery::AddCustom(data) => DatabaseQueries::add_custom_data(pool, &data).await,
-            DatabaseQuery::AddQuote(quote) => DatabaseQueries::add_quote(pool, &quote).await,
-            DatabaseQuery::AddTrade(trade) => DatabaseQueries::add_trade(pool, &trade).await,
-            DatabaseQuery::AddBar(bar) => DatabaseQueries::add_bar(pool, &bar).await,
-            DatabaseQuery::AddGreeks(greeks) => DatabaseQueries::add_greeks(pool, &greeks).await,
-            DatabaseQuery::AddYieldCurve(curve) => {
-                DatabaseQueries::add_yield_curve(pool, &curve).await
-            }
-            DatabaseQuery::UpdateOrder(event) => {
-                DatabaseQueries::add_order_event(pool, event.into_boxed(), None).await
-            }
-            DatabaseQuery::UpdatePosition(event) => {
-                DatabaseQueries::update_position(pool, &event).await
-            }
-            DatabaseQuery::IndexOrderPosition(client_order_id, position_id) => {
-                DatabaseQueries::index_order_position(pool, trader_id, client_order_id, position_id)
-                    .await
-            }
-            DatabaseQuery::IndexOrderClients(claims) => {
-                DatabaseQueries::index_order_clients(pool, trader_id, &claims).await
-            }
+            WriteCommand::Flush(_) => unreachable!("Flush runs before buffering"),
         };
 
         if let Err(e) = result {
             log::error!("Error on query: {e:?}");
         }
     }
+}
+
+async fn execute_query(
+    pool: &PgPool,
+    trader_id: &TraderId,
+    order_replacements: &mut OrderReplacements,
+    query: DatabaseQuery,
+) -> anyhow::Result<()> {
+    match query {
+        #[cfg(feature = "defi")]
+        DatabaseQuery::DefiCurrency(..) | DatabaseQuery::DefiInstrument(..) => {
+            unreachable!("DeFi writes execute before buffering")
+        }
+        DatabaseQuery::Close => Ok(()),
+        DatabaseQuery::Add(key, value) => DatabaseQueries::add(pool, key, value).await,
+        DatabaseQuery::Delete(key) => DatabaseQueries::delete(pool, &key).await,
+        DatabaseQuery::DeleteOrder(id) => {
+            DatabaseQueries::delete_order(pool, *trader_id, id).await?;
+            order_replacements.remove(&(*trader_id, id));
+            Ok(())
+        }
+        DatabaseQuery::DeletePosition(id) => {
+            DatabaseQueries::delete_position(pool, *trader_id, id).await
+        }
+        DatabaseQuery::AddCurrency(currency) => DatabaseQueries::add_currency(pool, currency).await,
+        DatabaseQuery::AddInstrument(instrument) => {
+            DatabaseQueries::add_instrument_any(pool, instrument).await
+        }
+        DatabaseQuery::AddInstrumentClose(close) => {
+            DatabaseQueries::add_instrument_close(pool, &close).await
+        }
+        DatabaseQuery::AddOrder(event, client_id) => {
+            DatabaseQueries::add_order(pool, event, client_id).await
+        }
+        DatabaseQuery::AddOrderSnapshot(snapshot) => {
+            DatabaseQueries::add_order_snapshot(pool, snapshot).await
+        }
+        DatabaseQuery::AddPosition(position_id, event) => {
+            DatabaseQueries::add_position(pool, position_id, &event).await
+        }
+        DatabaseQuery::AddPositionWithSnapshot(position_id, event, snapshot) => {
+            DatabaseQueries::replace_position(pool, position_id, &event, Some(*snapshot), None)
+                .await
+        }
+        DatabaseQuery::AddPositionSnapshot(snapshot) => {
+            DatabaseQueries::add_position_snapshot(pool, snapshot).await
+        }
+        DatabaseQuery::AddAccount(event, updated) => {
+            DatabaseQueries::add_account(pool, updated, event, trader_id).await
+        }
+        DatabaseQuery::AddSignal(signal) => DatabaseQueries::add_signal(pool, &signal).await,
+        DatabaseQuery::AddCustom(data) => DatabaseQueries::add_custom_data(pool, &data).await,
+        DatabaseQuery::AddQuote(quote) => DatabaseQueries::add_quote(pool, &quote).await,
+        DatabaseQuery::AddTrade(trade) => DatabaseQueries::add_trade(pool, &trade).await,
+        DatabaseQuery::AddBar(bar) => DatabaseQueries::add_bar(pool, &bar).await,
+        DatabaseQuery::AddGreeks(greeks) => DatabaseQueries::add_greeks(pool, &greeks).await,
+        DatabaseQuery::AddYieldCurve(curve) => DatabaseQueries::add_yield_curve(pool, &curve).await,
+        DatabaseQuery::UpdateOrder(event) => {
+            write_order_update(pool, order_replacements, event, None).await
+        }
+        DatabaseQuery::UpdatePosition(event) => {
+            DatabaseQueries::update_position(pool, &event).await
+        }
+        DatabaseQuery::IndexOrderPosition(client_order_id, position_id) => {
+            DatabaseQueries::index_order_position(pool, trader_id, client_order_id, position_id)
+                .await
+        }
+        DatabaseQuery::IndexOrderClients(claims) => {
+            DatabaseQueries::index_order_clients(pool, trader_id, &claims).await
+        }
+    }
+}
+
+async fn write_order_update(
+    pool: &PgPool,
+    order_replacements: &mut OrderReplacements,
+    event: OrderEventAny,
+    init_id: Option<UUID4>,
+) -> anyhow::Result<()> {
+    let key = (event.trader_id(), event.client_order_id());
+    let event = event.into_boxed();
+
+    let Some(replacement) = order_replacements.get_mut(&key) else {
+        return DatabaseQueries::add_order_event(pool, event, None).await;
+    };
+
+    // Reload can restore the original order while this replacement is pending
+    if init_id.is_some_and(|id| id != replacement.init.event_id) {
+        order_replacements.remove(&key);
+        return DatabaseQueries::add_order_event(pool, event, None).await;
+    }
+
+    let event_id = event.id();
+    let first_update_id = replacement.first_update_id.get_or_insert(event_id);
+    let client_order_id = key.1;
+    anyhow::ensure!(
+        *first_update_id == event_id,
+        "Cannot persist order {client_order_id} event {event_id} before replacement event {first_update_id}"
+    );
+
+    DatabaseQueries::add_order_replacement(
+        pool,
+        replacement.init.clone(),
+        replacement.client_id,
+        &replacement.prior_event_ids,
+        event,
+    )
+    .await?;
+    order_replacements.remove(&key);
+    Ok(())
 }

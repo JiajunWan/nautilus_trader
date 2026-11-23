@@ -319,6 +319,10 @@ pub(crate) const FEATHER_EXTENSION: &str = "feather";
 /// File extension of a Feather stream file that is still being appended to.
 pub(crate) const FEATHER_PARTIAL_EXTENSION: &str = "feather.partial";
 
+/// File extension of a sealed Feather stream file that promotion refused, which later
+/// promotions skip.
+pub(crate) const FEATHER_REFUSED_EXTENSION: &str = "feather.refused";
+
 /// An open local Feather file that appends Arrow IPC stream batches.
 ///
 /// Batches go to `{name}.feather.partial`, which is renamed to `{name}.feather` when the file is
@@ -1166,7 +1170,10 @@ impl FeatherWriter {
             let path = self.build_writer_path(&data_type, timestamp, sequence);
 
             // Files left by an earlier writer in the same directory keep their names
-            if path.exists() || path.with_extension(FEATHER_PARTIAL_EXTENSION).exists() {
+            if path.exists()
+                || path.with_extension(FEATHER_PARTIAL_EXTENSION).exists()
+                || path.with_extension(FEATHER_REFUSED_EXTENSION).exists()
+            {
                 continue;
             }
 
@@ -2217,7 +2224,7 @@ mod tests {
             WriterClock::Test(Arc::new(AtomicU64::new(0))),
             RotationConfig::ScheduledDates {
                 interval_ns: 86_400_000_000_000,
-                rotation_time: UnixNanos::from(36_000_000_000_000u64),
+                rotation_time: UnixNanos::from(36_000_000_000_000_u64),
                 rotation_timezone: jiff::tz::TimeZone::UTC,
             },
             None,
@@ -2228,14 +2235,14 @@ mod tests {
         writer.write(quote_at(1_767_258_000_000_000_000)).unwrap();
         assert_eq!(
             writer.get_next_rotation_time(&quotes),
-            Some(UnixNanos::from(1_767_261_600_000_000_000u64)),
+            Some(UnixNanos::from(1_767_261_600_000_000_000_u64)),
         );
 
         // The first row after it, at 10:30, opens the next file, which rotates at 10:00 tomorrow
         writer.write(quote_at(1_767_263_400_000_000_000)).unwrap();
         assert_eq!(
             writer.get_next_rotation_time(&quotes),
-            Some(UnixNanos::from(1_767_348_000_000_000_000u64)),
+            Some(UnixNanos::from(1_767_348_000_000_000_000_u64)),
         );
         assert_eq!(
             sealed_timestamps(temp_dir.path()),
@@ -2262,7 +2269,7 @@ mod tests {
         );
 
         // 2026-11-07 17:47:15 UTC, then two rows at 18:14:41.380125727 UTC
-        let (before, after) = (1_794_073_635_000_000_000u64, 1_794_075_281_380_125_727u64);
+        let (before, after) = (1_794_073_635_000_000_000_u64, 1_794_075_281_380_125_727_u64);
         writer.write(quote_at(before)).unwrap();
         writer.write(quote_at(after)).unwrap();
         writer.write(quote_at(after)).unwrap();
@@ -2854,18 +2861,24 @@ mod tests {
             .path()
             .join("trades")
             .join("trades_5-1.feather.partial");
+        let refused = temp_dir
+            .path()
+            .join("trades")
+            .join("trades_5-2.feather.refused");
         fs::create_dir_all(sealed.parent().unwrap()).unwrap();
         fs::write(&sealed, b"sealed").unwrap();
         fs::write(&partial, b"partial").unwrap();
+        fs::write(&refused, b"refused").unwrap();
 
         let path = writer.reserve_writer_path(NautilusDataType::TradeTick.into());
 
         assert_eq!(
             path.path,
-            temp_dir.path().join("trades").join("trades_5-2.feather")
+            temp_dir.path().join("trades").join("trades_5-3.feather")
         );
         assert_eq!(fs::read(&sealed).unwrap(), b"sealed");
         assert_eq!(fs::read(&partial).unwrap(), b"partial");
+        assert_eq!(fs::read(&refused).unwrap(), b"refused");
     }
 
     #[rstest]
@@ -3232,7 +3245,7 @@ mod tests {
         // A continuation marker followed by a negative metadata length is corrupt, not cut short
         let mut staged = fs::read(&partial).unwrap();
         staged.truncate(staged.len() - 8);
-        staged.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0xFF, 0xFF, 0xFF]);
+        staged.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xf0, 0xff, 0xff, 0xff]);
         fs::write(&partial, &staged).unwrap();
 
         let warnings = recover_with_warnings(temp_dir.path());

@@ -1113,7 +1113,7 @@ impl LighterHttpClient {
         let market_id = self.market_index(instrument)?;
         let query = LighterRecentTradesQuery { market_id, limit };
         let response = self.inner.get_recent_trades(&query).await?;
-        self.parse_trade_ticks(&response.trades, instrument)
+        self.parse_trades(&response.trades, instrument)
     }
 
     /// Requests historical trades and parses them into [`TradeTick`]s.
@@ -1134,7 +1134,7 @@ impl LighterHttpClient {
             query.market_id = Some(self.market_index(instrument)?);
         }
         let response = self.inner.get_trades(&query).await?;
-        self.parse_trade_ticks(&response.trades, instrument)
+        self.parse_trades(&response.trades, instrument)
     }
 
     /// Requests historical candles and parses them into Nautilus [`Bar`]s.
@@ -1260,6 +1260,7 @@ impl LighterHttpClient {
 
         let limit_satisfied =
             !start_was_unspecified && requested_limit.is_some_and(|limit| bars.len() >= limit);
+
         if pages >= MAX_BAR_REQUEST_PAGES && cursor_ms < end_ms && !limit_satisfied {
             return Err(LighterHttpError::HistoryIncomplete {
                 data_type: "bar",
@@ -1412,6 +1413,7 @@ impl LighterHttpClient {
 
         let limit_satisfied = !start_was_unspecified
             && requested_limit.is_some_and(|limit| funding_rates.len() >= limit);
+
         if pages >= MAX_FUNDING_REQUEST_PAGES && cursor_ms < end_ms && !limit_satisfied {
             return Err(LighterHttpError::HistoryIncomplete {
                 data_type: "funding rate",
@@ -1547,7 +1549,7 @@ impl LighterHttpClient {
         .map_err(LighterHttpError::from)
     }
 
-    fn parse_trade_ticks(
+    fn parse_trades(
         &self,
         trades: &[LighterTrade],
         instrument: &InstrumentAny,

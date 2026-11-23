@@ -46,7 +46,7 @@ const PARAM_SKIP_CATALOG_DATA: &str = "skip_catalog_data";
 pub(super) const PARAM_UPDATE_CATALOG: &str = "update_catalog";
 const PARAM_FORCE_INSTRUMENT_UPDATE: &str = "force_instrument_update";
 const PARAM_SUBSCRIPTION_NAME: &str = "subscription_name";
-const PARAM_FROM_DAY_START: &str = "from_day_start";
+pub(super) const PARAM_FROM_DAY_START: &str = "from_day_start";
 const CATALOG_CLIENT_ID: &str = "CATALOG";
 
 pub(crate) type CatalogMap = AHashMap<Ustr, DataCatalog>;
@@ -708,7 +708,7 @@ impl DataEngine {
 
         match leg {
             RequestCommand::Quotes(cmd) => {
-                let data = quote_ticks_from_query_result(
+                let data = quotes_from_query_result(
                     catalog.query_batch(
                         &CatalogQuery::new(NautilusDataType::QuoteTick)
                             .with_identifiers(Some(vec![cmd.single_instrument_id()?.to_string()]))
@@ -725,7 +725,7 @@ impl DataEngine {
                 ))
             }
             RequestCommand::Trades(cmd) => {
-                let data = trade_ticks_from_query_result(
+                let data = trades_from_query_result(
                     catalog.query_batch(
                         &CatalogQuery::new(NautilusDataType::TradeTick)
                             .with_identifiers(Some(vec![cmd.single_instrument_id()?.to_string()]))
@@ -1235,14 +1235,14 @@ fn catalog_missing_intervals(
     )
 }
 
-fn quote_ticks_from_query_result(data: DataBatch) -> anyhow::Result<BatchView<QuoteTick>> {
+fn quotes_from_query_result(data: DataBatch) -> anyhow::Result<BatchView<QuoteTick>> {
     match data {
         DataBatch::Quote(data) => Ok(data),
         _ => anyhow::bail!("expected a Quote batch, found another data batch variant"),
     }
 }
 
-fn trade_ticks_from_query_result(data: DataBatch) -> anyhow::Result<BatchView<TradeTick>> {
+fn trades_from_query_result(data: DataBatch) -> anyhow::Result<BatchView<TradeTick>> {
     match data {
         DataBatch::Trade(data) => Ok(data),
         _ => anyhow::bail!("expected a Trade batch, found another data batch variant"),
@@ -1845,7 +1845,7 @@ mod tests {
         let mut third = first;
         third.ts_init = UnixNanos::from(37);
         let original = Arc::new(vec![first, second, third]);
-        let result = quote_ticks_from_query_result(DataBatch::Quote(BatchView::new(
+        let result = quotes_from_query_result(DataBatch::Quote(BatchView::new(
             Arc::clone(&original),
             start..end,
         )))
@@ -2193,10 +2193,10 @@ mod tests {
 
         let result = build_empty_response(
             &request,
-            UnixNanos::from(1u64),
-            UnixNanos::from(2u64),
+            UnixNanos::from(1_u64),
+            UnixNanos::from(2_u64),
             None,
-            UnixNanos::from(3u64),
+            UnixNanos::from(3_u64),
         );
 
         assert_eq!(

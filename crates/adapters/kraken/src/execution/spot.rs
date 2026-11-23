@@ -50,7 +50,7 @@ use nautilus_model::{
         AccountType, OmsType, OrderSide, OrderType, PositionSide, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
-    events::OrderEventAny,
+    events::OrderDeniedReason,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
@@ -119,7 +119,6 @@ pub struct KrakenSpotExecutionClient {
     truncated_id_map: Arc<AtomicMap<String, ClientOrderId>>,
     ws_dispatch_state: Arc<WsDispatchState>,
     order_request_state: Arc<OrderRequestState>,
-    order_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<OrderEventAny>>,
 }
 
 impl KrakenSpotExecutionClient {
@@ -190,6 +189,7 @@ impl KrakenSpotExecutionClient {
             ws_idle_timeout_ms: 0,
             max_requests_per_second: config.max_requests_per_second,
             transport_backend: config.transport_backend,
+            ..Default::default()
         };
 
         let ws =
@@ -204,7 +204,9 @@ impl KrakenSpotExecutionClient {
         // Connect() swaps in a live cmd_tx; capture the shared handle so the
         // dispatcher reads the current sender, not the dropped placeholder.
         let cmd_tx_handle = ws.handler_command_handle();
-        let (order_event_tx, order_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Placeholder: each connect installs the sender for that session's channel
+        let (order_event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
         let order_request_state = Arc::new(OrderRequestState::new(
             cmd_tx_handle,
             order_event_tx,
@@ -233,7 +235,6 @@ impl KrakenSpotExecutionClient {
             truncated_id_map: Arc::new(AtomicMap::new()),
             ws_dispatch_state,
             order_request_state,
-            order_event_rx: Some(order_event_rx),
         })
     }
 
@@ -346,35 +347,8 @@ impl KrakenSpotExecutionClient {
             return;
         }
 
-        let order_type = order.order_type();
-        let time_in_force = order.time_in_force();
-
-        if time_in_force == TimeInForce::Fok && order_type != OrderType::Limit {
-            self.emitter.emit_order_denied(
-                order,
-                "FOK time in force only supported for LIMIT orders on Kraken Spot",
-            );
-            return;
-        }
-
-        if matches!(
-            order_type,
-            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
-        ) && let Some(offset_type) = order.trailing_offset_type()
-            && offset_type != TrailingOffsetType::Price
-        {
-            self.emitter.emit_order_denied(
-                order,
-                &format!(
-                    "Kraken Spot only supports Price trailing offset type: received {offset_type:?}"
-                ),
-            );
-            return;
-        }
-
-        if order.is_reduce_only() && self.config.spot_account_type == AccountType::Cash {
-            self.emitter
-                .emit_order_denied(order, "reduce_only requires spot_account_type=Margin");
+        if let Err(reason) = validate_order(order, self.config.spot_account_type) {
+            self.emitter.emit_order_denied(order, &reason);
             return;
         }
 
@@ -605,6 +579,9 @@ impl KrakenSpotExecutionClient {
         let clock = self.clock;
         let cancellation_token = self.cancellation_token.clone();
 
+        let (order_event_tx, mut order_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.order_request_state.reset_event_sender(order_event_tx);
+
         let future = async move {
             tokio::pin!(stream);
 
@@ -643,35 +620,32 @@ impl KrakenSpotExecutionClient {
             .spawn(future)
             .context("failed to register Kraken Spot execution stream task")?;
 
-        let event_rx = self.order_event_rx.take();
+        let emitter = self.emitter.clone();
+        let cancellation_token = self.cancellation_token.clone();
 
-        if let Some(mut event_rx) = event_rx {
-            let emitter = self.emitter.clone();
-            let cancellation_token = self.cancellation_token.clone();
-
-            let future = async move {
-                loop {
-                    tokio::select! {
-                        () = cancellation_token.cancelled() => {
-                            log::debug!("Spot execution order-event forwarder cancelled");
-                            break;
-                        }
-                        event = event_rx.recv() => {
-                            match event {
-                                Some(event) => emitter.send_order_event(event),
-                                None => {
-                                    log::debug!("Spot execution order-event channel closed");
-                                    break;
-                                }
+        let future = async move {
+            loop {
+                tokio::select! {
+                    () = cancellation_token.cancelled() => {
+                        log::debug!("Spot execution order-event forwarder cancelled");
+                        break;
+                    }
+                    event = order_event_rx.recv() => {
+                        match event {
+                            Some(event) => emitter.send_order_event(event),
+                            None => {
+                                log::debug!("Spot execution order-event channel closed");
+                                break;
                             }
                         }
                     }
                 }
-            };
-            self.session_tasks
-                .spawn(future)
-                .context("failed to register Kraken Spot order event task")?;
-        }
+            }
+        };
+
+        self.session_tasks
+            .spawn(future)
+            .context("failed to register Kraken Spot order event task")?;
 
         Ok(())
     }
@@ -1607,32 +1581,8 @@ impl ExecutionClient for KrakenSpotExecutionClient {
                 continue;
             }
 
-            if order.time_in_force() == TimeInForce::Fok && order.order_type() != OrderType::Limit {
-                self.emitter.emit_order_denied(
-                    order,
-                    "FOK time in force only supported for LIMIT orders on Kraken Spot",
-                );
-                continue;
-            }
-
-            if matches!(
-                order.order_type(),
-                OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
-            ) && let Some(offset_type) = order.trailing_offset_type()
-                && offset_type != TrailingOffsetType::Price
-            {
-                self.emitter.emit_order_denied(
-                    order,
-                    &format!(
-                        "Kraken Spot only supports Price trailing offset type: received {offset_type:?}"
-                    ),
-                );
-                continue;
-            }
-
-            if order.is_reduce_only() && self.config.spot_account_type == AccountType::Cash {
-                self.emitter
-                    .emit_order_denied(order, "reduce_only requires spot_account_type=Margin");
+            if let Err(reason) = validate_order(order, self.config.spot_account_type) {
+                self.emitter.emit_order_denied(order, &reason);
                 continue;
             }
 
@@ -1680,7 +1630,7 @@ impl ExecutionClient for KrakenSpotExecutionClient {
         }
 
         let use_ws_trade = resolve_use_ws_trade(cmd.params.as_ref(), self.config.use_ws_trade);
-        if use_ws_trade && self.ws.is_active() {
+        if use_ws_trade && self.ws.is_active() && (2..=15).contains(&prepared_orders.len()) {
             let any_quote_qty = prepared_orders.iter().any(|o| o.is_quote_quantity());
             let symbols_match = prepared_orders
                 .windows(2)
@@ -1858,6 +1808,45 @@ async fn cancel_order_for_spot(
 enum SpotBatchCancelId {
     VenueOrderId(String),
     ClientOrderId(String),
+}
+
+const KRAKEN_SPOT_SUPPORTED_ORDER_TYPES: &[OrderType] = &[
+    OrderType::Market,
+    OrderType::Limit,
+    OrderType::StopMarket,
+    OrderType::StopLimit,
+    OrderType::MarketIfTouched,
+    OrderType::LimitIfTouched,
+    OrderType::TrailingStopMarket,
+    OrderType::TrailingStopLimit,
+];
+
+fn validate_order(order: &OrderAny, account_type: AccountType) -> Result<(), String> {
+    let order_type = order.order_type();
+    if !KRAKEN_SPOT_SUPPORTED_ORDER_TYPES.contains(&order_type) {
+        return Err(OrderDeniedReason::UnsupportedOrderType { order_type }.to_string());
+    }
+
+    if order.time_in_force() == TimeInForce::Fok && order_type != OrderType::Limit {
+        return Err("FOK time in force only supported for LIMIT orders on Kraken Spot".to_string());
+    }
+
+    if matches!(
+        order_type,
+        OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
+    ) && let Some(offset_type) = order.trailing_offset_type()
+        && offset_type != TrailingOffsetType::Price
+    {
+        return Err(format!(
+            "Kraken Spot only supports Price trailing offset type: received {offset_type:?}"
+        ));
+    }
+
+    if order.is_reduce_only() && account_type == AccountType::Cash {
+        return Err("reduce_only requires spot_account_type=Margin".to_string());
+    }
+
+    Ok(())
 }
 
 const SPOT_BATCH_CANCEL_LIMIT: usize = 50;
@@ -2371,7 +2360,7 @@ mod tests {
 
     #[rstest]
     fn test_resolve_leverage_valid_integer() {
-        let p = params_with("leverage", json!(5u64));
+        let p = params_with("leverage", json!(5_u64));
         assert_eq!(resolve_leverage(Some(&p), Some(3)).unwrap(), Some(5));
     }
 
@@ -2384,7 +2373,7 @@ mod tests {
 
     #[rstest]
     fn test_resolve_leverage_overflow_errors() {
-        let p = params_with("leverage", json!(65539u64));
+        let p = params_with("leverage", json!(65539_u64));
         let err = resolve_leverage(Some(&p), None).unwrap_err();
         assert!(err.contains("exceeds maximum"), "unexpected: {err}");
     }

@@ -17,7 +17,14 @@
 #[cfg(feature = "postgres")]
 #[cfg(target_os = "linux")] // Databases only tested and supported on Linux
 mod serial_tests {
-    use std::{collections::HashSet, str::FromStr, time::Duration};
+    use std::{
+        cell::RefCell,
+        collections::HashSet,
+        panic::{AssertUnwindSafe, catch_unwind},
+        rc::Rc,
+        str::FromStr,
+        time::Duration,
+    };
 
     use ahash::AHashMap;
     use bytes::Bytes;
@@ -25,12 +32,16 @@ mod serial_tests {
     use nautilus_common::{
         cache::{
             Cache, CacheConfig,
-            database::{CacheDatabaseAdapter, CacheDatabaseFactory},
+            database::{CacheDatabaseAdapter, CacheDatabaseFactory, POSITION_OMS_KEY_PREFIX},
         },
+        clock::VirtualClock,
+        live::get_runtime,
+        messages::execution::SubmitOrder,
         signal::Signal,
-        testing::{wait_until, wait_until_async},
+        testing::wait_until_async,
     };
     use nautilus_core::{Params, UUID4, UnixNanos};
+    use nautilus_execution::{engine::ExecutionEngine, order_emulator::emulator::OrderEmulator};
     use nautilus_infrastructure::sql::{
         cache::{PostgresCacheConfig, PostgresCacheDatabase, get_pg_cache_database},
         models::instruments::{InstrumentAnyRow, OptionSpreadRow},
@@ -40,13 +51,17 @@ mod serial_tests {
     use nautilus_model::{
         accounts::{AccountAny, CashAccount},
         data::{
-            CustomData, DataType, InstrumentClose,
+            CustomData, DataType, InstrumentClose, QuoteTick,
             greeks::{GreeksData, OptionGreekValues, YieldCurve},
             stubs::{quote_ethusdt_binance, stub_bar, stub_trade_ethusdt_buy},
         },
-        enums::{CurrencyType, InstrumentCloseType, OmsType, OrderSide, OrderStatus, OrderType},
+        enums::{
+            CurrencyType, InstrumentCloseType, OmsType, OrderSide, OrderStatus, OrderType,
+            TriggerType,
+        },
         events::{
-            OrderEventAny, OrderFilled, OrderSnapshot, PositionSnapshot,
+            OrderCanceled, OrderEmulated, OrderEventAny, OrderFilled, OrderSnapshot,
+            PositionSnapshot,
             account::stubs::{
                 cash_account_state_million_usd, cash_account_state_multi,
                 cash_account_state_multi_changed_btc, wallet_account_state,
@@ -59,13 +74,13 @@ mod serial_tests {
             Symbol, TradeId, TraderId, VenueOrderId, stubs::account_id,
         },
         instruments::{
-            Instrument, InstrumentAny, OptionSpread, SyntheticInstrument,
+            FuturesSpread, Instrument, InstrumentAny, OptionSpread, SyntheticInstrument,
             stubs::{
                 audusd_sim, binary_option, cfd_gold, commodity_gold, crypto_future_btcusdt,
                 crypto_futures_spread_btc_deribit, crypto_option_btc_deribit,
                 crypto_option_spread_btc_deribit, crypto_perpetual_ethusdt, currency_pair_ethusdt,
-                equity_aapl, futures_contract_es, index_instrument_spx, option_contract_appl,
-                option_spread, perpetual_contract_eurusd,
+                equity_aapl, futures_contract_es, futures_spread_es, index_instrument_spx,
+                option_contract_appl, option_spread, perpetual_contract_eurusd,
             },
         },
         orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
@@ -80,6 +95,10 @@ mod serial_tests {
     use sqlx::{AssertSqlSafe, FromRow, PgPool, postgres::PgConnectOptions};
     use ustr::Ustr;
 
+    use crate::position_reopen::{ReplayMode, check_netting_position_reopen};
+
+    const POSTGRES_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
     pub(crate) fn assert_entirely_equal<T: Serialize>(a: T, b: T) {
         let a_serialized = serde_json::to_string(&a).unwrap();
         let b_serialized = serde_json::to_string(&b).unwrap();
@@ -88,20 +107,7 @@ mod serial_tests {
     }
 
     async fn get_test_pg_cache_database() -> anyhow::Result<PostgresCacheDatabase> {
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            get_pg_cache_database(TraderId::default()),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(|e| {
-                anyhow::anyhow!("A running PostgreSQL service is required for this test: {e}")
-            }),
-            Err(e) => Err(anyhow::anyhow!(
-                "A running PostgreSQL service is required for this test: connection timed out: \
-                 {e}"
-            )),
-        }
+        get_test_pg_cache_database_for_trader(TraderId::default()).await
     }
 
     // Clears every table between tests. The cache's own `flush` only removes its trader's rows.
@@ -110,15 +116,12 @@ mod serial_tests {
     }
 
     async fn connect_test_pg(options: PgConnectOptions) -> anyhow::Result<PgPool> {
-        match tokio::time::timeout(Duration::from_secs(2), connect_pg(options)).await {
-            Ok(result) => result.map_err(|e| {
+        tokio::time::timeout(POSTGRES_SETUP_TIMEOUT, connect_pg(options))
+            .await
+            .map_err(|e| anyhow::anyhow!("PostgreSQL connection timed out: {e}"))?
+            .map_err(|e| {
                 anyhow::anyhow!("A running PostgreSQL service is required for this test: {e}")
-            }),
-            Err(e) => Err(anyhow::anyhow!(
-                "A running PostgreSQL service is required for this test: connection timed out: \
-                 {e}"
-            )),
-        }
+            })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -162,9 +165,13 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_account_event_purge_preserves_incremental_replay() {
-        let mut adapter = get_test_pg_cache_database().await.unwrap();
-        reset_test_database(&adapter).await;
-        let mut account = AccountAny::from(cash_account_state_multi());
+        let trader_id = TraderId::from(format!("ACCOUNT-PURGE-{}", UUID4::new()));
+        let mut adapter = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let mut initial = cash_account_state_multi();
+        initial.event_id = UUID4::new();
+        let mut account = AccountAny::from(initial);
         let mut update = cash_account_state_multi_changed_btc();
         update
             .balances
@@ -178,7 +185,9 @@ mod serial_tests {
         account.apply(update.clone()).unwrap();
         adapter.update_account(&account).unwrap();
         adapter.close().unwrap();
-        let adapter = get_test_pg_cache_database().await.unwrap();
+        let adapter = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
         let mut cache = Cache::default();
         cache.add_account(account.clone()).unwrap();
         cache.set_database(Box::new(adapter));
@@ -189,7 +198,9 @@ mod serial_tests {
         assert_eq!(cache.account(&account.id()).unwrap().events(), vec![update]);
         cache.dispose();
 
-        let mut restarted = get_test_pg_cache_database().await.unwrap();
+        let mut restarted = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
         let loaded = restarted
             .load_account(&account.id())
             .await
@@ -403,7 +414,14 @@ mod serial_tests {
         let mut cache = Cache::new(None, Some(Box::new(database)));
         cache.cache_all().await.unwrap();
         cache.build_index();
+        let source_oms_key = format!("{POSITION_OMS_KEY_PREFIX}{source_id}");
+        assert_eq!(
+            cache.get(&source_oms_key).unwrap(),
+            Some(&Bytes::from(serde_json::to_vec(&OmsType::Hedging).unwrap()))
+        );
+        cache.clear_index();
         cache.purge_position(source_id, true).unwrap();
+        assert_eq!(cache.get(&source_oms_key).unwrap(), None);
         cache
             .purge_order(ClientOrderId::from("O-PERSISTED-OPEN"), true)
             .unwrap();
@@ -811,7 +829,7 @@ mod serial_tests {
             InstrumentId::from("SPY:CALL.OPRA"),
             true,
             500.0,
-            20270315,
+            20_270_315,
             40,
             0.125,
             100.0,
@@ -844,18 +862,20 @@ mod serial_tests {
         let second = Bytes::from("second_value");
 
         pg_cache.add(key.clone(), first.clone()).unwrap();
-        wait_until(
-            || pg_cache.load().unwrap().get(&key) == Some(&first),
+        wait_until_async(
+            || async { pg_cache.load().unwrap().get(&key) == Some(&first) },
             Duration::from_secs(5),
-        );
+        )
+        .await;
 
         // Re-adding an existing key must update the stored value, matching the
         // in-memory cache's insert semantics, rather than fail on the primary key.
         pg_cache.add(key.clone(), second.clone()).unwrap();
-        wait_until(
-            || pg_cache.load().unwrap().get(&key) == Some(&second),
+        wait_until_async(
+            || async { pg_cache.load().unwrap().get(&key) == Some(&second) },
             Duration::from_secs(5),
-        );
+        )
+        .await;
 
         reset_test_database(&pg_cache).await;
         pg_cache.close().unwrap();
@@ -869,13 +889,15 @@ mod serial_tests {
         pg_cache
             .add(String::from("test_id"), test_id_value.clone())
             .unwrap();
-        wait_until(
-            || {
+        wait_until_async(
+            || async {
                 let result = pg_cache.load().unwrap();
                 result.keys().len() > 0
             },
             Duration::from_secs(5),
-        );
+        )
+        .await;
+
         let result = pg_cache.load().unwrap();
         assert_eq!(result.keys().len(), 1);
         assert_eq!(
@@ -886,6 +908,116 @@ mod serial_tests {
 
         reset_test_database(&pg_cache).await;
         pg_cache.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_general_entries_are_trader_scoped() {
+        let trader_a = TraderId::from("GENERAL-001");
+        let trader_b = TraderId::from("GENERAL-001:SECOND-002");
+        let mut database = get_pg_cache_database(trader_a).await.unwrap();
+        reset_test_database(&database).await;
+        let key = "strategy:préférences";
+        let legacy_key = "legacy-preferences";
+        let legacy_value = b"old shared value";
+        DatabaseQueries::add(
+            &database.pool,
+            legacy_key.to_string(),
+            legacy_value.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let value_a = Bytes::from_static(b"value-a");
+        let value_b = Bytes::from_static(b"value-b");
+        for (trader_id, value) in [(trader_a, &value_a), (trader_b, &value_b)] {
+            let writer = get_pg_cache_database(trader_id).await.unwrap();
+            let mut cache = Cache::new(None, Some(Box::new(writer)));
+            cache.add(key, value.clone()).unwrap();
+            cache.dispose();
+        }
+
+        let reader_a = get_pg_cache_database(trader_a).await.unwrap();
+        let reader_b = get_pg_cache_database(trader_b).await.unwrap();
+        let mut cache_a = Cache::new(None, Some(Box::new(reader_a)));
+        let mut cache_b = Cache::new(None, Some(Box::new(reader_b)));
+        cache_a.reload().await.unwrap();
+        cache_b.reload().await.unwrap();
+        assert_eq!(cache_a.get(key).unwrap(), Some(&value_a));
+        assert_eq!(cache_b.get(key).unwrap(), Some(&value_b));
+        assert_eq!(cache_a.get(legacy_key).unwrap(), None);
+        assert_eq!(cache_b.get(legacy_key).unwrap(), None);
+
+        cache_a.flush_db().unwrap();
+        cache_a.reload().await.unwrap();
+        cache_b.reload().await.unwrap();
+        assert_eq!(cache_a.get(key).unwrap(), None);
+        assert_eq!(cache_b.get(key).unwrap(), Some(&value_b));
+        assert_eq!(
+            DatabaseQueries::load(&database.pool).await.unwrap()[legacy_key],
+            legacy_value
+        );
+
+        cache_a.dispose();
+        cache_b.dispose();
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_archive_is_trader_local_and_survives_flush() {
+        let owner = TraderId::from("ARCHIVE-001:OWNER-002");
+        let writer = get_pg_cache_database(owner).await.unwrap();
+        reset_test_database(&writer).await;
+        let pool = writer.pool.clone();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let order = shared_order(&instrument, owner, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        let mut cache = Cache::new(None, Some(Box::new(writer)));
+
+        let legacy = Cache::default()
+            .snapshot_position_encoded(&position)
+            .unwrap();
+        DatabaseQueries::add(&pool, legacy.blob_ref.clone(), legacy.blob.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(cache.load_snapshot_blob(&legacy.blob_ref).unwrap(), None);
+
+        let snapshot = cache.snapshot_position_encoded(&position).unwrap();
+        let (blob_ref, blob) = (snapshot.blob_ref, snapshot.blob);
+
+        cache.flush_db().unwrap();
+        cache.dispose();
+
+        let other = get_pg_cache_database(TraderId::from("ARCHIVE-002"))
+            .await
+            .unwrap();
+        let mut other_cache = Cache::new(None, Some(Box::new(other)));
+        assert_eq!(other_cache.load_snapshot_blob(&blob_ref).unwrap(), None);
+        other_cache.dispose();
+
+        let reader = get_pg_cache_database(owner).await.unwrap();
+        let pool = reader.pool.clone();
+        let mut restarted = Cache::new(None, Some(Box::new(reader)));
+        let oms_key = format!(
+            "cache-database:trader:{}:{owner}:{POSITION_OMS_KEY_PREFIX}P-OTHER",
+            owner.as_str().len(),
+        );
+        DatabaseQueries::add(&pool, oms_key, b"INVALID".to_vec())
+            .await
+            .unwrap();
+        let error = restarted.reload().await.unwrap_err();
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+
+        let loaded = restarted.load_snapshot_blob(&blob_ref).unwrap().unwrap();
+        assert_eq!(loaded, blob);
+        restarted.restore_snapshot_blob(&blob_ref, loaded).unwrap();
+        assert_eq!(
+            restarted.position_snapshot_bytes(&position.id),
+            Some(vec![blob.to_vec()])
+        );
+
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        restarted.dispose();
     }
 
     #[expect(
@@ -1113,6 +1245,7 @@ mod serial_tests {
     #[rstest]
     #[case("underlying_instrument_id")]
     #[case("exercise_style")]
+    #[case("strike_currency")]
     #[case("settlement_type")]
     #[case("tick_scheme")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1123,14 +1256,14 @@ mod serial_tests {
         let options = get_postgres_connect_options(None, None, None, None, None);
         let pool = connect_test_pg(options.into()).await.unwrap();
         sqlx::query(AssertSqlSafe(format!(
-            "ALTER TABLE instrument DROP COLUMN {column}"
+            "ALTER TABLE instrument RENAME COLUMN {column} TO hidden_test_column"
         )))
         .execute(&pool)
         .await
         .unwrap();
         let blocked = get_test_pg_cache_database().await;
         sqlx::query(AssertSqlSafe(format!(
-            "ALTER TABLE instrument ADD COLUMN {column} TEXT"
+            "ALTER TABLE instrument RENAME COLUMN hidden_test_column TO {column}"
         )))
         .execute(&pool)
         .await
@@ -1144,6 +1277,127 @@ mod serial_tests {
                 .to_string()
                 .contains(&format!("missing cache columns instrument.{column}"))
         );
+    }
+
+    #[rstest]
+    #[case::populated(true)]
+    #[case::nulls(false)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_futures_spread_round_trip(
+        mut futures_spread_es: FuturesSpread,
+        #[case] populated: bool,
+    ) {
+        futures_spread_es.raw_symbol = Symbol::from("ESM4-ESU4-LOCAL");
+        futures_spread_es.currency = Currency::EUR();
+        futures_spread_es.price_precision = 3;
+        futures_spread_es.price_increment = Price::from("0.025");
+        futures_spread_es.multiplier = Quantity::from("50");
+        futures_spread_es.lot_size = Quantity::from("5");
+        futures_spread_es.margin_init = Decimal::from_str("0.17").unwrap();
+        futures_spread_es.margin_maint = Decimal::from_str("0.09").unwrap();
+        futures_spread_es.ts_event = UnixNanos::from(1_700_000_000_000_000_123_u64);
+        futures_spread_es.ts_init = UnixNanos::from(1_700_000_000_000_000_456_u64);
+        futures_spread_es.exchange = populated.then(|| Ustr::from("XCME"));
+        futures_spread_es.max_quantity = populated.then(|| Quantity::from("137"));
+        futures_spread_es.min_quantity = populated.then(|| Quantity::from("2"));
+        futures_spread_es.max_price = populated.then(|| Price::from("8.625"));
+        futures_spread_es.min_price = populated.then(|| Price::from("-3.125"));
+        futures_spread_es.tick_scheme = populated.then(|| Ustr::from("FIXED_PRECISION_3"));
+        futures_spread_es.info = populated.then(|| {
+            serde_json::from_value(serde_json::json!({
+                "legs": [
+                    {"instrument_id": "ESM4.GLBX", "ratio": 1},
+                    {"instrument_id": "ESU4.GLBX", "ratio": -1}
+                ],
+                "strategy": "calendar"
+            }))
+            .unwrap()
+        });
+
+        let expected = futures_spread_es.into_any();
+        let mut writer = get_test_pg_cache_database().await.unwrap();
+        writer.add_currency(&expected.quote_currency()).unwrap();
+        writer.add_instrument(&expected).unwrap();
+        writer.close().unwrap();
+
+        let mut restarted = get_test_pg_cache_database().await.unwrap();
+        let loaded = restarted
+            .load_instrument(&expected.id())
+            .await
+            .unwrap()
+            .unwrap();
+        let recovered = restarted.load_all().await.unwrap().instruments;
+
+        assert_entirely_equal(&loaded, &expected);
+        assert_entirely_equal(&recovered[&expected.id()], &expected);
+
+        reset_test_database(&restarted).await;
+        restarted.close().unwrap();
+    }
+
+    #[rstest]
+    #[case("raw_symbol", "''")]
+    #[case("settlement_currency", "'EUR'")]
+    #[case("is_inverse", "TRUE")]
+    #[case("activation_ns", "'invalid'")]
+    #[case("activation_ns", "'1.0'")]
+    #[case("expiration_ns", "'2024-06-21'")]
+    #[case("ts_event", "'1e3'")]
+    #[case("ts_init", "'1.5'")]
+    #[case("price_precision", "3")]
+    #[case("size_precision", "1")]
+    #[case("size_increment", "'2'")]
+    #[case("size_increment", "'1.0'")]
+    #[case("max_price", "'invalid'")]
+    #[case("margin_init", "'0.00000000000000000000000000001'")]
+    #[case("margin_maint", "'1.23456789012345678901234567891'")]
+    #[case("tick_scheme", "'UNKNOWN'")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_futures_spread_invalid_rows(
+        futures_spread_es: FuturesSpread,
+        #[case] column: &str,
+        #[case] value: &str,
+    ) {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let id = futures_spread_es.id;
+        for currency in [futures_spread_es.currency, Currency::EUR()] {
+            DatabaseQueries::add_currency(&database.pool, currency)
+                .await
+                .unwrap();
+        }
+
+        DatabaseQueries::add_instrument(
+            &database.pool,
+            "FUTURES_SPREAD",
+            Box::new(futures_spread_es),
+        )
+        .await
+        .unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE instrument SET {column} = {value} WHERE id = $1"
+        )))
+        .bind(id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let lookup_error = database.load_instrument(&id).await.unwrap_err();
+        let bulk_error = database.load_instruments().await.unwrap_err();
+        for error in [lookup_error, bulk_error] {
+            let sqlx::Error::Decode(source) = error.downcast::<sqlx::Error>().unwrap() else {
+                panic!("Expected a SQL decode error for {id}");
+            };
+
+            let message = source.to_string();
+            assert!(
+                message.starts_with(&format!("Invalid FuturesSpread row Some(\"{id}\"): ")),
+                "{message}"
+            );
+            assert!(message.contains(column), "{message}");
+        }
+
+        reset_test_database(&database).await;
+        database.close().unwrap();
     }
 
     #[rstest]
@@ -1332,7 +1586,8 @@ mod serial_tests {
         for currency in [
             instrument.base_currency(),
             Some(instrument.quote_currency()),
-            Some(instrument.settlement_currency()),
+            Some(Currency::JPY()),
+            Some(Currency::EUR()),
         ]
         .into_iter()
         .flatten()
@@ -1364,6 +1619,8 @@ mod serial_tests {
                 .values_mut()
                 .next()
                 .unwrap();
+            fields["strike_currency"] = serde_json::json!(if known { "JPY" } else { "EUR" });
+            fields["settlement_currency"] = serde_json::json!(if known { "EUR" } else { "JPY" });
             fields["underlying_instrument_id"] =
                 serde_json::to_value(known.then_some(underlying_id)).unwrap();
             fields["exercise_style"] = serde_json::to_value(style).unwrap();
@@ -2448,7 +2705,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_order_for_open_order() {
-        let mut pg_cache = get_test_pg_cache_database().await.unwrap();
+        let pg_cache = get_test_pg_cache_database().await.unwrap();
 
         let client_order_id_1 = ClientOrderId::new("O-19700101-000000-001-002-1");
         let instrument = InstrumentAny::CurrencyPair(currency_pair_ethusdt());
@@ -2512,10 +2769,21 @@ mod serial_tests {
             .load_order(&market_order.client_order_id())
             .await
             .unwrap();
-        assert_entirely_equal(market_order_result.unwrap(), market_order);
+        assert_entirely_equal(market_order_result.as_ref().unwrap(), &market_order);
 
-        reset_test_database(&pg_cache).await;
-        pg_cache.close().unwrap();
+        let pool = pg_cache.pool.clone();
+        let mut cache = Cache::new(None, Some(Box::new(pg_cache)));
+        cache.reload().await.unwrap();
+        sqlx::query("UPDATE order_event SET order_side = 'INVALID' WHERE kind = 'OrderFilled'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = cache.reload().await.unwrap_err();
+        assert!(error.to_string().contains("order_side"));
+        assert_entirely_equal(&*cache.order(&client_order_id_1).unwrap(), &market_order);
+
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        cache.dispose();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3061,10 +3329,11 @@ mod serial_tests {
         let signal = Signal::new(name, value, UnixNanos::from(1), UnixNanos::from(2));
         pg_cache.add_signal(&signal).unwrap();
 
-        wait_until(
-            || pg_cache.load_signals(name.as_str()).unwrap().len() == 1,
+        wait_until_async(
+            || async { pg_cache.load_signals(name.as_str()).unwrap().len() == 1 },
             Duration::from_secs(5),
-        );
+        )
+        .await;
 
         let signals = pg_cache.load_signals(name.as_str()).unwrap();
         assert_eq!(signals.len(), 1);
@@ -3103,10 +3372,11 @@ mod serial_tests {
 
         pg_cache.add_custom_data(&data).unwrap();
 
-        wait_until(
-            || pg_cache.load_custom_data(&data_type).unwrap().len() == 1,
+        wait_until_async(
+            || async { pg_cache.load_custom_data(&data_type).unwrap().len() == 1 },
             Duration::from_secs(5),
-        );
+        )
+        .await;
 
         let datas = pg_cache.load_custom_data(&data_type).unwrap();
         assert_eq!(datas.len(), 1);
@@ -3147,15 +3417,16 @@ mod serial_tests {
 
         pg_cache.snapshot_order_state(&order).unwrap();
 
-        wait_until(
-            || {
+        wait_until_async(
+            || async {
                 pg_cache
                     .load_order_snapshot(&client_order_id)
                     .unwrap()
                     .is_some()
             },
             Duration::from_secs(5),
-        );
+        )
+        .await;
 
         let loaded = pg_cache
             .load_order_snapshot(&client_order_id)
@@ -3194,15 +3465,16 @@ mod serial_tests {
 
         pg_cache.add_order_snapshot(&snapshot).unwrap();
 
-        wait_until(
-            || {
+        wait_until_async(
+            || async {
                 pg_cache
                     .load_order_snapshot(&client_order_id)
                     .unwrap()
                     .is_some()
             },
             Duration::from_secs(5),
-        );
+        )
+        .await;
 
         let loaded = pg_cache
             .load_order_snapshot(&client_order_id)
@@ -3345,9 +3617,12 @@ mod serial_tests {
     fn order_numeric_migration_sql() -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../schema/sql/tables.sql");
         let schema = std::fs::read_to_string(path).unwrap();
-        let start = schema
-            .find("DO $$")
-            .expect("no DO block in tables.sql; the order-column migration moved");
+        let marker = schema
+            .find("ALTER COLUMN avg_px TYPE NUMERIC")
+            .expect("no order-column migration in tables.sql");
+        let start = schema[..marker]
+            .rfind("DO $$")
+            .expect("missing order-column migration guard");
         let end = schema[start..]
             .find("END $$;")
             .expect("unterminated DO block in tables.sql")
@@ -3356,7 +3631,7 @@ mod serial_tests {
         let block = schema[start..end].to_string();
         assert!(
             block.contains("avg_px TYPE NUMERIC") && block.contains("slippage TYPE NUMERIC"),
-            "first DO block in tables.sql is no longer the order-column migration"
+            "incomplete order-column migration in tables.sql"
         );
         block
     }
@@ -3721,18 +3996,36 @@ mod serial_tests {
         cache.dispose();
     }
 
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_netting_position_reopen_survives_cache_restart(
+        #[values(ReplayMode::Fresh, ReplayMode::Carry, ReplayMode::Corrected)] mode: ReplayMode,
+    ) {
+        let trader_id = TraderId::from(format!("reopen-{}", UUID4::new()));
+        let adapter = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let mut restarted = check_netting_position_reopen(
+            Box::new(adapter),
+            &PostgresCacheConfig::default(),
+            CacheConfig::default(),
+            trader_id,
+            mode,
+        )
+        .await;
+        restarted.flush().unwrap();
+        restarted.close().unwrap();
+    }
+
     async fn get_test_pg_cache_database_for_trader(
         trader_id: TraderId,
     ) -> anyhow::Result<PostgresCacheDatabase> {
-        match tokio::time::timeout(Duration::from_secs(2), get_pg_cache_database(trader_id)).await {
-            Ok(result) => result.map_err(|e| {
+        tokio::time::timeout(POSTGRES_SETUP_TIMEOUT, get_pg_cache_database(trader_id))
+            .await
+            .map_err(|e| anyhow::anyhow!("PostgreSQL cache initialization timed out: {e}"))?
+            .map_err(|e| {
                 anyhow::anyhow!("A running PostgreSQL service is required for this test: {e}")
-            }),
-            Err(e) => Err(anyhow::anyhow!(
-                "A running PostgreSQL service is required for this test: connection timed out: \
-                 {e}"
-            )),
-        }
+            })
     }
 
     async fn add_test_instrument(pg_cache: &PostgresCacheDatabase, instrument: &InstrumentAny) {
@@ -3775,12 +4068,467 @@ mod serial_tests {
             .build()
     }
 
+    #[rstest]
+    #[case::market(OrderType::StopMarket, OrderType::Market, false)]
+    #[case::limit(OrderType::StopLimit, OrderType::Limit, false)]
+    #[case::legacy_market(OrderType::StopMarket, OrderType::Market, true)]
+    #[case::legacy_limit(OrderType::StopLimit, OrderType::Limit, true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_released_emulated_order_survives_postgres_restart(
+        #[case] original_type: OrderType,
+        #[case] released_type: OrderType,
+        #[case] legacy: bool,
+    ) {
+        let trader_id = TraderId::from("TRADER-001");
+        let other_trader_id = TraderId::from("TRADER-002");
+        let client_order_id = ClientOrderId::new(SHARED_CLIENT_ORDER_ID);
+        let client_id = ClientId::new("CLIENT-A");
+        let other_client_id = ClientId::new("CLIENT-B");
+        let position_id = PositionId::new("POSITION-A");
+        let other_position_id = PositionId::new("POSITION-B");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let mut database = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&database).await;
+        add_test_instrument(&database, &instrument).await;
+
+        let unrelated = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(trader_id)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-PG-UNRELATED"))
+            .quantity(Quantity::from("3.0"))
+            .build();
+        let foreign = shared_order(&instrument, other_trader_id, "2.0");
+        DatabaseQueries::add_order(&database.pool, unrelated.init_event().clone(), None)
+            .await
+            .unwrap();
+        DatabaseQueries::add_order(
+            &database.pool,
+            foreign.init_event().clone(),
+            Some(other_client_id),
+        )
+        .await
+        .unwrap();
+        DatabaseQueries::index_order_position(
+            &database.pool,
+            &other_trader_id,
+            client_order_id,
+            other_position_id,
+        )
+        .await
+        .unwrap();
+
+        let backing = if legacy {
+            None
+        } else {
+            let writer = get_test_pg_cache_database_for_trader(trader_id)
+                .await
+                .unwrap();
+            Some(Box::new(writer) as Box<dyn CacheDatabaseAdapter>)
+        };
+
+        let released = release_pg_test_order(
+            backing,
+            &instrument,
+            trader_id,
+            client_order_id,
+            client_id,
+            position_id,
+            original_type,
+        );
+
+        if legacy {
+            for (index, event) in released.events().into_iter().enumerate() {
+                let event_client_id = (index == 0).then_some(client_id);
+                DatabaseQueries::add_order_event(
+                    &database.pool,
+                    event.clone().into_boxed(),
+                    event_client_id,
+                )
+                .await
+                .unwrap();
+            }
+
+            DatabaseQueries::index_order_position(
+                &database.pool,
+                &trader_id,
+                client_order_id,
+                position_id,
+            )
+            .await
+            .unwrap();
+        }
+
+        database.close().unwrap();
+
+        let reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let restored = DatabaseQueries::load_order(&reader.pool, &client_order_id, &trader_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.order_type(), released_type);
+        assert_eq!(restored.status(), OrderStatus::Released);
+        assert_eq!(restored.events(), released.events());
+
+        let other_orders = DatabaseQueries::load_orders(&reader.pool, &other_trader_id)
+            .await
+            .unwrap();
+        assert_entirely_equal(other_orders.as_slice(), std::slice::from_ref(&foreign));
+        let other_clients =
+            DatabaseQueries::load_distinct_order_event_client_ids(&reader.pool, &other_trader_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_clients,
+            AHashMap::from([(client_order_id, other_client_id)])
+        );
+        let other_positions =
+            DatabaseQueries::load_index_order_position(&reader.pool, &other_trader_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_positions,
+            AHashMap::from([(client_order_id, other_position_id)])
+        );
+        let recovery_pool = reader.pool.clone();
+        let mut restarted = Cache::new(None, Some(Box::new(reader)));
+        restarted.cache_all().await.unwrap();
+        restarted.build_index();
+        assert_entirely_equal(&restarted.order_owned(&client_order_id).unwrap(), &released);
+        assert_entirely_equal(
+            &restarted.order_owned(&unrelated.client_order_id()).unwrap(),
+            &unrelated,
+        );
+        assert_eq!(restarted.client_id(&client_order_id), Some(&client_id));
+        assert_eq!(restarted.position_id(&client_order_id), Some(&position_id));
+
+        DatabaseQueries::truncate(&recovery_pool).await.unwrap();
+        restarted.dispose();
+    }
+
+    fn release_pg_test_order(
+        backing: Option<Box<dyn CacheDatabaseAdapter>>,
+        instrument: &InstrumentAny,
+        trader_id: TraderId,
+        client_order_id: ClientOrderId,
+        client_id: ClientId,
+        position_id: PositionId,
+        original_type: OrderType,
+    ) -> OrderAny {
+        let cache = Rc::new(RefCell::new(Cache::new(None, backing)));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let emulator_clock = Rc::clone(&clock);
+        let mut emulator = OrderEmulator::new(emulator_clock, Rc::clone(&cache));
+
+        let mut builder = OrderTestBuilder::new(original_type);
+        builder
+            .trader_id(trader_id)
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .quantity(Quantity::from("1.0"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .trigger_price(Price::from("5100.00"))
+            .ts_init(1.into());
+
+        if original_type == OrderType::StopLimit {
+            builder.price(Price::from("5105.00"));
+        }
+
+        let order = builder.build();
+        let command = SubmitOrder::from_order(
+            &order,
+            trader_id,
+            Some(client_id),
+            Some(position_id),
+            UUID4::new(),
+            1.into(),
+        );
+        cache
+            .borrow_mut()
+            .add_order(order, Some(position_id), Some(client_id), false)
+            .unwrap();
+
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("5099.00"),
+            Price::from("5101.00"),
+            Quantity::from("10.0"),
+            Quantity::from("10.0"),
+            3.into(),
+            3.into(),
+        );
+
+        if original_type == OrderType::StopMarket {
+            cache.borrow_mut().add_quote(quote).unwrap();
+            clock.borrow_mut().advance_time(3.into(), true);
+            emulator.handle_submit_order(&command);
+        } else {
+            clock.borrow_mut().advance_time(2.into(), true);
+            emulator.handle_submit_order(&command);
+            assert_eq!(
+                cache.borrow().order(&client_order_id).unwrap().status(),
+                OrderStatus::Emulated
+            );
+            clock.borrow_mut().advance_time(3.into(), true);
+            emulator.on_quote_tick(quote);
+        }
+
+        let released = cache.borrow().order_owned(&client_order_id).unwrap();
+        assert_eq!(released.status(), OrderStatus::Released);
+        cache.borrow_mut().dispose();
+        released
+    }
+
+    #[rstest]
+    #[case::pending(None)]
+    #[case::rolled_back(Some(false))]
+    #[case::canceled(Some(true))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_postgres_order_replacement_commits_with_first_update(
+        #[case] commit: Option<bool>,
+    ) {
+        let trader_id = TraderId::from("TRADER-001");
+        let strategy_id = StrategyId::new(SHARED_STRATEGY_ID);
+        let client_order_id = ClientOrderId::new(SHARED_CLIENT_ORDER_ID);
+        let original_client_id = ClientId::new("CLIENT-ORIGINAL");
+        let replacement_client_id = ClientId::new("CLIENT-REPLACEMENT");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let mut writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&writer).await;
+        add_test_instrument(&writer, &instrument).await;
+
+        let (original, mut replacement) = pending_replacement_orders(&instrument, trader_id);
+        writer
+            .add_order(&original, Some(original_client_id))
+            .unwrap();
+        writer.update_order(original.last_event()).unwrap();
+        writer
+            .add_order(&replacement, Some(replacement_client_id))
+            .unwrap();
+
+        if let Some(commit) = commit {
+            let instrument_id = if commit {
+                instrument.id()
+            } else {
+                InstrumentId::from("MISSING.SIM")
+            };
+
+            let canceled = OrderCanceled::new(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                UUID4::new(),
+                2.into(),
+                2.into(),
+                false,
+                None,
+                None,
+                None,
+            );
+
+            let canceled = OrderEventAny::Canceled(canceled);
+            writer.update_order(&canceled).unwrap();
+            if commit {
+                replacement.apply(canceled).unwrap();
+            } else {
+                writer
+                    .add_order(&replacement, Some(replacement_client_id))
+                    .unwrap();
+                let submitted = TestOrderEventStubs::submitted(&replacement, account_id());
+                writer.update_order(&submitted).unwrap();
+            }
+        }
+
+        writer.close().unwrap();
+
+        let mut reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let restored = DatabaseQueries::load_order(&reader.pool, &client_order_id, &trader_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let clients = reader.load_index_order_client().unwrap();
+
+        let (expected, expected_client_id) = if commit == Some(true) {
+            (replacement, replacement_client_id)
+        } else {
+            (original, original_client_id)
+        };
+
+        assert_entirely_equal(restored, expected);
+        assert_eq!(
+            clients,
+            AHashMap::from([(client_order_id, expected_client_id)])
+        );
+        DatabaseQueries::index_order_clients(
+            &reader.pool,
+            &trader_id,
+            &[(client_order_id, expected_client_id)],
+        )
+        .await
+        .unwrap();
+
+        reset_test_database(&reader).await;
+        reader.close().unwrap();
+    }
+
+    #[rstest]
+    #[case::reload(true, OrderType::StopMarket)]
+    #[case::requeue(false, OrderType::Market)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_postgres_pending_order_replacement_route(
+        #[case] reload: bool,
+        #[case] order_type: OrderType,
+    ) {
+        let trader_id = TraderId::from("TRADER-001");
+        let client_order_id = ClientOrderId::new(SHARED_CLIENT_ORDER_ID);
+        let original_client_id = ClientId::new("CLIENT-ORIGINAL");
+        let replacement_client_id = ClientId::new("CLIENT-REPLACEMENT");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&writer).await;
+        add_test_instrument(&writer, &instrument).await;
+
+        let (original, replacement) = pending_replacement_orders(&instrument, trader_id);
+        writer
+            .add_order(&original, Some(original_client_id))
+            .unwrap();
+        writer.update_order(original.last_event()).unwrap();
+        wait_until_async(
+            || async {
+                DatabaseQueries::load_order(&writer.pool, &client_order_id, &trader_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|order| order.status() == OrderStatus::Emulated)
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        DatabaseQueries::index_order_clients(
+            &writer.pool,
+            &trader_id,
+            &[(client_order_id, original_client_id)],
+        )
+        .await
+        .unwrap();
+
+        let mut cache = Cache::new(None, Some(Box::new(writer)));
+        cache.cache_all().await.unwrap();
+        cache.build_index();
+        cache
+            .add_order(replacement.clone(), None, Some(replacement_client_id), true)
+            .unwrap();
+
+        let expected_client_id = if reload {
+            cache.reload().await.unwrap();
+            cache.build_index();
+            original_client_id
+        } else {
+            cache.add_order(replacement, None, None, true).unwrap();
+            replacement_client_id
+        };
+
+        let active = cache.order_owned(&client_order_id).unwrap();
+        let canceled = TestOrderEventStubs::canceled(&active, account_id(), None);
+        let expected = cache.update_order(&canceled).unwrap();
+        assert_eq!(expected.order_type(), order_type);
+        assert_eq!(cache.client_id(&client_order_id), Some(&expected_client_id));
+        cache.dispose();
+
+        let mut reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let restored = DatabaseQueries::load_order(&reader.pool, &client_order_id, &trader_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let clients = reader.load_index_order_client().unwrap();
+        assert_entirely_equal(restored, expected);
+        assert_eq!(
+            clients,
+            AHashMap::from([(client_order_id, expected_client_id)])
+        );
+        DatabaseQueries::index_order_clients(
+            &reader.pool,
+            &trader_id,
+            &[(client_order_id, expected_client_id)],
+        )
+        .await
+        .unwrap();
+        reset_test_database(&reader).await;
+        reader.close().unwrap();
+    }
+
+    fn pending_replacement_orders(
+        instrument: &InstrumentAny,
+        trader_id: TraderId,
+    ) -> (OrderAny, OrderAny) {
+        let strategy_id = StrategyId::new(SHARED_STRATEGY_ID);
+        let client_order_id = ClientOrderId::new(SHARED_CLIENT_ORDER_ID);
+        let mut original = OrderTestBuilder::new(OrderType::StopMarket)
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .quantity(Quantity::from("2.0"))
+            .trigger_price(Price::from("5100.00"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build();
+
+        let emulated = OrderEmulated::new(
+            trader_id,
+            strategy_id,
+            instrument.id(),
+            client_order_id,
+            UUID4::new(),
+            1.into(),
+            1.into(),
+        );
+
+        original.apply(OrderEventAny::Emulated(emulated)).unwrap();
+
+        let OrderAny::Market(mut replacement) = shared_order(instrument, trader_id, "2.0") else {
+            unreachable!();
+        };
+
+        replacement.prepend_events(original.events().into_iter().cloned());
+        (original, OrderAny::Market(replacement))
+    }
+
     fn shared_position(instrument: &InstrumentAny, order: &OrderAny, quantity: &str) -> Position {
+        position_with_id(
+            instrument,
+            order,
+            quantity,
+            shared_netting_position_id(instrument),
+        )
+    }
+
+    fn position_with_id(
+        instrument: &InstrumentAny,
+        order: &OrderAny,
+        quantity: &str,
+        position_id: PositionId,
+    ) -> Position {
         let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
             order,
             instrument,
             Some(TradeId::new("E-PG-SHARED-001")),
-            Some(shared_netting_position_id(instrument)),
+            Some(position_id),
             Some(Price::from("100.0")),
             Some(Quantity::from(quantity)),
             None,
@@ -3985,6 +4733,788 @@ mod serial_tests {
         reset_test_database(&restarted_a).await;
         restarted_a.close().unwrap();
         restarted_b.close().unwrap();
+    }
+
+    #[rstest]
+    #[case::all(true)]
+    #[case::positions_only(false)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_reload_is_trader_scoped(#[case] load_all: bool) {
+        let trader_a = TraderId::from("GENERAL-001");
+        let trader_b = TraderId::from("GENERAL-001:OTHER-002");
+        let traders = [(trader_a, OmsType::Hedging), (trader_b, OmsType::Netting)];
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let position_id = PositionId::new("P-SHARED-OMS");
+        let mut database = get_test_pg_cache_database_for_trader(trader_a)
+            .await
+            .unwrap();
+        reset_test_database(&database).await;
+        add_test_instrument(&database, &instrument).await;
+
+        for (trader_id, oms) in traders {
+            let database = get_test_pg_cache_database_for_trader(trader_id)
+                .await
+                .unwrap();
+            let mut cache = Cache::new(None, Some(Box::new(database)));
+            let order = shared_order(&instrument, trader_id, "1.0");
+            let position = position_with_id(&instrument, &order, "1.0", position_id);
+            cache.add_position_without_order(&position, oms).unwrap();
+            cache.dispose();
+        }
+
+        for (trader_id, oms) in traders {
+            let database = get_test_pg_cache_database_for_trader(trader_id)
+                .await
+                .unwrap();
+            let mut cache = Cache::new(None, Some(Box::new(database)));
+            if load_all {
+                cache.cache_all().await.unwrap();
+            } else {
+                cache.cache_positions().await.unwrap();
+            }
+
+            cache.build_index();
+
+            assert_eq!(cache.oms_type(&position_id), Some(oms));
+            assert_eq!(cache.position(&position_id).unwrap().trader_id, trader_id);
+            cache.dispose();
+        }
+
+        if !load_all {
+            let reader_a = get_test_pg_cache_database_for_trader(trader_a)
+                .await
+                .unwrap();
+            let reader_b = get_test_pg_cache_database_for_trader(trader_b)
+                .await
+                .unwrap();
+            let mut cache = Cache::new(None, Some(Box::new(reader_a)));
+            cache.cache_positions().await.unwrap();
+            cache.set_database(Box::new(reader_b));
+
+            sqlx::query("ALTER TABLE general RENAME TO general_oms_reload_test")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+            let result = cache.cache_positions().await;
+            sqlx::query("ALTER TABLE general_oms_reload_test RENAME TO general")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+
+            let error = result.unwrap_err();
+            let error = error.downcast_ref::<sqlx::Error>().unwrap();
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("42P01")
+            );
+            assert_eq!(cache.position(&position_id).unwrap().trader_id, trader_a);
+            assert_eq!(cache.oms_type(&position_id), Some(OmsType::Hedging));
+            cache.dispose();
+        }
+
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[rstest]
+    #[case::missing_general("general")]
+    #[case::invalid_replay_state("replay_state")]
+    #[case::invalid_fill_side("order_side")]
+    #[case::invalid_fill_quantity("last_qty")]
+    #[case::invalid_oms("oms")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_survives_failed_engine_reload(#[case] failure: &str) {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&writer).await;
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        add_test_instrument(&writer, &instrument).await;
+        let order = shared_order(&instrument, trader_id, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        let position_id = position.id;
+        let oms = Bytes::from(serde_json::to_vec(&OmsType::Hedging).unwrap());
+        writer
+            .add_position_with_oms(&position, OmsType::Hedging)
+            .unwrap();
+
+        if failure == "replay_state" {
+            writer
+                .add_position_snapshot(&PositionSnapshot::from_replay_state(&position, None))
+                .unwrap();
+        }
+
+        writer.close().unwrap();
+
+        let reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let pool = reader.pool.clone();
+        let cache = Rc::new(RefCell::new(Cache::new(None, Some(Box::new(reader)))));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let mut engine = ExecutionEngine::new(clock, Rc::clone(&cache), None);
+        engine.load_cache().await.unwrap();
+        assert_eq!(
+            cache.borrow().oms_type(&position_id),
+            Some(OmsType::Hedging)
+        );
+
+        match failure {
+            "general" => {
+                sqlx::query("ALTER TABLE general RENAME TO general_engine_reload_test")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let result = engine.load_cache().await;
+                sqlx::query("ALTER TABLE general_engine_reload_test RENAME TO general")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+
+                let error = result.unwrap_err();
+                let error = error.downcast_ref::<sqlx::Error>().unwrap();
+                assert_eq!(
+                    error.as_database_error().unwrap().code().as_deref(),
+                    Some("42P01")
+                );
+            }
+            "replay_state" => {
+                sqlx::query(r#"UPDATE "position" SET replay_state = '{}'::jsonb"#)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let error = engine.load_cache().await.unwrap_err();
+                assert!(format!("{error:#}").contains("Failed to decode position replay state"));
+            }
+            "order_side" | "last_qty" => {
+                let statement = if failure == "order_side" {
+                    "UPDATE position_event SET order_side = 'INVALID'"
+                } else {
+                    "UPDATE position_event SET last_qty = 'INVALID'"
+                };
+
+                sqlx::query(statement).execute(&pool).await.unwrap();
+                let error = engine.load_cache().await.unwrap_err();
+                match error.downcast_ref::<sqlx::Error>() {
+                    Some(sqlx::Error::ColumnDecode { index, .. }) => assert_eq!(index, failure),
+                    other => panic!("expected a decode error in {failure}, was {other:?}"),
+                }
+            }
+            "oms" => {
+                sqlx::query("UPDATE general SET value = $1")
+                    .bind(b"INVALID".as_slice())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let error = engine.load_cache().await.unwrap_err();
+                assert!(error.downcast_ref::<serde_json::Error>().is_some());
+                assert!(error.to_string().contains(position_id.as_str()));
+            }
+            _ => unreachable!("unknown recovery failure {failure}"),
+        }
+
+        {
+            let cache = cache.borrow();
+            assert_eq!(cache.oms_type(&position_id), Some(OmsType::Hedging));
+            let cached = cache.position(&position_id).unwrap();
+            assert_entirely_equal(&*cached, &position);
+            let key = format!("{POSITION_OMS_KEY_PREFIX}{position_id}");
+            assert_eq!(cache.get(&key).unwrap(), Some(&oms));
+        }
+
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        cache.borrow_mut().dispose();
+    }
+
+    #[rstest]
+    #[case::accounts("account_event")]
+    #[case::currencies("currency")]
+    #[case::order_position_index("order_position_index")]
+    #[case::order_client_index("client_id")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_engine_reload_preserves_account_on_read_error(#[case] missing: &str) {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut writer = get_pg_cache_database(trader_id).await.unwrap();
+        reset_test_database(&writer).await;
+        let account = shared_account("1000000 USD");
+        writer.add_currency(&Currency::USD()).unwrap();
+        writer.add_account(&account).unwrap();
+        writer.close().unwrap();
+
+        let reader = get_pg_cache_database(trader_id).await.unwrap();
+        let pool = reader.pool.clone();
+        let cache = Rc::new(RefCell::new(Cache::new(None, Some(Box::new(reader)))));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let mut engine = ExecutionEngine::new(clock, Rc::clone(&cache), None);
+        engine.load_cache().await.unwrap();
+
+        let (hide, restore, expected_error) = if missing == "client_id" {
+            (
+                "ALTER TABLE order_event RENAME COLUMN client_id TO client_id_test".to_string(),
+                "ALTER TABLE order_event RENAME COLUMN client_id_test TO client_id".to_string(),
+                "column \"client_id\" does not exist".to_string(),
+            )
+        } else {
+            (
+                format!("ALTER TABLE {missing} RENAME TO engine_reload_test"),
+                format!("ALTER TABLE engine_reload_test RENAME TO {missing}"),
+                format!("relation \"{missing}\" does not exist"),
+            )
+        };
+
+        sqlx::query(AssertSqlSafe(hide))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = engine.load_cache().await;
+        sqlx::query(AssertSqlSafe(restore))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains(&expected_error), "{error:#}");
+        assert_entirely_equal(&*cache.borrow().account(&account.id()).unwrap(), &account);
+
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        cache.borrow_mut().dispose();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_survives_an_instrument_decode_error() {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut writer = get_pg_cache_database(trader_id).await.unwrap();
+        reset_test_database(&writer).await;
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        add_test_instrument(&writer, &instrument).await;
+        let order = shared_order(&instrument, trader_id, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        let healthy_instrument = InstrumentAny::CurrencyPair(currency_pair_ethusdt());
+        add_test_instrument(&writer, &healthy_instrument).await;
+        let healthy_order = shared_order(&healthy_instrument, trader_id, "2.0");
+        let healthy_position = shared_position(&healthy_instrument, &healthy_order, "2.0");
+        writer
+            .add_position_with_oms(&position, OmsType::Hedging)
+            .unwrap();
+        writer
+            .add_position_with_oms(&healthy_position, OmsType::Netting)
+            .unwrap();
+        writer.close().unwrap();
+
+        let reader = get_pg_cache_database(trader_id).await.unwrap();
+        let pool = reader.pool.clone();
+        let cache = Rc::new(RefCell::new(Cache::new(None, Some(Box::new(reader)))));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let mut engine = ExecutionEngine::new(clock, Rc::clone(&cache), None);
+        engine.load_cache().await.unwrap();
+        sqlx::query("UPDATE instrument SET price_increment = 'INVALID' WHERE id = $1")
+            .bind(instrument.id().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let full = engine.load_cache().await.unwrap_err();
+        drop(engine);
+        let mut cache = Rc::into_inner(cache).unwrap().into_inner();
+        let positions_only = cache.cache_positions().await.unwrap_err();
+        let healthy_positions = DatabaseQueries::load_positions(&pool, &trader_id)
+            .await
+            .unwrap();
+
+        for error in [full, positions_only] {
+            match error.downcast_ref::<sqlx::Error>() {
+                Some(sqlx::Error::ColumnDecode { index, .. }) => {
+                    assert_eq!(index, "price_increment");
+                }
+                other => panic!("expected a price increment decode error, was {other:?}"),
+            }
+        }
+
+        assert_entirely_equal(healthy_positions.as_slice(), &[healthy_position]);
+        assert_entirely_equal(&*cache.position(&position.id).unwrap(), &position);
+        assert_eq!(cache.oms_type(&position.id), Some(OmsType::Hedging));
+
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        cache.dispose();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_reload_uses_the_position_snapshot() {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut writer = get_pg_cache_database(trader_id).await.unwrap();
+        reset_test_database(&writer).await;
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        add_test_instrument(&writer, &instrument).await;
+        let order = shared_order(&instrument, trader_id, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        let position_id = position.id;
+        writer
+            .add_position_with_oms(&position, OmsType::Hedging)
+            .unwrap();
+        writer.close().unwrap();
+
+        let reader = get_pg_cache_database(trader_id).await.unwrap();
+        let pool = reader.pool.clone();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(r#"LOCK TABLE "position" IN ACCESS EXCLUSIVE MODE"#)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+
+        let writer_pool = pool.clone();
+
+        let replace = tokio::spawn(async move {
+            let deadline = Duration::from_secs(5);
+
+            let wait_for_lock = wait_until_async(
+                || async {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks
+                         WHERE relation = 'position'::regclass
+                         AND mode = 'AccessShareLock' AND NOT granted)",
+                    )
+                    .fetch_one(&writer_pool)
+                    .await
+                    .unwrap()
+                },
+                deadline,
+            );
+
+            tokio::time::timeout(deadline, wait_for_lock)
+                .await
+                .expect("reload waits for position replay read");
+
+            sqlx::query("UPDATE position_event SET last_qty = '2.0'")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            let key = format!(
+                "cache-database:trader:{}:{trader_id}:{POSITION_OMS_KEY_PREFIX}{position_id}",
+                trader_id.as_str().len()
+            );
+            sqlx::query("UPDATE general SET value = $1 WHERE id = $2")
+                .bind(serde_json::to_vec(&OmsType::Netting).unwrap())
+                .bind(key)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+        });
+
+        let mut cache = Cache::new(None, Some(Box::new(reader)));
+        cache.reload().await.unwrap();
+        replace.await.unwrap();
+
+        assert_entirely_equal(&*cache.position(&position_id).unwrap(), &position);
+        assert_eq!(cache.oms_type(&position_id), Some(OmsType::Hedging));
+
+        cache.reload().await.unwrap();
+        assert_eq!(
+            cache.position(&position_id).unwrap().quantity,
+            Quantity::from("2.0")
+        );
+        assert_eq!(cache.oms_type(&position_id), Some(OmsType::Netting));
+
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        cache.dispose();
+    }
+
+    #[rstest]
+    #[case::delete_position(false)]
+    #[case::flush_trader(true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_cleanup_is_trader_scoped(#[case] flush: bool) {
+        let trader_a = TraderId::from("GENERAL-001");
+        let trader_b = TraderId::from("GENERAL-002");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let position_id = PositionId::new("P-SHARED-OMS");
+        let oms_key = format!("{POSITION_OMS_KEY_PREFIX}{position_id}");
+        let general_key = String::from("general-settings");
+        let general_value = Bytes::from_static(b"trader preferences");
+        let mut writer_a = get_test_pg_cache_database_for_trader(trader_a)
+            .await
+            .unwrap();
+        let mut writer_b = get_test_pg_cache_database_for_trader(trader_b)
+            .await
+            .unwrap();
+        reset_test_database(&writer_a).await;
+        add_test_instrument(&writer_a, &instrument).await;
+        writer_a
+            .add(general_key.clone(), general_value.clone())
+            .unwrap();
+        let oms_b = Bytes::from(serde_json::to_vec(&OmsType::Netting).unwrap());
+
+        for (writer, trader_id, oms_type) in [
+            (&writer_a, trader_a, OmsType::Hedging),
+            (&writer_b, trader_b, OmsType::Netting),
+        ] {
+            let order = shared_order(&instrument, trader_id, "1.0");
+            let position = position_with_id(&instrument, &order, "1.0", position_id);
+            writer.add_position_with_oms(&position, oms_type).unwrap();
+        }
+
+        if flush {
+            writer_a.flush().unwrap();
+        } else {
+            writer_a.delete_position(&position_id).unwrap();
+        }
+
+        writer_a.close().unwrap();
+        writer_b.close().unwrap();
+
+        let mut reader_a = get_test_pg_cache_database_for_trader(trader_a)
+            .await
+            .unwrap();
+        let mut reader_b = get_test_pg_cache_database_for_trader(trader_b)
+            .await
+            .unwrap();
+
+        let expected_a = if flush {
+            AHashMap::new()
+        } else {
+            AHashMap::from([(general_key, general_value)])
+        };
+
+        assert_eq!(reader_a.load().unwrap(), expected_a);
+        assert_eq!(reader_b.load().unwrap(), AHashMap::from([(oms_key, oms_b)]));
+        assert!(reader_a.load_positions().await.unwrap().is_empty());
+        assert_eq!(
+            reader_b.load_positions().await.unwrap()[&position_id].trader_id,
+            trader_b
+        );
+
+        reader_b.close().unwrap();
+        reset_test_database(&reader_a).await;
+        reader_a.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_reserved_key_preserves_metadata_through_reload() {
+        let trader_id = TraderId::from("GENERAL-001:OWNER-002");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let position_id = PositionId::new("P-RESERVED-OMS");
+        let key = format!("{POSITION_OMS_KEY_PREFIX}{position_id}");
+        let raw_value = Bytes::from_static(b"application preferences");
+        let oms_value = Bytes::from(serde_json::to_vec(&OmsType::Hedging).unwrap());
+        let mut database = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&database).await;
+        add_test_instrument(&database, &instrument).await;
+        DatabaseQueries::add(&database.pool, key.clone(), raw_value.to_vec())
+            .await
+            .unwrap();
+
+        let writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let mut cache = Cache::new(None, Some(Box::new(writer)));
+        let order = shared_order(&instrument, trader_id, "1.0");
+        let position = position_with_id(&instrument, &order, "1.0", position_id);
+        cache
+            .add_position_without_order(&position, OmsType::Hedging)
+            .unwrap();
+
+        for reserved_key in [key.as_str(), POSITION_OMS_KEY_PREFIX] {
+            let error = cache.add(reserved_key, raw_value.clone()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Cache key prefix {POSITION_OMS_KEY_PREFIX} is reserved for position OMS metadata"
+                )
+            );
+        }
+
+        cache.build_index();
+        assert_eq!(cache.get(&key).unwrap(), Some(&oms_value));
+        assert_eq!(cache.oms_type(&position_id), Some(OmsType::Hedging));
+        cache.dispose();
+
+        let mut other = get_test_pg_cache_database_for_trader(TraderId::from("GENERAL-003"))
+            .await
+            .unwrap();
+        let scoped_key = format!(
+            "cache-database:trader:{}:{trader_id}:{key}",
+            trader_id.as_str().len()
+        );
+        let other_oms = Bytes::from(serde_json::to_vec(&OmsType::Netting).unwrap());
+        for reserved_key in [scoped_key, key.clone()] {
+            let error = other.add(reserved_key, other_oms.clone()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Postgres cache keys cannot use the cache-database: or position_oms: prefixes"
+            );
+        }
+
+        other.close().unwrap();
+
+        let reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let mut restarted = Cache::new(None, Some(Box::new(reader)));
+        restarted.cache_general().unwrap();
+        restarted.cache_all().await.unwrap();
+        restarted.build_index();
+        assert_eq!(restarted.get(&key).unwrap(), Some(&oms_value));
+        assert_eq!(restarted.oms_type(&position_id), Some(OmsType::Hedging));
+        assert_eq!(
+            DatabaseQueries::load(&database.pool).await.unwrap()[&key],
+            raw_value.as_ref()
+        );
+        restarted.dispose();
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_legacy_owner_is_unspecified() {
+        let trader_a = TraderId::from("GENERAL-001");
+        let trader_b = TraderId::from("GENERAL-002");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let position_id = shared_netting_position_id(&instrument);
+        let key = format!("{POSITION_OMS_KEY_PREFIX}{position_id}");
+        let mut legacy_oms = serde_json::to_vec(&OmsType::Hedging).unwrap();
+        legacy_oms.push(b' ');
+        let mut database = get_test_pg_cache_database_for_trader(trader_a)
+            .await
+            .unwrap();
+        reset_test_database(&database).await;
+        add_test_instrument(&database, &instrument).await;
+        DatabaseQueries::add(&database.pool, key.clone(), legacy_oms.clone())
+            .await
+            .unwrap();
+        database.close().unwrap();
+
+        for trader_id in [trader_a, trader_b] {
+            let mut database = get_test_pg_cache_database_for_trader(trader_id)
+                .await
+                .unwrap();
+            let order = shared_order(&instrument, trader_id, "1.0");
+            database
+                .add_position(&shared_position(&instrument, &order, "1.0"))
+                .unwrap();
+            database.close().unwrap();
+        }
+
+        for trader_id in [trader_a, trader_b] {
+            let database = get_test_pg_cache_database_for_trader(trader_id)
+                .await
+                .unwrap();
+            let mut cache = Cache::new(None, Some(Box::new(database)));
+            cache.cache_all().await.unwrap();
+            cache.build_index();
+            assert_eq!(cache.oms_type(&position_id), Some(OmsType::Unspecified));
+            cache.dispose();
+        }
+
+        let mut database = get_test_pg_cache_database_for_trader(trader_b)
+            .await
+            .unwrap();
+        database.flush().unwrap();
+        assert!(database.load().unwrap().is_empty());
+        assert_eq!(
+            DatabaseQueries::load(&database.pool).await.unwrap()[&key],
+            legacy_oms
+        );
+        database.close().unwrap();
+
+        let database = get_test_pg_cache_database_for_trader(trader_a)
+            .await
+            .unwrap();
+        let mut cache = Cache::new(None, Some(Box::new(database)));
+        cache.cache_positions().await.unwrap();
+        assert_eq!(cache.oms_type(&position_id), Some(OmsType::Unspecified));
+
+        let order = shared_order(&instrument, trader_a, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        cache
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        cache.dispose();
+
+        let database = get_test_pg_cache_database_for_trader(trader_a)
+            .await
+            .unwrap();
+        let pool = database.pool.clone();
+        let mut restarted = Cache::new(None, Some(Box::new(database)));
+        restarted.cache_all().await.unwrap();
+        assert_eq!(restarted.oms_type(&position_id), Some(OmsType::Netting));
+        DatabaseQueries::truncate(&pool).await.unwrap();
+        restarted.dispose();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_write_rolls_back_when_position_write_fails() {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&writer).await;
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let order = shared_order(&instrument, trader_id, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        // The fill's instrument is missing from PostgreSQL, so its foreign key rejects the write
+        writer
+            .add_position_with_oms(&position, OmsType::Hedging)
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        assert_eq!(count_rows(&reader.pool, "position_event").await, 0);
+        assert!(
+            DatabaseQueries::load(&reader.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reader.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_write_rolls_back_when_oms_upsert_fails() {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&writer).await;
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        add_test_instrument(&writer, &instrument).await;
+        let order = shared_order(&instrument, trader_id, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        let oms = Bytes::from(serde_json::to_vec(&OmsType::Hedging).unwrap());
+        writer
+            .add_position_with_oms(&position, OmsType::Hedging)
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut database = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let mut replacement_writer = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"ALTER TABLE general ADD CONSTRAINT reject_netting_oms
+               CHECK (value <> convert_to('"NETTING"', 'UTF8'))"#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let replacement_order = shared_order(&instrument, trader_id, "2.0");
+        let replacement = shared_position(&instrument, &replacement_order, "2.0");
+        replacement_writer
+            .add_position_with_oms(&replacement, OmsType::Netting)
+            .unwrap();
+        replacement_writer.close().unwrap();
+        sqlx::query("ALTER TABLE general DROP CONSTRAINT reject_netting_oms")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let loaded = database.load_position(&position.id).await.unwrap().unwrap();
+        let key = format!("{POSITION_OMS_KEY_PREFIX}{}", position.id);
+        assert_entirely_equal(&loaded, &position);
+        assert_eq!(database.load().unwrap()[&key], oms);
+
+        reset_test_database(&database).await;
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_rejects_another_traders_position() {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut database = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&database).await;
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let foreign_trader = TraderId::from("GENERAL-002");
+        let order = shared_order(&instrument, foreign_trader, "1.0");
+        let position = shared_position(&instrument, &order, "1.0");
+        let error = database
+            .add_position_with_oms(&position, OmsType::Hedging)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cannot persist position {} with OMS metadata for trader {trader_id}",
+                position.id
+            )
+        );
+        database.close().unwrap();
+    }
+
+    #[expect(
+        clippy::disallowed_types,
+        reason = "exercises the PostgreSQL load from a Nautilus runtime LocalSet"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_load_propagates_database_failure() {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        database.close().unwrap();
+
+        let runtime = get_runtime();
+        let error = runtime
+            .spawn_blocking(move || {
+                tokio::task::LocalSet::new()
+                    .block_on(runtime, async { database.load().unwrap_err() })
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::PoolClosed)
+        ));
+    }
+
+    #[expect(
+        clippy::disallowed_types,
+        reason = "verifies that an unsupported runtime context cannot queue a flush"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_position_oms_flush_panic_keeps_trader_data() {
+        let trader_id = TraderId::from("GENERAL-001");
+        let mut reader = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        reset_test_database(&reader).await;
+        let mut database = get_test_pg_cache_database_for_trader(trader_id)
+            .await
+            .unwrap();
+        let heartbeat = UnixNanos::from(42);
+        database.heartbeat(heartbeat).unwrap();
+
+        let runtime = get_runtime();
+        let (mut database, result) = runtime
+            .spawn_blocking(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    tokio::task::LocalSet::new().block_on(runtime, async { database.flush() })
+                }));
+
+                (database, result)
+            })
+            .await
+            .unwrap();
+
+        database.close().unwrap();
+
+        assert!(result.is_err());
+        let heartbeat_key = format!(
+            "cache-database:trader:{}:{trader_id}:health:heartbeat",
+            trader_id.as_str().len()
+        );
+        assert_eq!(
+            DatabaseQueries::load(&reader.pool).await.unwrap(),
+            AHashMap::from([(heartbeat_key, serde_json::to_vec(&heartbeat).unwrap())])
+        );
+
+        reset_test_database(&reader).await;
+        reader.close().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

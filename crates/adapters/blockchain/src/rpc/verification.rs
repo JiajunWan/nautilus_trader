@@ -653,6 +653,7 @@ impl VerificationCoordinator {
                 let slot = B256::from_str(&proxy.storage_slot).expect("validated proxy slot");
                 let expected =
                     B256::from_str(&proxy.storage_value).expect("validated proxy storage value");
+
                 match self.verify_storage(&address, &slot, block).await {
                     VerificationOutcome::Verified(verified) if verified.value == expected => {}
                     VerificationOutcome::Verified(_) => {
@@ -677,6 +678,7 @@ impl VerificationCoordinator {
                     Address::from_str(&proxy.target_address).expect("validated proxy target");
                 let target_hash =
                     B256::from_str(&proxy.target_code_hash).expect("validated proxy target hash");
+
                 match self.verify_code(&target, block).await {
                     VerificationOutcome::Verified(verified)
                         if !verified.value.is_empty()
@@ -1997,9 +1999,9 @@ mod tests {
     fn quote_response(amount: u64) -> String {
         let encoded = (
             U256::from(amount),
-            U160::from(1u128 << 96),
-            0u32,
-            U256::from(50_000u64),
+            U160::from(1_u128 << 96),
+            0_u32,
+            U256::from(50_000_u64),
         )
             .abi_encode();
         serde_json::json!({
@@ -2132,8 +2134,8 @@ mod tests {
     fn normalized_digest_uses_canonical_binary_encoding() {
         let expected = keccak256([3, 0, 0, 0, 0, 0, 0, 0, 42]);
 
-        assert_eq!(normalized_digest(&42u64), expected);
-        assert_ne!(normalized_digest(&42u64), normalized_digest(&43u64));
+        assert_eq!(normalized_digest(&42_u64), expected);
+        assert_ne!(normalized_digest(&42_u64), normalized_digest(&43_u64));
     }
 
     #[rstest]
@@ -2338,8 +2340,8 @@ mod tests {
                 &address!("0000000000000000000000000000000000000004"),
                 address!("0000000000000000000000000000000000000003"),
                 address!("0000000000000000000000000000000000000005"),
-                U256::from(1u64),
-                U24::try_from(500u32).unwrap(),
+                U256::from(1_u64),
+                U24::try_from(500_u32).unwrap(),
                 1,
             )
             .await;
@@ -2367,8 +2369,8 @@ mod tests {
                 &address!("0000000000000000000000000000000000000004"),
                 address!("0000000000000000000000000000000000000003"),
                 address!("0000000000000000000000000000000000000005"),
-                U256::from(1u64),
-                U24::try_from(500u32).unwrap(),
+                U256::from(1_u64),
+                U24::try_from(500_u32).unwrap(),
                 1,
             )
             .await;
@@ -2476,8 +2478,8 @@ mod tests {
                 &address!("0000000000000000000000000000000000000004"),
                 address!("0000000000000000000000000000000000000003"),
                 address!("0000000000000000000000000000000000000005"),
-                U256::from(1u64),
-                U24::try_from(500u32).unwrap(),
+                U256::from(1_u64),
+                U24::try_from(500_u32).unwrap(),
                 1,
             )
             .await;

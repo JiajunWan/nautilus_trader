@@ -1615,7 +1615,7 @@ impl AxHttpClient {
     /// - The instrument is not found in the cache.
     /// - The HTTP request fails.
     /// - Trade parsing fails.
-    pub async fn request_trade_ticks(
+    pub async fn request_trades(
         &self,
         symbol: Ustr,
         limit: Option<i32>,
@@ -2410,10 +2410,6 @@ impl AxHttpClient {
                     anyhow::ensure!(
                         !next_cursor.is_empty(),
                         "AX orders returned an empty next_cursor"
-                    );
-                    anyhow::ensure!(
-                        page_len > 0,
-                        "AX orders returned an empty page with a next_cursor"
                     );
                     anyhow::ensure!(
                         seen_cursors.insert(next_cursor.clone()),

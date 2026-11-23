@@ -133,7 +133,7 @@ alloy-primitives = { version = "1.7.3", default-features = false, features = [
 anyhow = "1.0.104"
 arc-swap = "1.9.5"
 arraydeque = "0.5.1"
-arrow = { version = "59.3.2", default-features = false, features = [
+arrow = { version = "59.3.3", default-features = false, features = [
   "ipc",
   "ffi",
 ] }
@@ -146,10 +146,10 @@ base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
 # Pinned: 3.10.1 pulls prettyplease 0.3 while prost-build still requires 0.2.
 bon = "=3.9.3"
-bytes = { version = "1.12.1", features = ["serde"] }
-clap = { version = "4.6.7", features = ["derive", "env"] }
+bytes = { version = "1.12.2", features = ["serde"] }
+clap = { version = "4.6.8", features = ["derive", "env"] }
 dashmap = "6.2.1"
-datafusion = { version = "55.2.0", default-features = false, features = [
+datafusion = { version = "55.3.0", default-features = false, features = [
   "parquet",
   "regex_expressions",
   "unicode_expressions",
@@ -190,7 +190,7 @@ hyper-util = { version = "0.1.21", default-features = false, features = [
 implied-vol = { version = "2.1.0" }
 indexmap = { version = "2.14.2", features = ["serde"] }
 itchy = "0.3"
-jiff = { version = "0.2.44", default-features = false, features = [
+jiff = { version = "0.2.46", default-features = false, features = [
   "perf-inline",
   "serde",
   "std",
@@ -211,7 +211,7 @@ object_store = { version = "0.13.2", default-features = false, features = [
   "fs",
 ] }
 parking_lot = "0.13.0"
-parquet = { version = "59.3.2", default-features = false, features = [
+parquet = { version = "59.3.3", default-features = false, features = [
   "arrow",
   "arrow_canonical_extension_types",
   "async",
@@ -236,11 +236,11 @@ pyo3-stub-gen = { version = "=0.20.0", default-features = false, features = [
   "rust_decimal",
 ] }
 quote = "1.0.47"
-rand = { version = "0.10.3", default-features = false, features = [
+rand = { version = "0.10.4", default-features = false, features = [
   "std",
   "thread_rng",
 ] }
-redb = { version = "4.6.0", default-features = false }
+redb = { version = "5.0.0", default-features = false, features = ["std"] }
 redis = { version = "1.8.2", default-features = false, features = [
   "connection-manager",
   "sentinel",
@@ -250,7 +250,7 @@ redis = { version = "1.8.2", default-features = false, features = [
   "tls-rustls",
   "tls-rustls-webpki-roots",
 ] }
-regex = { version = "1.13.1", default-features = false, features = [
+regex = { version = "1.13.2", default-features = false, features = [
   "std",
   "perf",
   "unicode-perl",
@@ -276,7 +276,7 @@ serde_json = { version = "1.0.154", default-features = false, features = [
   "std",
 ] }
 serde_urlencoded = "0.7.1"
-smallvec = { version = "1.16.5", features = ["serde"] }
+smallvec = { version = "1.16.6", features = ["serde"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 sockudo-ws = { version = "3.1.1", default-features = false, features = [
   "simd",
@@ -292,7 +292,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ] }
 strum = { version = "0.28.0", features = ["derive"] }
 syn = { version = "3.0.10", features = ["full"] }
-sysinfo = { version = "0.40.3", default-features = false, features = [
+sysinfo = { version = "0.40.4", default-features = false, features = [
   "system",
 ] }
 tabled = { version = "0.22.0", default-features = false, features = ["std"] }
@@ -328,16 +328,16 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
   "fmt",
   "registry",
 ] }
-url = { version = "2.5.8", default-features = false }
+url = { version = "2.5.9", default-features = false }
 ustr = { version = "1.1.0", features = ["serde"] }
-uuid = { version = "1.29.2", features = ["v4", "serde"] }
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
 webpki-roots = "1.0.12"
-zeroize = { version = "1.9.1", features = ["alloc", "zeroize_derive"] }
+zeroize = { version = "1.9.2", features = ["alloc", "zeroize_derive"] }
 
 # -----------------------------------------------------------------------------
 # Adapter dependencies
 # -----------------------------------------------------------------------------
-alloy = { version = "2.5.0", default-features = false }
+alloy = { version = "2.6.1", default-features = false }
 bollard = { version = "0.21.1", default-features = false, features = [
   "http",
   "pipe",
@@ -345,7 +345,7 @@ bollard = { version = "0.21.1", default-features = false, features = [
 bzip2 = "0.6.1"
 cosmrs = { version = "0.22.0", default-features = false }
 csv = "1.4.0"
-databento = { version = "0.63.0" }
+databento = { version = "0.65.0" }
 dydx-proto = { version = "0.4.0", default-features = false }
 fallible-streaming-iterator = "0.1.9"
 hypersync-client = { version = "2.0.0" }
@@ -412,6 +412,12 @@ store = { path = '.supply-chain' }
 [workspace.metadata.cooldown]
 days = 3
 trusted-base = "origin/develop"
+
+# RUSTSEC-2026-0592 is fixed in url 2.5.9, which requires form_urlencoded 1.2.3.
+# Both deltas are audited. Remove this exception after 2026-11-23 23:04 UTC.
+[workspace.metadata.cooldown.allow]
+form_urlencoded = "1.2.3"
+url = "2.5.9"
 
 # -----------------------------------------------------------------------------
 # Profiles
@@ -633,6 +639,7 @@ manual_map = "warn"
 bool_to_int_with_if = "warn"
 explicit_iter_loop = "warn"
 uninlined_format_args = "warn"
+unseparated_literal_suffix = "warn"
 
 # Pedantic (explicitness and clarity)
 borrow_as_ptr = "warn"
@@ -663,6 +670,7 @@ manual_assert = "warn"
 items_after_statements = "warn"
 ignored_unit_patterns = "warn"
 if_not_else = "warn"
+unreadable_literal = "warn"
 
 # Security and robustness
 disallowed_methods = "warn"

@@ -486,7 +486,6 @@ mod tests {
     fn object(token: &str, tagged: bool) -> String {
         let mut fields = BTreeMap::new();
         fields.insert("value", RawValue::from_string(token.to_string()).unwrap());
-
         if tagged {
             fields.insert(
                 "kind",
@@ -914,8 +913,8 @@ mod tests {
         #[rstest]
         fn prop_roundtrips_and_exponent_rescaling(
             mantissa in Decimal::MIN.mantissa()..=Decimal::MAX.mantissa(),
-            scale in 0u32..=Decimal::MAX_SCALE,
-            zeros in 0usize..=35,
+            scale in 0_u32..=Decimal::MAX_SCALE,
+            zeros in 0_usize..=35,
         ) {
             let expected = Decimal::try_from_i128_with_scale(mantissa, scale).unwrap();
             let scientific = format!("{mantissa}{}e-{}", "0".repeat(zeros), scale as usize + zeros);

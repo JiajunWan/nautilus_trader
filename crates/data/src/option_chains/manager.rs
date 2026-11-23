@@ -13,30 +13,31 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Per-series option chain manager.
+//! Per-owner option chain manager.
 //!
 //! Each [`OptionChainManager`] instance is self-contained: it owns its aggregator,
-//! msgbus handlers, and timer for a single option series. The `DataEngine` holds
-//! one manager per active series in
-//! `AHashMap<OptionSeriesId, Rc<RefCell<OptionChainManager>>>`.
+//! msgbus handlers, and timer for one subscription to an option series.
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
+use ahash::AHashSet;
 use nautilus_common::{
     cache::Cache,
     clock::Clock,
     messages::data::{
         SubscribeCommand, SubscribeInstrumentStatus, SubscribeOptionChain, SubscribeOptionGreeks,
-        SubscribeQuotes, UnsubscribeCommand, UnsubscribeInstrumentStatus, UnsubscribeOptionGreeks,
-        UnsubscribeQuotes,
+        SubscribeQuotes, UnsubscribeCommand,
     },
-    msgbus::{self, MStr, Topic, TypedHandler, switchboard},
+    msgbus::{self, TypedHandler, switchboard},
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{DurationNanos, UUID4, correctness::FAILED};
+use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, correctness::FAILED};
 use nautilus_model::{
-    data::{QuoteTick, option_chain::OptionGreeks},
-    enums::OptionKind,
+    data::{
+        QuoteTick,
+        option_chain::{OptionGreeks, StrikeRange},
+    },
+    enums::{GreeksConvention, OptionKind},
     identifiers::{ClientId, InstrumentId, OptionSeriesId, Venue},
     instruments::Instrument,
     types::Price,
@@ -44,7 +45,7 @@ use nautilus_model::{
 use ustr::Ustr;
 
 use super::{
-    AtmTracker, OptionChainAggregator,
+    AtmTracker, OptionChainAggregator, RebalanceAction,
     handlers::{OptionChainGreeksHandler, OptionChainQuoteHandler, OptionChainSlicePublisher},
 };
 use crate::{
@@ -52,32 +53,36 @@ use crate::{
     engine::{DeferredCommand, DeferredCommandQueue},
 };
 
-/// Per-series option chain manager.
+/// Manages one option series subscription.
 ///
-/// Each instance manages a single option series: its aggregator,
-/// handlers, timer, and lifecycle. The `DataEngine` holds one
-/// manager per active series.
+/// A subscription that needs an ATM price can defer strike selection until the
+/// first price arrives. In raw mode, quotes and Greeks for active instruments
+/// trigger publication. In timed mode, the subscription timer triggers publication.
+///
+/// The data engine processes deferred subscription and expiry commands outside
+/// the manager's callbacks. It reuses handler and timer slots after a subscription
+/// ends, so subsequent subscriptions to the same series can reuse interned names.
 #[derive(Debug)]
 pub struct OptionChainManager {
     aggregator: OptionChainAggregator,
-    topic: MStr<Topic>,
+    owner_id: UUID4,
+    slot: usize,
     quote_handlers: Vec<TypedHandler<QuoteTick>>,
     greeks_handlers: Vec<TypedHandler<OptionGreeks>>,
     timer_name: Option<Ustr>,
     msgbus_priority: u32,
-    /// Whether the first ATM price has been received and the active set bootstrapped.
     bootstrapped: bool,
-    /// Shared deferred command queue - the `DataEngine` drains this on each data tick.
     deferred_cmd_queue: DeferredCommandQueue,
-    /// Clock reference for constructing command timestamps.
     clock: Rc<RefCell<dyn Clock>>,
     client_id: Option<ClientId>,
-    /// When `true`, every quote/greeks update for an active instrument immediately publishes a snapshot.
+    params: Option<Params>,
+    greeks_feed_params: Option<Params>,
+    greeks_convention: GreeksConvention,
     raw_mode: bool,
 }
 
 impl OptionChainManager {
-    /// Factory method that creates a per-series manager, registers all msgbus
+    /// Factory method that creates a per-owner manager, registers all msgbus
     /// handlers, forwards subscribe commands to the data client, and sets up
     /// the snapshot timer.
     ///
@@ -86,16 +91,17 @@ impl OptionChainManager {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn create_and_setup(
         series_id: OptionSeriesId,
-        cache: &Rc<RefCell<Cache>>,
+        instruments: HashMap<InstrumentId, (Price, OptionKind)>,
         cmd: &SubscribeOptionChain,
         clock: &Rc<RefCell<dyn Clock>>,
         msgbus_priority: u32,
         client: Option<&mut DataClientAdapter>,
         initial_atm_price: Option<Price>,
+        greeks_convention: GreeksConvention,
         deferred_cmd_queue: DeferredCommandQueue,
+        slot: usize,
     ) -> Rc<RefCell<Self>> {
-        let topic = switchboard::get_option_chain_topic(series_id);
-        let instruments = Self::resolve_instruments(cache, &series_id);
+        let owner_id = cmd.owner_id();
         let client_id = client.as_ref().map(|client| client.client_id);
 
         let mut tracker = AtmTracker::new();
@@ -116,14 +122,17 @@ impl OptionChainManager {
         // When ATM is unknown (ATM-based ranges), this is empty - deferred until bootstrap.
         let active_instrument_ids = aggregator.instrument_ids();
         let all_instrument_ids = aggregator.all_instrument_ids();
-        // If active set is already populated (Fixed range or ATM provided), we're bootstrapped
-        let bootstrapped = !active_instrument_ids.is_empty() || all_instrument_ids.is_empty();
+        // Fixed ranges never wait for ATM, even before their first matching listing
+        let bootstrapped = matches!(cmd.strike_range, StrikeRange::Fixed(_))
+            || !active_instrument_ids.is_empty()
+            || all_instrument_ids.is_empty();
 
         let raw_mode = cmd.snapshot_interval_ms.is_none();
 
         let manager = Self {
             aggregator,
-            topic,
+            owner_id,
+            slot,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
             timer_name: None,
@@ -132,6 +141,9 @@ impl OptionChainManager {
             deferred_cmd_queue,
             clock: Rc::clone(clock),
             client_id,
+            params: cmd.params.clone(),
+            greeks_feed_params: cmd.greeks_feed_params(),
+            greeks_convention,
             raw_mode,
         };
         let manager_rc = Rc::new(RefCell::new(manager));
@@ -141,28 +153,26 @@ impl OptionChainManager {
             &manager_rc,
             &active_instrument_ids,
             series_id,
+            slot,
             msgbus_priority,
         );
         let greeks_handlers = Self::register_greeks_handlers(
             &manager_rc,
             &active_instrument_ids,
             series_id,
+            slot,
             msgbus_priority,
         );
 
         // Forward wire-level subscriptions for the active set.
         // When ATM is unknown, active set is empty - deferred until bootstrap.
-        Self::forward_client_subscriptions(
-            client,
-            &active_instrument_ids,
-            cmd,
-            series_id.venue,
-            clock,
-        );
+        manager_rc
+            .borrow()
+            .forward_client_subscriptions(client, &active_instrument_ids);
 
         let timer_name = cmd
             .snapshot_interval_ms
-            .map(|ms| Self::setup_timer(&manager_rc, series_id, ms, clock));
+            .map(|ms| Self::setup_timer(&manager_rc, series_id, slot, ms, clock));
 
         {
             let mut mgr = manager_rc.borrow_mut();
@@ -184,6 +194,10 @@ impl OptionChainManager {
         manager_rc
     }
 
+    pub(crate) const fn slot(&self) -> usize {
+        self.slot
+    }
+
     /// Registers quote handlers on the msgbus for each instrument.
     ///
     /// Always stores the handler prototype as the first element so that
@@ -192,9 +206,12 @@ impl OptionChainManager {
         manager_rc: &Rc<RefCell<Self>>,
         instrument_ids: &[InstrumentId],
         series_id: OptionSeriesId,
+        slot: usize,
         priority: u32,
     ) -> (Vec<TypedHandler<QuoteTick>>, TypedHandler<QuoteTick>) {
-        let quote_handler = TypedHandler::new(OptionChainQuoteHandler::new(manager_rc, series_id));
+        let quote_handler =
+            TypedHandler::new(OptionChainQuoteHandler::new(manager_rc, series_id, slot));
+
         // Always store prototype as first element for bootstrap cloning
         let mut handlers = Vec::with_capacity(instrument_ids.len() + 1);
         handlers.push(quote_handler.clone());
@@ -215,10 +232,12 @@ impl OptionChainManager {
         manager_rc: &Rc<RefCell<Self>>,
         instrument_ids: &[InstrumentId],
         series_id: OptionSeriesId,
+        slot: usize,
         priority: u32,
     ) -> Vec<TypedHandler<OptionGreeks>> {
         let greeks_handler =
-            TypedHandler::new(OptionChainGreeksHandler::new(manager_rc, series_id));
+            TypedHandler::new(OptionChainGreeksHandler::new(manager_rc, series_id, slot));
+
         // Always store prototype as first element for bootstrap cloning
         let mut handlers = Vec::with_capacity(instrument_ids.len() + 1);
         handlers.push(greeks_handler.clone());
@@ -233,71 +252,36 @@ impl OptionChainManager {
 
     /// Forwards subscribe commands to the data client for all instruments.
     fn forward_client_subscriptions(
+        &self,
         client: Option<&mut DataClientAdapter>,
         instrument_ids: &[InstrumentId],
-        cmd: &SubscribeOptionChain,
-        venue: Venue,
-        clock: &Rc<RefCell<dyn Clock>>,
     ) {
-        let ts_init = clock.borrow().timestamp_ns();
-
         let Some(client) = client else {
             log::error!(
-                "Cannot forward option chain subscriptions: no client found for venue={venue}",
+                "Cannot forward option chain subscriptions: no client for {}",
+                self.venue()
             );
             return;
         };
 
         for instrument_id in instrument_ids {
-            client.execute_subscribe_intent(SubscribeCommand::Quotes(SubscribeQuotes {
-                instrument_ids: vec![*instrument_id],
-                client_id: cmd.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            }));
-            client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(
-                SubscribeOptionGreeks {
-                    instrument_ids: vec![*instrument_id],
-                    client_id: cmd.client_id,
-                    venue: Some(venue),
-                    command_id: UUID4::new(),
-                    ts_init,
-                    correlation_id: None,
-                    params: None,
-                },
-            ));
-            client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
-                SubscribeInstrumentStatus {
-                    instrument_ids: vec![*instrument_id],
-                    client_id: cmd.client_id,
-                    venue: Some(venue),
-                    command_id: UUID4::new(),
-                    ts_init,
-                    correlation_id: None,
-                    params: None,
-                },
-            ));
+            for command in self.subscribe_commands(*instrument_id) {
+                client.execute_subscribe_intent(command);
+            }
         }
-
-        log::info!(
-            "Forwarded {} quote + greeks + instrument status subscriptions to DataClient",
-            instrument_ids.len(),
-        );
     }
 
     /// Sets up the snapshot timer for periodic publishing.
     fn setup_timer(
         manager_rc: &Rc<RefCell<Self>>,
         series_id: OptionSeriesId,
+        slot: usize,
         interval_ms: u64,
         clock: &Rc<RefCell<dyn Clock>>,
     ) -> Ustr {
         let interval_ns = DurationNanos::from_millis(interval_ms);
         let publisher = OptionChainSlicePublisher::new(manager_rc);
-        let timer_name = Ustr::from(&format!("OptionChain|{series_id}|{interval_ms}"));
+        let timer_name = Ustr::from(&format!("OptionChain|{series_id}|{slot}"));
 
         let now_ns = clock.borrow().timestamp_ns();
         let start_time_ns = now_ns
@@ -330,6 +314,10 @@ impl OptionChainManager {
         self.aggregator.all_instrument_ids()
     }
 
+    pub(crate) fn contains_instrument(&self, instrument_id: &InstrumentId) -> bool {
+        self.aggregator.instruments().contains_key(instrument_id)
+    }
+
     /// Returns the venue for this option chain.
     #[must_use]
     pub fn venue(&self) -> Venue {
@@ -342,14 +330,26 @@ impl OptionChainManager {
         self.bootstrapped
     }
 
-    #[must_use]
-    pub(crate) fn is_instrument_active(&self, instrument_id: &InstrumentId) -> bool {
-        self.aggregator.active_ids().contains(instrument_id)
+    pub(crate) const fn is_delta(&self) -> bool {
+        self.aggregator.is_delta()
     }
 
     #[must_use]
     pub(crate) const fn client_id(&self) -> Option<ClientId> {
         self.client_id
+    }
+
+    pub(crate) const fn greeks_feed_params(&self) -> Option<&Params> {
+        self.greeks_feed_params.as_ref()
+    }
+
+    pub(crate) fn unsubscribe_commands(&self) -> Vec<UnsubscribeCommand> {
+        let mut instrument_ids = self.aggregator.instrument_ids();
+        instrument_ids.sort_unstable();
+        instrument_ids
+            .into_iter()
+            .flat_map(|id| self.instrument_unsubscribe_commands(id))
+            .collect()
     }
 
     /// Tears down this manager: unregisters all msgbus handlers and cancels the timer.
@@ -385,7 +385,7 @@ impl OptionChainManager {
         self.greeks_handlers.clear();
     }
 
-    /// Routes incoming greeks to the aggregator.
+    /// Routes incoming Greeks in the selected convention to the aggregator.
     ///
     /// Also updates the ATM tracker from the reference price when one is available,
     /// and triggers deferred bootstrap on the first arrival.
@@ -396,17 +396,15 @@ impl OptionChainManager {
                 greeks.instrument_id,
                 self.aggregator.series_id(),
             );
-            self.deferred_cmd_queue
-                .borrow_mut()
-                .push_back(DeferredCommand::ExpireInstrument(greeks.instrument_id));
+            self.defer_market_data_expiry(greeks.instrument_id);
             return;
         }
 
-        if let Err(e) = self
-            .aggregator
-            .atm_tracker_mut()
-            .try_update_from_option_greeks(greeks)
-        {
+        if greeks.convention != self.greeks_convention {
+            return;
+        }
+
+        if let Err(e) = self.aggregator.try_update_atm_from_greeks(greeks) {
             log::warn!(
                 "Dropping greeks for {}: invalid forward price: {e}",
                 greeks.instrument_id,
@@ -425,8 +423,8 @@ impl OptionChainManager {
         }
     }
 
-    /// Handles an expired/settled instrument by removing it from the aggregator,
-    /// unregistering msgbus handlers, and pushing deferred wire unsubscribes.
+    /// Removes a settled or expired instrument and releases its subscriptions.
+    /// Delta discovery can replace the contract while the series remains open.
     ///
     /// Returns `true` if the aggregator catalog is now empty (all instruments expired),
     /// signaling the engine to tear down this entire manager.
@@ -448,8 +446,11 @@ impl OptionChainManager {
                 let topic = switchboard::get_option_greeks_topic(*instrument_id);
                 msgbus::unsubscribe_option_greeks(topic.into(), gh);
             }
+        }
 
-            // Push deferred wire unsubscribes
+        self.rebalance_after_catalog_change();
+
+        if was_active {
             self.push_unsubscribe_commands(*instrument_id);
         }
 
@@ -473,9 +474,7 @@ impl OptionChainManager {
                 quote.instrument_id,
                 self.aggregator.series_id(),
             );
-            self.deferred_cmd_queue
-                .borrow_mut()
-                .push_back(DeferredCommand::ExpireInstrument(quote.instrument_id));
+            self.defer_market_data_expiry(quote.instrument_id);
             return;
         }
 
@@ -488,6 +487,16 @@ impl OptionChainManager {
         {
             self.publish_slice(quote.ts_event);
         }
+    }
+
+    fn defer_market_data_expiry(&self, instrument_id: InstrumentId) {
+        let command = if self.aggregator.is_delta() {
+            DeferredCommand::ExpireSeries(self.aggregator.series_id())
+        } else {
+            DeferredCommand::ExpireInstrument(instrument_id)
+        };
+
+        self.deferred_cmd_queue.borrow_mut().push_back(command);
     }
 
     /// Bootstraps the active instrument set on the first ATM price arrival.
@@ -529,8 +538,8 @@ impl OptionChainManager {
 
     /// Adds a dynamically discovered instrument to this option chain.
     ///
-    /// Registers msgbus handlers and forwards wire-level subscriptions via
-    /// `client` when the instrument falls in the active range.
+    /// Activates in-range instruments. Delta ranges rebalance discovery
+    /// subscriptions when a listing changes the candidate set.
     /// Returns `true` if the instrument was newly inserted.
     pub fn add_instrument(
         &mut self,
@@ -538,16 +547,17 @@ impl OptionChainManager {
         strike: Price,
         kind: OptionKind,
         client: Option<&mut DataClientAdapter>,
-        clock: &Rc<RefCell<dyn Clock>>,
+        _clock: &Rc<RefCell<dyn Clock>>,
     ) -> bool {
         if !self.aggregator.add_instrument(instrument_id, strike, kind) {
             return false;
         }
 
-        if self.aggregator.active_ids().contains(&instrument_id) {
+        if self.aggregator.is_delta() {
+            self.rebalance_after_catalog_change();
+        } else if self.aggregator.active_ids().contains(&instrument_id) {
             self.register_handlers_for_instrument(instrument_id);
-            let venue = self.aggregator.series_id().venue;
-            Self::forward_instrument_subscriptions(client, instrument_id, venue, clock);
+            self.forward_client_subscriptions(client, &[instrument_id]);
         }
 
         log::info!(
@@ -571,139 +581,90 @@ impl OptionChainManager {
         }
     }
 
-    /// Pushes deferred subscribe commands (quotes, greeks, instrument status) for a single instrument.
     fn push_subscribe_commands(&self, instrument_id: InstrumentId) {
-        let venue = self.aggregator.series_id().venue;
-        let ts_init = self.clock.borrow().timestamp_ns();
-        let mut queue = self.deferred_cmd_queue.borrow_mut();
-        queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::Quotes(
-            SubscribeQuotes {
-                instrument_ids: vec![instrument_id],
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            },
-        )));
-        queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
-            SubscribeOptionGreeks {
-                instrument_ids: vec![instrument_id],
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            },
-        )));
-        queue.push_back(DeferredCommand::Subscribe(
-            SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
-                instrument_ids: vec![instrument_id],
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            }),
-        ));
+        let commands = self.subscribe_commands(instrument_id);
+        self.deferred_cmd_queue
+            .borrow_mut()
+            .extend(commands.map(DeferredCommand::Subscribe));
     }
 
-    /// Pushes deferred unsubscribe commands (quotes, greeks, instrument status) for a single instrument.
     fn push_unsubscribe_commands(&self, instrument_id: InstrumentId) {
-        let venue = self.aggregator.series_id().venue;
-        let ts_init = self.clock.borrow().timestamp_ns();
-        let mut queue = self.deferred_cmd_queue.borrow_mut();
-        queue.push_back(DeferredCommand::Unsubscribe(UnsubscribeCommand::Quotes(
-            UnsubscribeQuotes {
-                instrument_ids: vec![instrument_id],
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            },
-        )));
-        queue.push_back(DeferredCommand::Unsubscribe(
-            UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks {
-                instrument_ids: vec![instrument_id],
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            }),
-        ));
-        queue.push_back(DeferredCommand::Unsubscribe(
-            UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus {
-                instrument_ids: vec![instrument_id],
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            }),
-        ));
+        let commands = self.instrument_unsubscribe_commands(instrument_id);
+        self.deferred_cmd_queue
+            .borrow_mut()
+            .extend(commands.map(DeferredCommand::Unsubscribe));
     }
 
-    /// Forwards quote, greeks, and instrument status subscriptions for a single instrument.
-    fn forward_instrument_subscriptions(
-        client: Option<&mut DataClientAdapter>,
+    fn instrument_unsubscribe_commands(
+        &self,
         instrument_id: InstrumentId,
-        venue: Venue,
-        clock: &Rc<RefCell<dyn Clock>>,
-    ) {
-        let Some(client) = client else {
-            log::error!(
-                "Cannot forward subscriptions for {instrument_id}: no client for venue={venue}",
-            );
-            return;
-        };
+    ) -> impl Iterator<Item = UnsubscribeCommand> + '_ {
+        let ts_init = self.clock.borrow().timestamp_ns();
+        self.subscribe_commands(instrument_id).map(move |command| {
+            let command_id = command.command_id();
+            command.into_unsubscribe(command_id, ts_init, None)
+        })
+    }
 
-        let ts_init = clock.borrow().timestamp_ns();
+    fn subscribe_commands(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> impl Iterator<Item = SubscribeCommand> + '_ {
+        self.client_id.into_iter().flat_map(move |client_id| {
+            let venue = Some(self.aggregator.series_id().venue);
+            let ts_init = self.clock.borrow().timestamp_ns();
 
-        client.execute_subscribe_intent(SubscribeCommand::Quotes(SubscribeQuotes {
-            instrument_ids: vec![instrument_id],
-            client_id: None,
-            venue: Some(venue),
-            command_id: UUID4::new(),
-            ts_init,
-            correlation_id: None,
-            params: None,
-        }));
-        client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
-            instrument_ids: vec![instrument_id],
-            client_id: None,
-            venue: Some(venue),
-            command_id: UUID4::new(),
-            ts_init,
-            correlation_id: None,
-            params: None,
-        }));
-        client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
-            SubscribeInstrumentStatus {
-                instrument_ids: vec![instrument_id],
-                client_id: None,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            },
-        ));
+            [
+                SubscribeCommand::Quotes(SubscribeQuotes::new(
+                    instrument_id,
+                    Some(client_id),
+                    venue,
+                    UUID4::new(),
+                    ts_init,
+                    None,
+                    self.params.clone(),
+                )),
+                SubscribeCommand::OptionGreeks(SubscribeOptionGreeks::new(
+                    instrument_id,
+                    Some(client_id),
+                    venue,
+                    UUID4::new(),
+                    ts_init,
+                    None,
+                    self.greeks_feed_params.clone(),
+                )),
+                SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus::new(
+                    instrument_id,
+                    Some(client_id),
+                    venue,
+                    UUID4::new(),
+                    ts_init,
+                    None,
+                    self.params.clone(),
+                )),
+            ]
+        })
     }
 
     /// Checks if ATM has shifted and rebalances msgbus subscriptions if needed.
-    fn maybe_rebalance(&mut self, now_ns: nautilus_core::UnixNanos) {
+    fn maybe_rebalance(&mut self, now_ns: UnixNanos) {
         let Some(action) = self.aggregator.check_rebalance(now_ns) else {
             return;
         };
 
+        self.apply_rebalance(&action, now_ns);
+    }
+
+    fn rebalance_after_catalog_change(&mut self) {
+        let now_ns = self.clock.borrow().timestamp_ns();
+        if !self.aggregator.is_expired(now_ns)
+            && let Some(action) = self.aggregator.check_delta_catalog_rebalance()
+        {
+            self.apply_rebalance(&action, now_ns);
+        }
+    }
+
+    fn apply_rebalance(&mut self, action: &RebalanceAction, now_ns: UnixNanos) {
         // Unsubscribe removed instruments from msgbus
         if let Some(qh) = self.quote_handlers.first() {
             for id in &action.remove {
@@ -720,28 +681,9 @@ impl OptionChainManager {
             }
         }
 
-        // Subscribe new instruments on msgbus
-        if let Some(qh) = self.quote_handlers.first().cloned() {
-            for id in &action.add {
-                msgbus::subscribe_quotes(
-                    switchboard::get_quotes_topic(*id).into(),
-                    qh.clone(),
-                    Some(self.msgbus_priority),
-                );
-            }
-        }
+        self.register_handlers_for_instruments_bulk(&action.add);
 
-        if let Some(gh) = self.greeks_handlers.first().cloned() {
-            for id in &action.add {
-                msgbus::subscribe_option_greeks(
-                    switchboard::get_option_greeks_topic(*id).into(),
-                    gh.clone(),
-                    Some(self.msgbus_priority),
-                );
-            }
-        }
-
-        // Push deferred wire-level changes into the shared command queue
+        // Acquire replacements first to preserve shared venue feeds
         for &id in &action.add {
             self.push_subscribe_commands(id);
         }
@@ -760,24 +702,30 @@ impl OptionChainManager {
         }
 
         // Apply state changes to aggregator
-        self.aggregator.apply_rebalance(&action, now_ns);
+        self.aggregator.apply_rebalance(action, now_ns);
     }
 
     /// Takes the accumulated snapshot and publishes it to the msgbus.
-    pub fn publish_slice(&mut self, ts: nautilus_core::UnixNanos) {
+    pub fn publish_slice(&mut self, trigger_time: UnixNanos) {
         // Proactive expiry safeguard
-        if self.aggregator.is_expired(ts) {
+        if self.aggregator.is_expired(trigger_time) {
             self.deferred_cmd_queue
                 .borrow_mut()
                 .push_back(DeferredCommand::ExpireSeries(self.aggregator.series_id()));
             return;
         }
 
-        self.maybe_rebalance(ts);
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let rebalance_time = if self.aggregator.is_delta() {
+            ts_init
+        } else {
+            trigger_time
+        };
+
+        self.maybe_rebalance(rebalance_time);
 
         let series_id = self.aggregator.series_id();
-        let slice = self.aggregator.snapshot(ts);
-
+        let slice = self.aggregator.snapshot(ts_init);
         if slice.is_empty() {
             log::debug!("OptionChainSlice empty for {series_id}, skipping publish");
             return;
@@ -789,13 +737,14 @@ impl OptionChainManager {
             slice.call_count(),
             slice.put_count(),
         );
-        msgbus::publish_option_chain(self.topic, &slice);
+        msgbus::publish_option_chain_owner(self.owner_id, &slice);
     }
 
     /// Resolves instruments from cache that match the given option series.
-    fn resolve_instruments(
+    pub(crate) fn resolve_instruments(
         cache: &Rc<RefCell<Cache>>,
         series_id: &OptionSeriesId,
+        expired: &AHashSet<InstrumentId>,
     ) -> HashMap<InstrumentId, (Price, OptionKind)> {
         let cache = cache.borrow();
         let mut map = HashMap::new();
@@ -810,6 +759,10 @@ impl OptionChainManager {
             }
 
             if instrument.settlement_currency().code != series_id.settlement_currency {
+                continue;
+            }
+
+            if expired.contains(&instrument.id()) {
                 continue;
             }
 
@@ -834,7 +787,7 @@ mod tests {
 
     use nautilus_common::clock::VirtualClock;
     use nautilus_core::UnixNanos;
-    use nautilus_model::{data::option_chain::StrikeRange, identifiers::Venue, types::Quantity};
+    use nautilus_model::{identifiers::Venue, types::Quantity};
     use rstest::*;
 
     use super::*;
@@ -844,7 +797,7 @@ mod tests {
             Venue::new("DERIBIT"),
             ustr::Ustr::from("BTC"),
             ustr::Ustr::from("BTC"),
-            UnixNanos::from(1_700_000_000_000_000_000u64),
+            UnixNanos::from(1_700_000_000_000_000_000_u64),
         )
     }
 
@@ -854,8 +807,8 @@ mod tests {
 
     fn make_manager() -> (OptionChainManager, DeferredCommandQueue) {
         let series_id = make_series_id();
-        let topic = switchboard::get_option_chain_topic(series_id);
         let tracker = AtmTracker::new();
+
         let aggregator = OptionChainAggregator::new(
             series_id,
             StrikeRange::Fixed(vec![]),
@@ -867,7 +820,8 @@ mod tests {
 
         let manager = OptionChainManager {
             aggregator,
-            topic,
+            owner_id: UUID4::new(),
+            slot: 0,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
             timer_name: None,
@@ -875,7 +829,10 @@ mod tests {
             bootstrapped: true,
             deferred_cmd_queue: Rc::clone(&queue),
             clock,
-            client_id: None,
+            client_id: Some(ClientId::from("DERIBIT")),
+            params: None,
+            greeks_feed_params: None,
+            greeks_convention: GreeksConvention::BlackScholes,
             raw_mode: false,
         };
         (manager, queue)
@@ -892,8 +849,8 @@ mod tests {
             Price::from("101.00"),
             Quantity::from("1.0"),
             Quantity::from("1.0"),
-            UnixNanos::from(1u64),
-            UnixNanos::from(1u64),
+            UnixNanos::from(1_u64),
+            UnixNanos::from(1_u64),
         );
         manager.handle_quote(&quote);
     }
@@ -902,7 +859,7 @@ mod tests {
     fn test_manager_publish_slice_empty() {
         let (mut manager, _queue) = make_manager();
         // Should not panic - empty slice skips publish
-        manager.publish_slice(UnixNanos::from(100u64));
+        manager.publish_slice(UnixNanos::from(100_u64));
     }
 
     #[rstest]
@@ -916,7 +873,6 @@ mod tests {
 
     fn make_option_chain_manager() -> (OptionChainManager, DeferredCommandQueue) {
         let series_id = make_series_id();
-        let topic = switchboard::get_option_chain_topic(series_id);
 
         let strikes = [45000, 47500, 50000, 52500, 55000];
         let mut instruments = HashMap::new();
@@ -944,7 +900,8 @@ mod tests {
 
         let manager = OptionChainManager {
             aggregator,
-            topic,
+            owner_id: UUID4::new(),
+            slot: 0,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
             timer_name: None,
@@ -952,7 +909,10 @@ mod tests {
             bootstrapped: false,
             deferred_cmd_queue: Rc::clone(&queue),
             clock,
-            client_id: None,
+            client_id: Some(ClientId::from("DERIBIT")),
+            params: None,
+            greeks_feed_params: None,
+            greeks_convention: GreeksConvention::BlackScholes,
             raw_mode: false,
         };
         (manager, queue)
@@ -983,7 +943,7 @@ mod tests {
         assert_eq!(queue.borrow().len(), 18);
 
         // publish_slice should still work normally after bootstrap
-        manager.publish_slice(UnixNanos::from(100u64));
+        manager.publish_slice(UnixNanos::from(100_u64));
         assert!(manager.aggregator.last_atm_strike().is_some());
     }
 
@@ -1078,12 +1038,18 @@ mod tests {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
             underlying_price: Some(50000.0),
+            ts_event: UnixNanos::from(20),
             ..Default::default()
         };
         manager.handle_greeks(&greeks);
+        let slice = manager.aggregator.snapshot(UnixNanos::from(30));
         assert!(manager.bootstrapped);
         // 3 strikes × 2 sides = 6 active instruments
         assert_eq!(manager.aggregator.instrument_ids().len(), 6);
+        assert_eq!(slice.atm_strike, Some(Price::from("50000")));
+        assert!(slice.is_empty());
+        assert_eq!(slice.ts_event, UnixNanos::from(20));
+        assert_eq!(slice.ts_init, UnixNanos::from(30));
     }
 
     #[rstest]
@@ -1097,10 +1063,15 @@ mod tests {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
             underlying_price: None,
+            ts_event: UnixNanos::from(20),
             ..Default::default()
         };
         manager.handle_greeks(&greeks);
         assert!(!manager.bootstrapped);
+        assert_eq!(
+            manager.aggregator.snapshot(UnixNanos::from(30)).ts_event,
+            UnixNanos::from(0)
+        );
     }
 
     #[rstest]
@@ -1136,8 +1107,8 @@ mod tests {
             Price::from("101.00"),
             Quantity::from("1.0"),
             Quantity::from("1.0"),
-            UnixNanos::from(1u64),
-            UnixNanos::from(1u64),
+            UnixNanos::from(1_u64),
+            UnixNanos::from(1_u64),
         );
         manager.handle_quote(&quote);
 
@@ -1148,16 +1119,18 @@ mod tests {
                 delta: 0.55,
                 ..Default::default()
             },
+            ts_event: UnixNanos::from(20),
             ..Default::default()
         };
         manager.handle_greeks(&greeks);
 
-        let slice = manager.aggregator.snapshot(UnixNanos::from(2u64));
+        let slice = manager.aggregator.snapshot(UnixNanos::from(2_u64));
         assert_eq!(
             manager.aggregator.atm_tracker().atm_price().unwrap(),
             Price::from("50000.00")
         );
         assert!(slice.get_call_greeks(&Price::from("50000")).is_none());
+        assert_eq!(slice.ts_event, UnixNanos::from(1));
         assert!(queue.borrow().is_empty());
     }
 
@@ -1199,7 +1172,6 @@ mod tests {
     #[rstest]
     fn test_handle_instrument_expired_returns_true_when_last() {
         let series_id = make_series_id();
-        let topic = switchboard::get_option_chain_topic(series_id);
         let call_id = InstrumentId::from("BTC-20240101-50000-C.DERIBIT");
         let strike = Price::from("50000");
         let mut instruments = HashMap::new();
@@ -1216,7 +1188,8 @@ mod tests {
 
         let mut manager = OptionChainManager {
             aggregator,
-            topic,
+            owner_id: UUID4::new(),
+            slot: 0,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
             timer_name: None,
@@ -1224,7 +1197,10 @@ mod tests {
             bootstrapped: true,
             deferred_cmd_queue: queue,
             clock,
-            client_id: None,
+            client_id: Some(ClientId::from("DERIBIT")),
+            params: None,
+            greeks_feed_params: None,
+            greeks_convention: GreeksConvention::BlackScholes,
             raw_mode: false,
         };
 
@@ -1244,6 +1220,56 @@ mod tests {
         // Empty manager returns true (catalog was already empty)
         assert!(is_empty);
         assert!(queue.borrow().is_empty()); // no deferred commands pushed
+    }
+
+    #[rstest]
+    fn test_delta_catalog_and_raw_rebalances_use_engine_time() {
+        let (mut manager, _queue) = make_manager();
+
+        let instruments = (50..=61)
+            .map(|n| {
+                let id = InstrumentId::from(&format!("BTC-20240101-{n}000-C.DERIBIT"));
+                let strike = Price::from(format!("{n}000").as_str());
+                (id, (strike, OptionKind::Call))
+            })
+            .collect();
+
+        let mut tracker = AtmTracker::new();
+        let strike = Price::from("50000");
+        tracker.set_initial_price(strike);
+
+        manager.aggregator = OptionChainAggregator::new(
+            make_series_id(),
+            StrikeRange::delta(0.25, 0.04).unwrap(),
+            tracker,
+            instruments,
+        );
+
+        manager.raw_mode = true;
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        manager.clock = Rc::clone(&clock) as Rc<RefCell<dyn Clock>>;
+
+        clock.borrow().set_time(UnixNanos::from(10_000_000_000_u64));
+        let new_listing = InstrumentId::from("BTC-20240101-50000-P.DERIBIT");
+        let manager_clock = Rc::clone(&manager.clock);
+        assert!(manager.add_instrument(new_listing, strike, OptionKind::Put, None, &manager_clock));
+        assert!(manager.aggregator.active_ids().contains(&new_listing));
+
+        let greeks = OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            underlying_price: Some(51000.0),
+            ts_event: UnixNanos::from(4_000_000_000_u64),
+            ..Default::default()
+        };
+
+        let candidate = InstrumentId::from("BTC-20240101-61000-C.DERIBIT");
+        clock.borrow().set_time(UnixNanos::from(14_999_999_999_u64));
+        manager.handle_greeks(&greeks);
+        assert!(!manager.aggregator.active_ids().contains(&candidate));
+
+        clock.borrow().set_time(UnixNanos::from(15_000_000_000_u64));
+        manager.handle_greeks(&greeks);
+        assert!(manager.aggregator.active_ids().contains(&candidate));
     }
 
     #[rstest]

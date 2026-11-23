@@ -55,12 +55,21 @@ const MARKET_ID: &str = "TEST-OUTCOME_NO";
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
 async fn shared_latest_poll_preserves_every_field_ties_duplicates_and_older_events() {
+    let mut activity: Value = serde_json::from_str(ACTIVITY).unwrap();
+    let mut crossed = activity["quotes"][0].clone();
+    crossed["bid"] = Value::String("0.5".into());
+    activity["quotes"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, crossed);
+
+    let activity = activity.to_string();
     let (peer, http) = start_peer(vec![
-        (200, "", EXCHANGES),
-        (200, "", MARKET),
-        (200, "", ACTIVITY),
-        (200, "", ACTIVITY),
-        (200, "", OLDER),
+        (200, "", EXCHANGES.to_owned()),
+        (200, "", MARKET.to_owned()),
+        (200, "", activity.clone()),
+        (200, "", activity),
+        (200, "", OLDER.to_owned()),
     ])
     .await;
     let (mut client, mut receiver) = connected(http.clone()).await;
@@ -874,11 +883,13 @@ async fn saturation_diagnostics_follow_independent_list_limits(
             (200, "", EXCHANGES.to_owned()),
             (200, "", MARKET.to_owned()),
             (200, "", quotes.to_string()),
+            (200, "", quotes.to_string()),
             (200, "", trades.to_string()),
             (200, "", short.to_string()),
+            (200, "", quotes.to_string()),
             (200, "", ABSENT.to_owned()),
         ],
-        5,
+        7,
     )
     .await;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -906,7 +917,7 @@ async fn saturation_diagnostics_follow_independent_list_limits(
         subscribe(&mut client, quotes_subscribed, trades_subscribed);
     }
 
-    for _ in 0..6 {
+    for _ in 0..8 {
         next_request(&mut observed).await;
     }
 
@@ -916,21 +927,35 @@ async fn saturation_diagnostics_follow_independent_list_limits(
     let messages = logs.lock().unwrap();
     let messages = &messages[first_message..];
 
-    for (quotes, trades) in [(3, 0), (0, 3), (2, 2)] {
+    let mut diagnostics = messages
+        .iter()
+        .filter(|(_, message)| message.contains("per-list limit=3"));
+    let mut was_saturated = false;
+
+    for (quotes, trades) in [(3, 0), (3, 0), (0, 3), (2, 2), (3, 0)] {
         let quotes_saturated = quotes_subscribed && quotes == 3;
         let trades_saturated = trades_subscribed && trades == 3;
-        assert!(messages.contains(&(log::Level::Debug, format!(
-            "FinFeed activity received for {}, quotes={quotes}, trades={trades}, per-list limit=3, quotes_saturated={quotes_saturated}, trades_saturated={trades_saturated}", id()
-        ))));
+        let saturated = quotes_saturated || trades_saturated;
+        let level = if saturated && !was_saturated {
+            log::Level::Warn
+        } else {
+            log::Level::Debug
+        };
+
+        was_saturated = saturated;
+        assert_eq!(
+            diagnostics.next(),
+            Some(&(
+                level,
+                format!(
+                    "FinFeed activity received for {}, quotes={quotes}, trades={trades}, per-list limit=3, quotes_saturated={quotes_saturated}, trades_saturated={trades_saturated}",
+                    id()
+                )
+            ))
+        );
     }
 
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|(_, message)| message.contains("per-list limit=3"))
-            .count(),
-        3
-    );
+    assert_eq!(diagnostics.next(), None);
 }
 
 pub(super) fn capture_diagnostics() -> &'static std::sync::Mutex<Vec<(log::Level, String)>> {
@@ -955,6 +980,7 @@ impl log::Log for SaturationLogs {
                 "nautilus_finfeed::data::poll"
                     | "nautilus_finfeed::parse"
                     | "nautilus_finfeed::http::parse"
+                    | "nautilus_finfeed::http::client"
             )
     }
 

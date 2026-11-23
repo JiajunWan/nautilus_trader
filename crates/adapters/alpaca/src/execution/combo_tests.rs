@@ -43,6 +43,7 @@ const TS: &str = "2026-11-18T16:38:25.107400871Z";
 fn legs() -> [InstrumentAny; 2] {
     [LONG, SHORT].map(|symbol| {
         let id = crate::provider::instrument_id(symbol).unwrap();
+        let currency = Currency::USD();
         OptionContract::builder()
             .instrument_id(id)
             .raw_symbol(id.symbol)
@@ -50,7 +51,9 @@ fn legs() -> [InstrumentAny; 2] {
             .underlying(Ustr::from("SPX"))
             .option_kind(OptionKind::Call)
             .strike_price(Price::from(if symbol == LONG { "7395" } else { "7400" }))
-            .currency(Currency::USD())
+            .strike_currency(currency)
+            .quote_currency(currency)
+            .settlement_currency(currency)
             .activation_ns(0.into())
             .expiration_ns("2026-11-20T21:00:00Z".parse().unwrap())
             .price_precision(2)

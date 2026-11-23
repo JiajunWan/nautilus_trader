@@ -3472,7 +3472,7 @@ async fn test_generate_order_status_reports_filters() {
         "orders": [
             {
                 "tn": 0,
-                "ts": 1704067200,
+                "ts": 1_704_067_200,
                 "d": "B",
                 "o": "ACCEPTED",
                 "oid": "OID-ACCEPTED",
@@ -3488,7 +3488,7 @@ async fn test_generate_order_status_reports_filters() {
             },
             {
                 "tn": 0,
-                "ts": 1704067201,
+                "ts": 1_704_067_201,
                 "d": "S",
                 "o": "FILLED",
                 "oid": "OID-FILLED",
@@ -3504,7 +3504,7 @@ async fn test_generate_order_status_reports_filters() {
             },
             {
                 "tn": 0,
-                "ts": 1704067203,
+                "ts": 1_704_067_203,
                 "d": "B",
                 "o": "PENDING",
                 "oid": "OID-PENDING",
@@ -3520,7 +3520,7 @@ async fn test_generate_order_status_reports_filters() {
             },
             {
                 "tn": 0,
-                "ts": 1704067202,
+                "ts": 1_704_067_202,
                 "d": "B",
                 "o": "ACCEPTED",
                 "oid": "OID-ACCEPTED-2",
@@ -3622,7 +3622,7 @@ async fn test_generate_order_status_reports_filters() {
         UnixNanos::default(),
         false,
         None,
-        Some(UnixNanos::from(1_704_067_201_000_000_000u64)),
+        Some(UnixNanos::from(1_704_067_201_000_000_000_u64)),
         None,
         None,
         None,
@@ -3643,7 +3643,7 @@ async fn test_generate_order_status_reports_filters() {
         UnixNanos::default(),
         false,
         None,
-        Some(UnixNanos::from(1_704_067_202_000_000_000u64)),
+        Some(UnixNanos::from(1_704_067_202_000_000_000_u64)),
         None,
         None,
         None,
@@ -5799,10 +5799,9 @@ async fn test_submit_order_denies_unsupported_order_type(#[case] order_type: Ord
     match event {
         ExecutionEvent::Order(OrderEventAny::Denied(denied)) => {
             assert_eq!(denied.client_order_id, client_order_id);
-            assert!(
-                denied.reason.contains("Unsupported order type"),
-                "reason was: {}",
-                denied.reason
+            assert_eq!(
+                denied.reason.as_str(),
+                format!("UNSUPPORTED_ORDER_TYPE: {order_type}")
             );
         }
         other => panic!("expected OrderDenied, was {other:?}"),
@@ -5830,7 +5829,7 @@ async fn test_submit_order_denies_gtd_time_in_force() {
         .price(Price::from("50000.00"))
         .quantity(Quantity::from("10"))
         .time_in_force(TimeInForce::Gtd)
-        .expire_time(UnixNanos::from(2_000_000_000_000_000_000u64))
+        .expire_time(UnixNanos::from(2_000_000_000_000_000_000_u64))
         .build();
 
     cache

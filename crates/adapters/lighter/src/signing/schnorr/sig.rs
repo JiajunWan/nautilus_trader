@@ -57,7 +57,7 @@ impl Signature {
     /// Encode to the canonical 80-byte little-endian layout `s_le || e_le`.
     #[must_use]
     pub fn to_le_bytes(&self) -> [u8; SIG_BYTES] {
-        let mut out = [0u8; SIG_BYTES];
+        let mut out = [0_u8; SIG_BYTES];
         out[..SCALAR_BYTES].copy_from_slice(&self.s.to_le_bytes());
         out[SCALAR_BYTES..].copy_from_slice(&self.e.to_le_bytes());
         out
@@ -71,8 +71,8 @@ impl Signature {
     /// the actual canonicality / membership check.
     #[must_use]
     pub fn from_le_bytes_reduce(bytes: [u8; SIG_BYTES]) -> Self {
-        let mut s_buf = [0u8; SCALAR_BYTES];
-        let mut e_buf = [0u8; SCALAR_BYTES];
+        let mut s_buf = [0_u8; SCALAR_BYTES];
+        let mut e_buf = [0_u8; SCALAR_BYTES];
         s_buf.copy_from_slice(&bytes[..SCALAR_BYTES]);
         e_buf.copy_from_slice(&bytes[SCALAR_BYTES..]);
 
@@ -197,7 +197,7 @@ mod tests {
             let hashed_msg = decode_fp5_bytes(&v.hashed_msg);
             let k = Scalar::from_le_bytes_reduce(decode_scalar_bytes(&v.k));
 
-            let sig = sk.sign(hashed_msg, k);
+            let sig = sk.sign(hashed_msg, k).unwrap();
             assert_eq!(
                 bytes_to_hex(&sig.to_le_bytes()),
                 v.sig,
@@ -228,7 +228,7 @@ mod tests {
         let sk = PrivateKey::from_le_bytes_reduce(decode_scalar_bytes(&v.sk));
         let hashed_msg = decode_fp5_bytes(&v.hashed_msg);
         let k = Scalar::from_le_bytes_reduce(decode_scalar_bytes(&v.k));
-        let mut sig = sk.sign(hashed_msg, k);
+        let mut sig = sk.sign(hashed_msg, k).unwrap();
         let pk = sk.public_key();
 
         sig.s += Scalar::ONE;
@@ -243,7 +243,7 @@ mod tests {
         let sk = PrivateKey::from_le_bytes_reduce(decode_scalar_bytes(&v.sk));
         let hashed_msg = decode_fp5_bytes(&v.hashed_msg);
         let k = Scalar::from_le_bytes_reduce(decode_scalar_bytes(&v.k));
-        let sig = sk.sign(hashed_msg, k);
+        let sig = sk.sign(hashed_msg, k).unwrap();
         let pk = sk.public_key();
 
         let other_msg = Fp5::from_u64s_reduce([1, 2, 3, 4, 5]);
@@ -329,17 +329,13 @@ mod tests {
             k in arb_scalar(),
             hashed_msg in arb_fp5(),
         ) {
-            // Schnorr is undefined for k == 0 (caller contract); skip that
-            // case rather than asserting on a malformed input.
             prop_assume!(!k.is_zero());
-            // sk == 0 is also pathological (pk = neutral); skip to avoid
-            // tripping the deferred neutral-pk concern unrelated to the
-            // round-trip property.
+            // The round-trip property requires a non-neutral public key
             prop_assume!(!sk.is_zero());
 
             let private_key = PrivateKey::from_scalar(sk);
             let pk = private_key.public_key();
-            let sig = private_key.sign(hashed_msg, k);
+            let sig = private_key.sign(hashed_msg, k).unwrap();
             prop_assert!(pk.verify(hashed_msg, &sig));
         }
 
@@ -353,7 +349,7 @@ mod tests {
         ) {
             prop_assume!(!sk.is_zero());
             prop_assume!(!k.is_zero());
-            let sig = PrivateKey::from_scalar(sk).sign(hashed_msg, k);
+            let sig = PrivateKey::from_scalar(sk).sign(hashed_msg, k).unwrap();
             prop_assert!(sig.is_canonical());
             let decoded = Signature::from_le_bytes_reduce(sig.to_le_bytes());
             prop_assert_eq!(decoded, sig);
@@ -375,14 +371,14 @@ mod tests {
             sk in arb_scalar(),
             k in arb_scalar(),
             hashed_msg in arb_fp5(),
-            byte_idx in 0usize..SCALAR_BYTES,
-            bit in 0u8..8,
+            byte_idx in 0_usize..SCALAR_BYTES,
+            bit in 0_u8..8,
         ) {
             prop_assume!(!sk.is_zero());
             prop_assume!(!k.is_zero());
             let private_key = PrivateKey::from_scalar(sk);
             let pk = private_key.public_key();
-            let sig = private_key.sign(hashed_msg, k);
+            let sig = private_key.sign(hashed_msg, k).unwrap();
 
             let mut bytes = sig.to_le_bytes();
             bytes[byte_idx] ^= 1 << bit;
@@ -398,13 +394,13 @@ mod tests {
             k in arb_scalar(),
             hashed_msg in arb_fp5(),
             byte_idx in SCALAR_BYTES..SIG_BYTES,
-            bit in 0u8..8,
+            bit in 0_u8..8,
         ) {
             prop_assume!(!sk.is_zero());
             prop_assume!(!k.is_zero());
             let private_key = PrivateKey::from_scalar(sk);
             let pk = private_key.public_key();
-            let sig = private_key.sign(hashed_msg, k);
+            let sig = private_key.sign(hashed_msg, k).unwrap();
 
             let mut bytes = sig.to_le_bytes();
             bytes[byte_idx] ^= 1 << bit;
@@ -430,7 +426,7 @@ mod tests {
 
             let private_key = PrivateKey::from_scalar(sk);
             let pk = private_key.public_key();
-            let sig = private_key.sign(hashed_msg, k);
+            let sig = private_key.sign(hashed_msg, k).unwrap();
             prop_assert!(pk.verify(hashed_msg, &sig));
 
             let perturbed = PublicKey::from_fp5(pk.as_fp5() + offset);
@@ -465,14 +461,14 @@ mod tests {
         let sk = PrivateKey::from_le_bytes_reduce(decode_scalar_bytes(&v.sk));
         let hashed_msg = decode_fp5_bytes(&v.hashed_msg);
         let k = Scalar::from_le_bytes_reduce(decode_scalar_bytes(&v.k));
-        let canonical = sk.sign(hashed_msg, k);
+        let canonical = sk.sign(hashed_msg, k).unwrap();
         let pk = sk.public_key();
 
         // Mirrors the Go `TestBytes` case: add ORDER to each scalar without
         // reducing, encode raw, and feed back through the reducing decoder.
         let s_inflated = canonical.s.add_inner(crate::signing::curve::ORDER);
         let e_inflated = canonical.e.add_inner(crate::signing::curve::ORDER);
-        let mut bytes = [0u8; SIG_BYTES];
+        let mut bytes = [0_u8; SIG_BYTES];
         bytes[..SCALAR_BYTES].copy_from_slice(&s_inflated.to_le_bytes());
         bytes[SCALAR_BYTES..].copy_from_slice(&e_inflated.to_le_bytes());
 

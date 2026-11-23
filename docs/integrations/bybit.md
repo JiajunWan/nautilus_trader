@@ -432,6 +432,10 @@ rejected order has an empty `rejectReason`, the reason is `venue omitted rejectR
 `UNKNOWN`. Bybit reports a post-only order that would take liquidity as `Cancelled` with
 `EC_PostOnlyWillTakeLiquidity`; reconciliation emits `OrderRejected` with `due_post_only=true`.
 
+Bybit can return an empty `price` for closed IV-priced option orders. See
+[External order creation](../concepts/execution/reconciliation.md#external-order-creation) for how
+reconciliation handles the unknown price.
+
 ### Position management
 
 | Feature          | Spot | Linear | Inverse | Option | Notes                                                       |
@@ -827,6 +831,9 @@ on Spot instruments. This feature is disabled by default, so set
 1. A failed request or `FA` result status is logged without crashing the execution client. A `P`
    result status is logged as processing, not complete.
 1. The execution client defers queued repayments during Bybit's UTC blackout window.
+
+Automatic repayment for a quote-quantity market order applies only in the execution client that
+submits it. After restoring such an order, check the outstanding borrow before repaying it manually.
 
 **Example**:
 

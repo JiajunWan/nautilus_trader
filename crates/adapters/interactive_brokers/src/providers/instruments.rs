@@ -177,38 +177,6 @@ impl InteractiveBrokersInstrumentProvider {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_test_instrument(
-        &self,
-        instrument: InstrumentAny,
-        contract_id: i32,
-        price_magnifier: i32,
-    ) {
-        let instrument_id = instrument.id();
-        self.instruments.insert(instrument_id, instrument);
-        self.contract_id_to_instrument_id
-            .insert(contract_id, instrument_id);
-        self.contracts.insert(
-            instrument_id,
-            Contract {
-                contract_id,
-                ..Default::default()
-            },
-        );
-
-        self.price_magnifiers.insert(instrument_id, price_magnifier);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_test_contract_id_mapping(
-        &self,
-        contract_id: i32,
-        instrument_id: InstrumentId,
-    ) {
-        self.contract_id_to_instrument_id
-            .insert(contract_id, instrument_id);
-    }
-
     /// Initialize the provider by loading cache if configured.
     ///
     /// This is equivalent to Python's `provider.initialize()` method.
@@ -2719,6 +2687,38 @@ mod tests {
     use super::*;
     use crate::common::contract_to_json_value;
 
+    impl InteractiveBrokersInstrumentProvider {
+        pub(crate) fn insert_test_instrument(
+            &self,
+            instrument: InstrumentAny,
+            contract_id: i32,
+            price_magnifier: i32,
+        ) {
+            let instrument_id = instrument.id();
+            self.instruments.insert(instrument_id, instrument);
+            self.contract_id_to_instrument_id
+                .insert(contract_id, instrument_id);
+            self.contracts.insert(
+                instrument_id,
+                Contract {
+                    contract_id,
+                    ..Default::default()
+                },
+            );
+
+            self.price_magnifiers.insert(instrument_id, price_magnifier);
+        }
+
+        pub(crate) fn insert_test_contract_id_mapping(
+            &self,
+            contract_id: i32,
+            instrument_id: InstrumentId,
+        ) {
+            self.contract_id_to_instrument_id
+                .insert(contract_id, instrument_id);
+        }
+    }
+
     struct TestStartupLoader {
         id_calls: AtomicUsize,
         contract_calls: AtomicUsize,
@@ -2794,7 +2794,7 @@ mod tests {
 
         let config = InteractiveBrokersInstrumentProviderConfig::builder()
             .cache_path(cache_path)
-            .cache_validity_days(7u32)
+            .cache_validity_days(7_u32)
             .build();
 
         let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
@@ -3163,7 +3163,7 @@ mod tests {
         // Create a new provider and load the cache
         let new_config = InteractiveBrokersInstrumentProviderConfig::builder()
             .cache_path(cache_path.clone())
-            .cache_validity_days(7u32)
+            .cache_validity_days(7_u32)
             .build();
 
         let new_provider = InteractiveBrokersInstrumentProvider::new(new_config).unwrap();
@@ -3187,7 +3187,7 @@ mod tests {
     async fn test_load_cache_reads_chrono_timestamp() {
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::builder()
-                .cache_validity_days(7u32)
+                .cache_validity_days(7_u32)
                 .build(),
         )
         .unwrap();
@@ -3210,7 +3210,7 @@ mod tests {
         let instrument = create_test_instrument(instrument_id);
 
         let contract = Contract {
-            contract_id: 265598,
+            contract_id: 265_598,
             symbol: ibapi::contracts::Symbol::from("AAPL"),
             security_type: SecurityType::Stock,
             exchange: Exchange::from("SMART"),
@@ -3244,7 +3244,7 @@ mod tests {
                 .resolve_contract_for_instrument(instrument_id)
                 .unwrap()
                 .contract_id,
-            265598
+            265_598
         );
         assert_eq!(
             new_provider
@@ -3252,7 +3252,7 @@ mod tests {
                 .unwrap()
                 .contract
                 .contract_id,
-            265598
+            265_598
         );
     }
 
@@ -3277,7 +3277,7 @@ mod tests {
             InstrumentId::new(Symbol::from("BTCUSDT"), Venue::from("BINANCE"));
 
         let contract = Contract {
-            contract_id: 265598,
+            contract_id: 265_598,
             symbol: ibapi::contracts::Symbol::from("AAPL"),
             security_type: SecurityType::Stock,
             exchange: Exchange::from("SMART"),
@@ -3303,14 +3303,14 @@ mod tests {
                 .resolve_contract_for_instrument(ib_instrument_id)
                 .unwrap()
                 .contract_id,
-            265598
+            265_598
         );
         assert_eq!(provider.get_price_magnifier(&ib_instrument_id), 100);
     }
 
     fn create_future_contract_with_expiry_time() -> Contract {
         Contract {
-            contract_id: 515416632,
+            contract_id: 515_416_632,
             symbol: ibapi::contracts::Symbol::from("ES"),
             security_type: SecurityType::Future,
             exchange: Exchange::from("CME"),
@@ -3454,7 +3454,7 @@ mod tests {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
 
         let contract = Contract {
-            contract_id: 265598,
+            contract_id: 265_598,
             symbol: ibapi::contracts::Symbol::from("AAPL"),
             security_type: SecurityType::Stock,
             exchange: Exchange::from("SMART"),
@@ -3489,7 +3489,7 @@ mod tests {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
 
         let contract = Contract {
-            contract_id: 265598,
+            contract_id: 265_598,
             ..Default::default()
         };
 
@@ -3534,7 +3534,7 @@ mod tests {
         );
 
         let contract = Contract {
-            contract_id: 815824252,
+            contract_id: 815_824_252,
             symbol: ibapi::contracts::Symbol::from("ZC"),
             security_type: SecurityType::Future,
             exchange: Exchange::from("CBOT"),
@@ -3647,7 +3647,7 @@ mod tests {
     #[rstest]
     fn test_provider_rejects_duplicate_contracts_before_loading() {
         let config = serde_json::from_value(serde_json::json!({
-            "load_contracts": [{"conId": 265598}, {"conId": 265598}]
+            "load_contracts": [{"conId": 265_598}, {"conId": 265_598}]
         }))
         .unwrap();
         let error = InteractiveBrokersInstrumentProvider::new(config).unwrap_err();

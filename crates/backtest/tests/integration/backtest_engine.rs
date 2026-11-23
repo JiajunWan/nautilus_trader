@@ -42,14 +42,19 @@ use nautilus_common::{
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
-use nautilus_execution::models::{
-    fee::{FeeModelAny, FeeModelHandle, MakerTakerFeeModel},
-    latency::{LatencyModelHandle, StaticLatencyModel},
+use nautilus_execution::{
+    engine::stubs::StubExecutionClient,
+    models::{
+        fee::{FeeModelAny, FeeModelHandle, MakerTakerFeeModel},
+        latency::{LatencyModelHandle, StaticLatencyModel},
+    },
 };
 use nautilus_indicators::{
     average::ema::ExponentialMovingAverage,
     indicator::{Indicator, MovingAverage},
 };
+#[cfg(feature = "defi")]
+use nautilus_model::enums::CurrencyType;
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{
@@ -61,8 +66,8 @@ use nautilus_model::{
     enums::{
         AccountType, AggregationSource, AggressorSide, AssetClass, BarAggregation, BookAction,
         BookType, ContingencyType, InstrumentCloseType, LiquiditySide, OmsType, OptionKind,
-        OrderSide, OrderStatus, PositionAdjustmentType, PriceType, TimeInForce, TrailingOffsetType,
-        TriggerType,
+        OrderSide, OrderStatus, OrderType, PositionAdjustmentType, PriceType, SettlementType,
+        TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::{
         AccountState, OrderEventAny, OrderEventType, OrderFilled, OrderModifyRejected, OrderUpdated,
@@ -73,7 +78,9 @@ use nautilus_model::{
     },
     instruments::{
         CryptoPerpetual, Equity, IndexInstrument, Instrument, InstrumentAny, OptionContract,
-        stubs::{audusd_sim, betting, crypto_perpetual_ethusdt, default_fx_ccy},
+        stubs::{
+            audusd_sim, betting, crypto_perpetual_ethusdt, default_fx_ccy, futures_contract_es,
+        },
     },
     orders::{Order, OrderAny},
     position::Position,
@@ -1113,6 +1120,94 @@ fn create_engine_with_config(
     engine
 }
 
+#[cfg(feature = "defi")]
+#[rstest]
+#[case(16, true)]
+#[case(17, false)]
+#[case(18, false)]
+fn test_backtest_analysis_checks_engine_held_balance_precision(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] precision: u8,
+    #[case] supported: bool,
+    #[values(false, true)] streaming: bool,
+) {
+    let config = BacktestEngineConfig {
+        bypass_logging: true,
+        run_analysis: true,
+        ..Default::default()
+    };
+
+    let mut engine = BacktestEngine::new(config).unwrap();
+
+    let currency = Currency::new(
+        "TST-ANALYSIS",
+        precision,
+        0,
+        "Test balance",
+        CurrencyType::Crypto,
+    );
+
+    let exact_amount = dec!(1000) + Decimal::new(1, u32::from(precision));
+    let balance = Money::from_decimal(exact_amount, currency).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![balance])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    engine.add_venue(venue_config).unwrap();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    let quotes = vec![
+        quote(id, "1000.00", "1001.00", 1),
+        quote(id, "1000.00", "1001.00", 2),
+    ];
+    engine.add_data(quotes, None, true, true).unwrap();
+
+    let run = engine.run(None, None, None, streaming);
+    let completed = if streaming {
+        run.unwrap();
+        engine.end()
+    } else {
+        run
+    };
+
+    let result = engine.try_get_result();
+    let portfolio = engine.kernel().portfolio();
+    let analyzer = portfolio.try_analyzer();
+    let exact_analyzer = portfolio.analyzer();
+
+    if supported {
+        completed.unwrap();
+        assert_eq!(
+            result.unwrap().stats_pnls[currency.code.as_str()]["PnL (total)"],
+            0.0
+        );
+        assert_eq!(analyzer.unwrap().account_balances[&currency], balance);
+    } else {
+        let expected = format!(
+            "Cannot analyze TST-ANALYSIS balance for BINANCE-001: Fixed-point precision {precision} exceeds maximum float precision 16"
+        );
+        assert_eq!(
+            completed.unwrap_err().to_string(),
+            format!(
+                "Backtest completed, but portfolio analysis failed. Disable run_analysis to skip post-run analysis. {expected}"
+            ),
+        );
+        assert_eq!(result.unwrap_err().to_string(), expected);
+        assert_eq!(analyzer.unwrap_err().to_string(), expected);
+    }
+
+    assert_eq!(exact_analyzer.account_balances[&currency], balance);
+    assert_eq!(exact_analyzer.account_balances_starting[&currency], balance);
+    assert_eq!(engine.get_result().iterations, 2);
+    assert!(engine.run_finished().is_some());
+}
+
 #[rstest]
 fn test_add_custom_data_bypasses_market_setup_and_replays_in_order(
     crypto_perpetual_ethusdt: CryptoPerpetual,
@@ -1263,9 +1358,13 @@ fn option_contract(venue: Venue, expiration_ns: UnixNanos) -> InstrumentAny {
             .asset_class(AssetClass::Equity)
             .exchange(Ustr::from(venue.as_str()))
             .underlying(Ustr::from("AAPL"))
+            .underlying_instrument_id(InstrumentId::new(Symbol::from("AAPL"), venue))
+            .settlement_type(SettlementType::Physical)
             .option_kind(OptionKind::Call)
             .strike_price(Price::from("150.00"))
-            .currency(Currency::USD())
+            .quote_currency(Currency::USD())
+            .settlement_currency(Currency::USD())
+            .strike_currency(Currency::USD())
             .activation_ns(UnixNanos::default())
             .expiration_ns(expiration_ns)
             .price_precision(2)
@@ -1353,7 +1452,7 @@ fn test_run_with_empty_data_does_not_advance_recurring_timer() {
         .add_actor(RecurringTimerShutdownActor::new(Rc::clone(&fired)))
         .unwrap();
 
-    let start = UnixNanos::from(10_000_000_000u64);
+    let start = UnixNanos::from(10_000_000_000_u64);
     engine.run(Some(start), None, None, false).unwrap();
 
     assert_eq!(fired.get(), 0);
@@ -1756,7 +1855,7 @@ fn test_add_strategies_stops_at_first_error() {
 }
 
 #[rstest]
-fn test_run_processes_quote_ticks(crypto_perpetual_ethusdt: CryptoPerpetual) {
+fn test_run_processes_quotes(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let mut engine = create_engine();
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let instrument_id = instrument.id();
@@ -2684,7 +2783,7 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
     #[values(false, true)] quote_at_expiration: bool,
 ) {
     let venue = Venue::from("OPRA");
-    let expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let expiration_ns = UnixNanos::from(2_000_000_000_u64);
     let underlying = option_underlying_equity(venue);
     let option = option_contract(venue, expiration_ns);
     let underlying_id = underlying.id();
@@ -2761,7 +2860,7 @@ fn test_option_expiry_uses_same_timestamp_index_price(
     #[values(false, true)] streaming: bool,
 ) {
     let venue = Venue::from("OPRA");
-    let expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let expiration_ns = UnixNanos::from(2_000_000_000_u64);
     let entry_ns = expiration_ns.as_u64() - 2_000;
     let underlying_id = InstrumentId::from("SPXW.OPRA");
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
@@ -2822,6 +2921,8 @@ fn test_option_expiry_uses_same_timestamp_index_price(
         option.id = InstrumentId::from(id);
         option.raw_symbol = option.id.symbol;
         option.underlying = Ustr::from("SPXW");
+        option.underlying_instrument_id = Some(underlying_id);
+        option.settlement_type = Some(SettlementType::Cash);
         option.asset_class = AssetClass::Index;
         option.strike_price = Price::from(strike);
         engine.add_instrument(&option.clone().into()).unwrap();
@@ -2906,14 +3007,27 @@ fn test_option_expiry_uses_same_timestamp_index_price(
         expiration_fill_price(&engine, venue, otm_id),
         Price::from("0.00")
     );
-    assert_eq!(
-        engine
-            .kernel()
-            .cache
-            .borrow()
+    let cache = engine.kernel().cache.borrow();
+    assert!(
+        cache
             .positions_open(None, None, None, None, None)
-            .len(),
-        0
+            .is_empty()
+    );
+
+    for (id, realized_pnl) in [(itm_id, "233 USD"), (otm_id, "-55 USD")] {
+        let closed = cache.positions_closed(None, Some(&id), None, None, None);
+        assert_eq!(closed.len(), 1);
+        let position = &closed[0];
+        assert_eq!(position.quantity, Quantity::zero(0));
+        assert_eq!(position.peak_qty, Quantity::from(1));
+        assert_eq!(position.quote_currency, Currency::USD());
+        assert_eq!(position.settlement_currency, Currency::USD());
+        assert_eq!(position.realized_pnl, Some(Money::from(realized_pnl)));
+    }
+
+    assert_eq!(
+        account_total(&engine, "OPRA", Currency::USD()),
+        Some(Money::from("1000178 USD"))
     );
 }
 
@@ -4450,7 +4564,7 @@ fn test_strategy_receives_only_subscribed_quotes(crypto_perpetual_ethusdt: Crypt
     let interval: u64 = 1_000_000_000;
 
     // Ramp up
-    for i in 0..10u64 {
+    for i in 0..10_u64 {
         let mid = 1000.0 + (i as f64 * 10.0);
         quotes.push(quote(
             instrument_id,
@@ -4461,7 +4575,7 @@ fn test_strategy_receives_only_subscribed_quotes(crypto_perpetual_ethusdt: Crypt
     }
 
     // Ramp down
-    for i in 0..10u64 {
+    for i in 0..10_u64 {
         let mid = 1090.0 - (i as f64 * 10.0);
         quotes.push(quote(
             instrument_id,
@@ -4535,7 +4649,7 @@ fn test_start_boundary_skips_earlier_data(crypto_perpetual_ethusdt: CryptoPerpet
 
     // Start at t=3, should skip first 2 quotes
     engine
-        .run(Some(3_000_000_000u64.into()), None, None, false)
+        .run(Some(3_000_000_000_u64.into()), None, None, false)
         .unwrap();
 
     let bt_result = engine.get_result();
@@ -4563,7 +4677,7 @@ fn test_end_boundary_stops_before_later_data(crypto_perpetual_ethusdt: CryptoPer
 
     // End at t=3, should process only first 3
     engine
-        .run(None, Some(3_000_000_000u64.into()), None, false)
+        .run(None, Some(3_000_000_000_u64.into()), None, false)
         .unwrap();
 
     let bt_result = engine.get_result();
@@ -4588,13 +4702,13 @@ fn test_ema_cross_with_batched_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let interval: u64 = 1_000_000_000;
 
     // Add flat data in one batch
-    let flat: Vec<Data> = (0..10u64)
+    let flat: Vec<Data> = (0..10_u64)
         .map(|i| quote(instrument_id, "1000.00", "1000.10", base_ts + i * interval))
         .collect();
     engine.add_data(flat, None, true, true).unwrap();
 
     // Add ramp-up in a separate batch
-    let ramp_up: Vec<Data> = (0..15u64)
+    let ramp_up: Vec<Data> = (0..15_u64)
         .map(|i| {
             let mid = 1000.0 + (i as f64 * 10.0);
             quote(
@@ -5871,7 +5985,7 @@ fn test_streaming_no_dummy_bars_past_batch_data(crypto_perpetual_ethusdt: Crypto
         .add_strategy(BarSubscriberStrategy::new(instrument_id, bar_type))
         .unwrap();
 
-    let batch1: Vec<Data> = (1..=10u64)
+    let batch1: Vec<Data> = (1..=10_u64)
         .map(|i| quote(instrument_id, "1000.00", "1000.10", i * 1_000_000_000))
         .collect();
     engine.add_data(batch1, None, true, true).unwrap();
@@ -5879,7 +5993,7 @@ fn test_streaming_no_dummy_bars_past_batch_data(crypto_perpetual_ethusdt: Crypto
     // Run with end far past data (100s), streaming=true.
     // Without the fix, timers fire from 10s to 100s producing ~18 dummy bars.
     // With the fix, only bars from the actual data period are built.
-    let end = Some(UnixNanos::from(100_000_000_000u64));
+    let end = Some(UnixNanos::from(100_000_000_000_u64));
     engine.run(None, end, None, true).unwrap();
 
     let cache = engine.kernel().cache.borrow();
@@ -5894,12 +6008,12 @@ fn test_streaming_no_dummy_bars_past_batch_data(crypto_perpetual_ethusdt: Crypto
     // Batch 2: continues from where batch 1 left off (20s to 30s).
     // Gap bars (10-20s) fire naturally when time advances to batch 2 data.
     engine.clear_data();
-    let batch2: Vec<Data> = (20..=30u64)
+    let batch2: Vec<Data> = (20..=30_u64)
         .map(|i| quote(instrument_id, "1001.00", "1001.10", i * 1_000_000_000))
         .collect();
     engine.add_data(batch2, None, true, true).unwrap();
     engine
-        .run(None, Some(UnixNanos::from(30_000_000_000u64)), None, false)
+        .run(None, Some(UnixNanos::from(30_000_000_000_u64)), None, false)
         .unwrap();
 
     // Batch 1 produced ~1 bar, batch 2 adds gap bars (10-20s) + data bars (20-30s)
@@ -5928,13 +6042,13 @@ fn test_streaming_end_flushes_tail_timers(crypto_perpetual_ethusdt: CryptoPerpet
         .add_strategy(BarSubscriberStrategy::new(instrument_id, bar_type))
         .unwrap();
 
-    let batch: Vec<Data> = (1..=10u64)
+    let batch: Vec<Data> = (1..=10_u64)
         .map(|i| quote(instrument_id, "1000.00", "1000.10", i * 1_000_000_000))
         .collect();
     engine.add_data(batch, None, true, true).unwrap();
 
     // Node-style workflow: all batches use streaming=true, finalize with end()
-    let end = Some(UnixNanos::from(20_000_000_000u64));
+    let end = Some(UnixNanos::from(20_000_000_000_u64));
     engine.run(None, end, None, true).unwrap();
 
     let cache = engine.kernel().cache.borrow();
@@ -6048,7 +6162,7 @@ fn test_iteration_advances_with_data(crypto_perpetual_ethusdt: CryptoPerpetual) 
 #[rstest]
 fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
     let venue = Venue::from("OPRA");
-    let expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let expiration_ns = UnixNanos::from(2_000_000_000_u64);
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     engine
         .add_venue(
@@ -6114,9 +6228,20 @@ fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
 }
 
 #[rstest]
-fn test_itm_option_expiry_timer_exercises_without_data_at_expiration() {
-    let (engine, option_id, underlying_id) =
-        run_call_option_expiry_timer("160.00", UnixNanos::from(2_000_001_000u64));
+#[case::margin(AccountType::Margin, "999490 USD")]
+#[case::cash(AccountType::Cash, "984490 USD")]
+fn test_itm_option_expiry_timer_exercises_without_data_at_expiration(
+    #[case] account_type: AccountType,
+    #[case] expected_balance: &str,
+    #[values(OmsType::Netting, OmsType::Hedging)] oms_type: OmsType,
+) {
+    let (engine, option_id, underlying_id) = run_call_option_expiry_timer(
+        "160.00",
+        2_000_001_000.into(),
+        account_type,
+        oms_type,
+        &option_underlying_equity(Venue::from("IB")),
+    );
 
     let cache_rc = engine.kernel().cache();
     let cache = cache_rc.borrow();
@@ -6129,17 +6254,236 @@ fn test_itm_option_expiry_timer_exercises_without_data_at_expiration() {
 
     let option_closed = cache.positions_closed(None, Some(&option_id), None, None, None);
     assert_eq!(option_closed.len(), 1);
+    let closed = &option_closed[0];
+    assert_eq!(closed.quantity, Quantity::zero(0));
+    assert_eq!(closed.peak_qty, Quantity::from(1));
+    assert_eq!(closed.avg_px_close, Some(dec!(0)));
+    assert_eq!(closed.quote_currency, Currency::USD());
+    assert_eq!(closed.settlement_currency, Currency::USD());
+    assert_eq!(closed.realized_pnl, Some(Money::from("-510 USD")));
 
     let underlying_open = cache.positions_open(None, Some(&underlying_id), None, None, None);
-    assert_eq!(underlying_open.len(), 1);
-    assert_eq!(underlying_open[0].quantity, Quantity::from(100));
-    assert_eq!(underlying_open[0].avg_px_open, dec!(150.0));
+
+    let expected_positions = if oms_type == OmsType::Hedging { 2 } else { 1 };
+    assert_eq!(underlying_open.len(), expected_positions);
+    let delivered = underlying_open
+        .iter()
+        .find(|position| position.account_id == closed.account_id)
+        .expect("Expected delivery to the originating account");
+    assert_eq!(delivered.instrument_id, InstrumentId::from("AAPL.IB"));
+    assert_eq!(cache.oms_type(&closed.id), Some(oms_type));
+    assert_eq!(cache.oms_type(&delivered.id), Some(oms_type));
+    assert_eq!(delivered.account_id, closed.account_id);
+    assert_eq!(delivered.entry, OrderSide::Buy);
+    assert_eq!(delivered.quantity, Quantity::from(100));
+    assert_eq!(delivered.avg_px_open, dec!(150));
+    assert_eq!(delivered.quote_currency, Currency::USD());
+    assert_eq!(delivered.settlement_currency, Currency::USD());
+    assert_eq!(
+        delivered.unrealized_pnl(Price::from("160.00")).unwrap(),
+        Money::from("1000 USD"),
+    );
+
+    if oms_type == OmsType::Hedging {
+        let existing = underlying_open
+            .iter()
+            .find(|position| position.account_id == AccountId::from("IB-001"))
+            .expect("Expected the other account's position to remain open");
+        assert_eq!(existing.strategy_id, closed.strategy_id);
+        assert_eq!(cache.oms_type(&existing.id), Some(OmsType::Netting));
+        assert_eq!(existing.quantity, Quantity::from(25));
+        assert_eq!(existing.avg_px_open, dec!(155));
+    }
+
+    assert_eq!(
+        cache.positions_open(None, None, None, None, None).len(),
+        expected_positions
+    );
+    assert_eq!(
+        account_total(&engine, "OPRA", Currency::USD()),
+        Some(Money::from(expected_balance))
+    );
+}
+
+#[rstest]
+fn test_option_expiry_rejects_delivery_into_another_accounts_netting_position(
+    #[values(false, true)] conflicting_delivery_in_same_batch: bool,
+) {
+    let underlying = option_underlying_equity(Venue::from("IB"));
+    let (mut engine, option_id, underlying_id) = prepare_call_option_expiry_timer(
+        "160.00",
+        AccountType::Margin,
+        OmsType::Hedging,
+        &underlying,
+        !conflicting_delivery_in_same_batch,
+    );
+    let expiration = CALL_OPTION_EXPIRATION;
+    engine
+        .run(
+            Some((expiration - 3_000).into()),
+            Some((expiration - 1).into()),
+            None,
+            true,
+        )
+        .unwrap();
+
+    let cache = engine.kernel().cache();
+    let option = cache
+        .borrow()
+        .positions_open(None, Some(&option_id), None, None, None)[0]
+        .clone();
+    assert_eq!(cache.borrow().oms_type(&option.id), Some(OmsType::Hedging));
+
+    if conflicting_delivery_in_same_batch {
+        let mut cache = cache.borrow_mut();
+        let mut fill = option.events[0].clone();
+        fill.position_id = Some(PositionId::from("OTHER-OPTION-POSITION"));
+        fill.account_id = AccountId::from("IB-001");
+        fill.client_order_id = ClientOrderId::from("OTHER-OPTION-OPEN");
+        fill.trade_id = TradeId::from("OTHER-OPTION-TRADE");
+        let position = Position::new(cache.instrument(&option_id).unwrap(), fill);
+        cache
+            .add_position_without_order(&position, OmsType::Hedging)
+            .unwrap();
+    }
+
+    engine
+        .kernel()
+        .exec_engine
+        .borrow_mut()
+        .register_oms_type(option.strategy_id, OmsType::Netting);
+    engine
+        .run(None, Some((expiration + 1_000).into()), None, false)
+        .unwrap();
+
+    let cache = cache.borrow();
+    let retained = cache.position(&option.id).unwrap();
+    let existing = cache.positions_open(None, Some(&underlying_id), None, None, None);
+    assert_eq!(retained.quantity, Quantity::from(1));
+
+    if conflicting_delivery_in_same_batch {
+        assert!(existing.is_empty());
+        let competing = cache
+            .position(&PositionId::from("OTHER-OPTION-POSITION"))
+            .unwrap();
+        assert_eq!(competing.quantity, Quantity::from(1));
+    } else {
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].account_id, AccountId::from("IB-001"));
+        assert_eq!(existing[0].quantity, Quantity::from(25));
+        assert_eq!(existing[0].avg_px_open, dec!(155));
+    }
+
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+}
+
+#[rstest]
+fn test_option_expiry_resolves_origin_account_after_opening_order_purge() {
+    let underlying = option_underlying_equity(Venue::from("IB"));
+    let (mut engine, option_id, underlying_id) = prepare_call_option_expiry_timer(
+        "160.00",
+        AccountType::Margin,
+        OmsType::Hedging,
+        &underlying,
+        true,
+    );
+    let expiration = CALL_OPTION_EXPIRATION;
+    engine
+        .run(
+            Some((expiration - 3_000).into()),
+            Some((expiration - 1).into()),
+            None,
+            true,
+        )
+        .unwrap();
+
+    let cache = engine.kernel().cache();
+
+    let account_id = {
+        let mut cache = cache.borrow_mut();
+        let position =
+            cache.positions_open_refs(None, Some(&option_id), None, None, None)[0].cloned();
+        cache.purge_order(position.opening_order_id, false).unwrap();
+        assert!(cache.client_id(&position.opening_order_id).is_none());
+        cache.add_client_route(ClientId::from("IB"), option_id.venue);
+        position.account_id
+    };
+
+    let delivery_client = ClientId::from("IB-HEDGE");
+    engine
+        .kernel()
+        .exec_engine
+        .borrow_mut()
+        .register_client(Box::new(StubExecutionClient::new(
+            delivery_client,
+            account_id,
+            underlying_id.venue,
+            OmsType::Hedging,
+            None,
+        )))
+        .unwrap();
+
+    engine
+        .run(None, Some((expiration + 1_000).into()), None, false)
+        .unwrap();
+
+    let cache = cache.borrow();
+    let delivered = cache.positions_open(None, Some(&underlying_id), None, Some(&account_id), None);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].quantity, Quantity::from(100));
+    assert_eq!(delivered[0].avg_px_open, dec!(150));
+    assert_eq!(cache.oms_type(&delivered[0].id), Some(OmsType::Hedging));
+    assert_eq!(
+        cache.client_id(&delivered[0].opening_order_id),
+        Some(&delivery_client)
+    );
+    assert!(
+        cache
+            .positions_open(None, Some(&option_id), None, None, None)
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn test_option_expiry_rejects_futures_delivery_to_cash_account() {
+    let underlying = InstrumentAny::FuturesContract(futures_contract_es(
+        Some(UnixNanos::default()),
+        Some(3_000_000_000.into()),
+    ));
+    let (engine, option_id, underlying_id) = run_call_option_expiry_timer(
+        "160.00",
+        2_000_001_000.into(),
+        AccountType::Cash,
+        OmsType::Netting,
+        &underlying,
+    );
+
+    let cache = engine.kernel().cache.borrow();
+    let open = cache.positions_open(None, Some(&option_id), None, None, None);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].quantity, Quantity::from(1));
+    assert!(
+        cache
+            .positions(None, Some(&underlying_id), None, None, None)
+            .is_empty()
+    );
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+    assert_eq!(
+        account_total(&engine, "OPRA", Currency::USD()),
+        Some(Money::from("999490 USD"))
+    );
 }
 
 #[rstest]
 fn test_option_expiry_timer_runs_when_end_equals_expiration() {
-    let expiration_ns = UnixNanos::from(2_000_000_000u64);
-    let (engine, option_id, underlying_id) = run_call_option_expiry_timer("140.00", expiration_ns);
+    let expiration_ns = UnixNanos::from(2_000_000_000_u64);
+    let (engine, option_id, underlying_id) = run_call_option_expiry_timer(
+        "140.00",
+        expiration_ns,
+        AccountType::Margin,
+        OmsType::Netting,
+        &option_underlying_equity(Venue::from("IB")),
+    );
 
     let cache_rc = engine.kernel().cache();
     let cache = cache_rc.borrow();
@@ -6164,7 +6508,7 @@ fn test_option_expiry_timer_runs_when_end_equals_expiration() {
 #[rstest]
 fn test_instruments_with_same_expiration_share_expiry_timer() {
     let venue = Venue::from("OPRA");
-    let expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let expiration_ns = UnixNanos::from(2_000_000_000_u64);
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     engine
         .add_venue(
@@ -6210,8 +6554,8 @@ fn test_instruments_with_same_expiration_share_expiry_timer() {
 #[rstest]
 fn test_add_instrument_with_changed_expiration_is_rejected() {
     let venue = Venue::from("OPRA");
-    let original_expiration_ns = UnixNanos::from(2_000_000_000u64);
-    let updated_expiration_ns = UnixNanos::from(3_000_000_000u64);
+    let original_expiration_ns = UnixNanos::from(2_000_000_000_u64);
+    let updated_expiration_ns = UnixNanos::from(3_000_000_000_u64);
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     engine
         .add_venue(
@@ -6266,17 +6610,62 @@ fn test_add_instrument_with_changed_expiration_is_rejected() {
     assert_eq!(cached_expiration_ns, Some(original_expiration_ns));
 }
 
+const CALL_OPTION_EXPIRATION: u64 = 2_000_000_000;
+
 fn run_call_option_expiry_timer(
     underlying_price: &str,
     end_ns: UnixNanos,
+    account_type: AccountType,
+    oms_type: OmsType,
+    underlying: &InstrumentAny,
+) -> (BacktestEngine, InstrumentId, InstrumentId) {
+    let (mut engine, option_id, underlying_id) = prepare_call_option_expiry_timer(
+        underlying_price,
+        account_type,
+        oms_type,
+        underlying,
+        oms_type == OmsType::Hedging,
+    );
+    engine
+        .run(
+            Some((CALL_OPTION_EXPIRATION - 3_000).into()),
+            Some(end_ns),
+            None,
+            false,
+        )
+        .unwrap();
+    (engine, option_id, underlying_id)
+}
+
+fn prepare_call_option_expiry_timer(
+    underlying_price: &str,
+    account_type: AccountType,
+    oms_type: OmsType,
+    underlying: &InstrumentAny,
+    seed_netting_position: bool,
 ) -> (BacktestEngine, InstrumentId, InstrumentId) {
     let venue = Venue::from("OPRA");
-    let expiration_ns = UnixNanos::from(2_000_000_000u64);
+    let expiration_ns = UnixNanos::from(CALL_OPTION_EXPIRATION);
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     engine
         .add_venue(
             SimulatedVenueConfig::builder()
                 .venue(venue)
+                .oms_type(oms_type)
+                .account_type(account_type)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let underlying_venue = underlying.id().venue;
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(underlying_venue)
                 .oms_type(OmsType::Netting)
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
@@ -6286,16 +6675,58 @@ fn run_call_option_expiry_timer(
                 .unwrap(),
         )
         .unwrap();
-
-    let underlying = option_underlying_equity(venue);
-    let option = option_contract(venue, expiration_ns);
+    let decoy = option_underlying_equity(venue);
     let underlying_id = underlying.id();
-    let option_id = option.id();
-    engine.add_instrument(&underlying).unwrap();
-    engine.add_instrument(&option).unwrap();
-    engine
-        .add_strategy(OpenOptionOnQuote::new(option_id, Quantity::from(1)))
-        .unwrap();
+
+    let InstrumentAny::OptionContract(mut option) = option_contract(venue, expiration_ns) else {
+        unreachable!();
+    };
+
+    option.underlying_instrument_id = Some(underlying_id);
+    let option_id = option.id;
+    engine.add_instrument(underlying).unwrap();
+    engine.add_instrument(&decoy).unwrap();
+    engine.add_instrument(&option.into()).unwrap();
+    let strategy = OpenOptionOnQuote::new(option_id, Quantity::from(1));
+    if seed_netting_position {
+        let strategy_id = strategy.strategy_id().unwrap();
+        let position_id = PositionId::from(format!("{underlying_id}-{strategy_id}").as_str());
+
+        let position = Position::new(
+            underlying,
+            OrderFilled::new(
+                engine.trader_id(),
+                strategy_id,
+                underlying_id,
+                ClientOrderId::from("UNDERLYING-NETTING"),
+                "UNDERLYING-NETTING".into(),
+                AccountId::from(format!("{underlying_venue}-001").as_str()),
+                TradeId::from("UNDERLYING-NETTING"),
+                OrderSide::Buy,
+                OrderType::Market,
+                Quantity::from(25),
+                Price::from("155.00"),
+                Currency::USD(),
+                LiquiditySide::Taker,
+                UUID4::new(),
+                0.into(),
+                0.into(),
+                false,
+                Some(position_id),
+                Some(Money::from("0 USD")),
+                None,
+            ),
+        );
+
+        engine
+            .kernel()
+            .cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    engine.add_strategy(strategy).unwrap();
 
     let data = vec![
         quote_with_size(
@@ -6305,6 +6736,7 @@ fn run_call_option_expiry_timer(
             "1",
             expiration_ns.as_u64() - 2_000,
         ),
+        trade(decoy.id(), "145.00", "100", expiration_ns.as_u64() - 1_500),
         trade(
             underlying_id,
             underlying_price,
@@ -6313,15 +6745,6 @@ fn run_call_option_expiry_timer(
         ),
     ];
     engine.add_data(data, None, true, true).unwrap();
-
-    engine
-        .run(
-            Some(UnixNanos::from(expiration_ns.as_u64() - 3_000)),
-            Some(end_ns),
-            None,
-            false,
-        )
-        .unwrap();
 
     (engine, option_id, underlying_id)
 }

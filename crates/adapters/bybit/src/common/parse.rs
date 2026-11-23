@@ -142,6 +142,17 @@ pub(crate) fn deserialize_optional_symbol_type<'de, D: serde::Deserializer<'de>>
     .map(Some)
 }
 
+pub(crate) fn deserialize_optional_market_unit<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<BybitMarketUnit>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.and_then(|value| {
+        BybitMarketUnit::deserialize(serde::de::IntoDeserializer::<D::Error>::into_deserializer(
+            value,
+        ))
+        .ok()
+    }))
+}
+
 /// Round-trips `Option<bool>` as `0`/`1` integers for Bybit request bodies
 /// that advertise `readOnly` as an integer on the wire.
 pub mod opt_bool_as_int {
@@ -836,7 +847,7 @@ pub fn parse_option_instrument(
     let instrument_id = symbol.to_instrument_id();
     let raw_symbol = Symbol::new(symbol.raw_symbol());
     let underlying = get_currency(definition.base_coin.as_str());
-    let quote_currency = get_currency(definition.quote_coin.as_str());
+    let strike_currency = get_currency(definition.quote_coin.as_str());
     let settlement_currency = get_currency(definition.settle_coin.as_str());
     // Bybit Options are linear contracts - they are margined and settled in stablecoins
     let is_inverse = false;
@@ -876,7 +887,8 @@ pub fn parse_option_instrument(
         .instrument_id(instrument_id)
         .raw_symbol(raw_symbol)
         .underlying(underlying)
-        .quote_currency(quote_currency)
+        .strike_currency(strike_currency)
+        .quote_currency(settlement_currency)
         .settlement_currency(settlement_currency)
         .is_inverse(is_inverse)
         .option_kind(option_kind)
@@ -1557,13 +1569,17 @@ pub fn parse_order_status_report(
         BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi => TimeInForce::Gtc,
     };
 
-    let quantity =
-        parse_quantity_with_precision(&order.qty, instrument.size_precision(), "order.qty")?;
-
     let filled_qty = parse_quantity_with_precision(
         &order.cum_exec_qty,
         instrument.size_precision(),
         "order.cumExecQty",
+    )?;
+    let quantity = parse_order_report_quantity(
+        &order.qty,
+        instrument.size_precision(),
+        order.market_unit,
+        order.order_status,
+        filled_qty,
     )?;
 
     // Map Bybit order status to Nautilus order status
@@ -1673,6 +1689,23 @@ pub fn parse_order_status_report(
     let report = report_with_reject_reason(report, reject_reason, order_status);
 
     Ok(report)
+}
+
+pub(crate) fn parse_order_report_quantity(
+    order_qty: &str,
+    size_precision: u8,
+    market_unit: Option<BybitMarketUnit>,
+    order_status: BybitOrderStatus,
+    filled_qty: Quantity,
+) -> anyhow::Result<Quantity> {
+    if order_status == BybitOrderStatus::Filled
+        && market_unit == Some(BybitMarketUnit::QuoteCoin)
+        && filled_qty.is_positive()
+    {
+        return Ok(filled_qty);
+    }
+
+    parse_quantity_with_precision(order_qty, size_precision, "order.qty")
 }
 
 fn report_with_reject_reason(
@@ -2123,10 +2156,14 @@ pub(crate) fn parse_tpsl_mode(s: &str) -> anyhow::Result<BybitTpSlMode> {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_execution::reconciliation::{
+        generate_external_order_status_events, initialize_external_order_price,
+    };
     use nautilus_model::{
         data::BarSpecification,
         enums::{AggregationSource, BarAggregation, PositionSide, PriceType},
-        orders::OrderAny,
+        events::{OrderEventAny, order::spec::OrderInitializedSpec},
+        orders::{Order, OrderAny, RECONCILIATION_PRICE_UNKNOWN_TAG},
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
@@ -2144,8 +2181,8 @@ mod tests {
         http::models::{
             BybitInstrumentInverseResponse, BybitInstrumentLinearResponse,
             BybitInstrumentOptionResponse, BybitInstrumentSpotResponse, BybitKlinesResponse,
-            BybitOpenOrdersResponse, BybitPositionListResponse, BybitTradeHistoryResponse,
-            BybitTradesResponse, BybitWalletBalanceResponse,
+            BybitOpenOrdersResponse, BybitOrder, BybitPositionListResponse,
+            BybitTradeHistoryResponse, BybitTradesResponse, BybitWalletBalanceResponse,
         },
     };
 
@@ -2732,6 +2769,7 @@ mod tests {
             InstrumentAny::CryptoOption(option) => {
                 assert_eq!(option.id.to_string(), "ETH-26JUN26-16000-P-OPTION.BYBIT");
                 assert_eq!(option.underlying.code, "ETH");
+                assert_eq!(option.strike_currency.code, "USDC");
                 assert_eq!(option.quote_currency.code, "USDC");
                 assert_eq!(option.settlement_currency.code, "USDC");
                 assert!(!option.is_inverse);
@@ -2746,6 +2784,18 @@ mod tests {
             }
             other => panic!("unexpected instrument variant: {other:?}"),
         }
+    }
+
+    #[rstest]
+    fn parse_usdc_option_with_usd_strike() {
+        let json = load_test_json("http_get_instruments_option_symbol_id.json");
+        let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
+
+        let parsed = parse_option_instrument(&response.result.list[0], TS, TS).unwrap();
+
+        assert_eq!(parsed.strike_currency(), Some(Currency::USD()));
+        assert_eq!(parsed.quote_currency(), Currency::USDC());
+        assert_eq!(parsed.settlement_currency(), Currency::USDC());
     }
 
     #[rstest]
@@ -2862,6 +2912,56 @@ mod tests {
 
         assert_eq!(report.quantity, Quantity::from("9000000.000000001"));
         assert_eq!(report.quantity.precision, 9);
+    }
+
+    #[rstest]
+    fn parse_http_order_iv_closed_reconciles() {
+        let json = load_test_json("http_get_instruments_option.json");
+        let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
+        let mut definition = response.result.list[0].clone();
+        definition.symbol = Ustr::from("ETH-18NOV26-1810-C-USDT");
+        definition.quote_coin = Ustr::from("USDT");
+        definition.settle_coin = Ustr::from("USDT");
+        definition.options_type = BybitOptionType::Call;
+        definition.lot_size_filter.qty_step = "0.1".to_string();
+        definition.lot_size_filter.min_order_qty = "0.1".to_string();
+        let instrument = parse_option_instrument(&definition, TS, TS).unwrap();
+        let json = load_test_json("http_get_order_iv_canceled.json");
+        let raw: BybitOrder = serde_json::from_str(&json).unwrap();
+        let account_id = AccountId::from("BYBIT-001");
+        let report = parse_order_status_report(&raw, &instrument, account_id, TS).unwrap();
+        let mut initialized = OrderInitializedSpec::builder()
+            .instrument_id(report.instrument_id)
+            .client_order_id(report.client_order_id.unwrap())
+            .order_type(report.order_type)
+            .order_side(report.order_side.unwrap())
+            .quantity(report.quantity)
+            .time_in_force(report.time_in_force)
+            .post_only(report.post_only)
+            .reconciliation(true)
+            .build();
+        initialize_external_order_price(&mut initialized, &report, false);
+        let event = OrderEventAny::Initialized(initialized);
+        let mut order = OrderAny::from_events(vec![event]).unwrap();
+        let events =
+            generate_external_order_status_events(&order, &report, &account_id, &instrument, TS);
+        for event in events {
+            order.apply(event).unwrap();
+        }
+
+        assert_eq!(raw.order_iv.as_deref(), Some("0.2"));
+        assert_eq!(raw.place_type.as_str(), "iv");
+        assert_eq!(report.price, None);
+        assert_eq!(report.avg_px, None);
+        assert_eq!(order.order_type(), OrderType::Limit);
+        assert_eq!(order.status(), OrderStatus::Canceled);
+        assert_eq!(order.quantity(), Quantity::from("0.1"));
+        assert_eq!(order.filled_qty(), Quantity::from("0.0"));
+        assert_eq!(order.price(), Some(Price::zero(0)));
+        assert_eq!(
+            order.tags(),
+            Some([Ustr::from(RECONCILIATION_PRICE_UNKNOWN_TAG)].as_slice())
+        );
     }
 
     #[rstest]

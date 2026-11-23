@@ -40,7 +40,10 @@ use ustr::Ustr;
 
 use super::WsDispatchState;
 use crate::{
-    common::parse::{parse_venue_order_id, truncate_cl_ord_id},
+    common::{
+        enums::KrakenOrderType,
+        parse::{parse_venue_order_id, truncate_cl_ord_id},
+    },
     websocket::spot_v2::{
         enums::KrakenWsMethod,
         handler::SpotHandlerCommand,
@@ -98,7 +101,7 @@ pub struct OrderRequestState {
     /// construction: `connect()` swaps the inner sender, and the
     /// post-`new()` placeholder's receiver is already dropped.
     cmd_tx_handle: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<SpotHandlerCommand>>>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<OrderEventAny>,
+    event_tx: RwLock<tokio::sync::mpsc::UnboundedSender<OrderEventAny>>,
     dispatch_state: Arc<WsDispatchState>,
     trader_id: TraderId,
     account_id: AccountId,
@@ -132,7 +135,7 @@ impl OrderRequestState {
             pending: DashMap::new(),
             timeout,
             cmd_tx_handle,
-            event_tx,
+            event_tx: RwLock::new(event_tx),
             dispatch_state,
             trader_id,
             account_id,
@@ -157,14 +160,28 @@ impl OrderRequestState {
     ///
     /// # Errors
     ///
-    /// Returns an error if the JSON envelope fails to serialize or if the
-    /// handler command channel is closed.
+    /// Returns an error if the order or its conditional close order is an iceberg order, if the
+    /// JSON envelope fails to serialize or if the handler command channel is closed.
     pub fn submit(
         self: &Arc<Self>,
         params: KrakenWsAddOrderParams,
         identity: PendingRequest,
         ts_now_ns: u64,
     ) -> anyhow::Result<u64> {
+        // The request has no `display_qty`, which Kraken requires of an iceberg order
+        if params.order_type == KrakenOrderType::Iceberg {
+            anyhow::bail!("Iceberg orders are not supported on the Kraken WS path; use REST");
+        }
+
+        // Kraken's conditional close order types do not include iceberg
+        if params
+            .conditional
+            .as_ref()
+            .is_some_and(|close| close.order_type == KrakenOrderType::Iceberg)
+        {
+            anyhow::bail!("Iceberg conditional close orders are not supported by Kraken");
+        }
+
         self.send(
             KrakenWsRequest {
                 method: KrakenWsMethod::AddOrder,
@@ -224,13 +241,23 @@ impl OrderRequestState {
     ///
     /// # Errors
     ///
-    /// Returns an error if serialization fails or the handler command channel is closed.
+    /// Returns an error if an order is an iceberg order, if serialization fails or if the handler
+    /// command channel is closed.
     pub fn batch_add(
         self: &Arc<Self>,
         params: KrakenWsBatchAddParams,
         identity: PendingRequest,
         ts_now_ns: u64,
     ) -> anyhow::Result<u64> {
+        // The orders have no `display_qty`, which Kraken requires of an iceberg order
+        if params
+            .orders
+            .iter()
+            .any(|order| order.order_type == KrakenOrderType::Iceberg)
+        {
+            anyhow::bail!("Iceberg orders are not supported on the Kraken WS batch path; use REST");
+        }
+
         self.send(
             KrakenWsRequest {
                 method: KrakenWsMethod::BatchAdd,
@@ -399,6 +426,13 @@ impl OrderRequestState {
 
     pub(crate) fn reset_task_spawner(&self, task_spawner: TaskSpawner) {
         *self.task_spawner.write() = task_spawner;
+    }
+
+    pub(crate) fn reset_event_sender(
+        &self,
+        event_tx: tokio::sync::mpsc::UnboundedSender<OrderEventAny>,
+    ) {
+        *self.event_tx.write() = event_tx;
     }
 
     /// Sends a best-effort `cancel_order` over the WebSocket after a Submit or
@@ -791,14 +825,12 @@ impl OrderRequestState {
 
     /// Forwards an order event to the execution-engine channel.
     ///
-    /// A send failure means the receiver has been dropped, which only happens
-    /// during shutdown after the forwarder task has exited. Events lost in
-    /// that window are recovered on the next start by the reconciliation
-    /// engine (`open_check_interval_secs`), which queries the venue for any
-    /// orders or fills the local cache is missing. The error log preserves
-    /// operator visibility for the (rare) shutdown-race case.
+    /// Each connect installs a new channel, so a send fails only after a
+    /// session's forwarder task has exited and before the next connect. A
+    /// lost event is not replayed: the engine learns the order's state from
+    /// venue reports when reconciliation or open-order checks are enabled.
     fn send_event(&self, event: OrderEventAny) {
-        if let Err(e) = self.event_tx.send(event) {
+        if let Err(e) = self.event_tx.read().send(event) {
             log::error!("Kraken WS order-event channel send failed: {e}");
         }
     }
@@ -810,13 +842,6 @@ fn pending_op_to_method(op: PendingOperation) -> KrakenWsMethod {
         PendingOperation::Amend => KrakenWsMethod::AmendOrder,
         PendingOperation::Cancel => KrakenWsMethod::CancelOrder,
         PendingOperation::BatchAdd => KrakenWsMethod::BatchAdd,
-    }
-}
-
-#[cfg(test)]
-impl OrderRequestState {
-    pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
     }
 }
 
@@ -840,12 +865,18 @@ mod tests {
         websocket::{
             dispatch::OrderIdentity,
             spot_v2::messages::{
-                KrakenWsAddOrderParams, KrakenWsAmendOrderParams, KrakenWsBatchAddParams,
-                KrakenWsBatchOrderResult, KrakenWsCancelOrderParams, KrakenWsOrderResponse,
-                KrakenWsOrderResult,
+                KrakenWsAddOrderParams, KrakenWsAmendOrderParams, KrakenWsBatchAddOrder,
+                KrakenWsBatchAddParams, KrakenWsBatchOrderResult, KrakenWsCancelOrderParams,
+                KrakenWsConditionalParams, KrakenWsOrderResponse, KrakenWsOrderResult,
             },
         },
     };
+
+    impl OrderRequestState {
+        pub(super) fn pending_len(&self) -> usize {
+            self.pending.len()
+        }
+    }
 
     const CLIENT_ORDER_ID: &str = "O-1";
     const VENUE_ORDER_ID: &str = "O-VENUE";
@@ -1013,6 +1044,87 @@ mod tests {
         }
     }
 
+    /// An add_order request cannot state a display quantity, so an iceberg order fails before it is
+    /// sent or awaits a response.
+    #[rstest]
+    fn test_submit_rejects_an_iceberg_order() {
+        let (state, mut rx) = make_state(60_000);
+        let params = KrakenWsAddOrderParams {
+            order_type: KrakenOrderType::Iceberg,
+            ..make_add_order_params("TKN")
+        };
+
+        let error = state
+            .submit(params, make_identity(PendingOperation::Submit), 1)
+            .expect_err("an iceberg order must not be sent");
+
+        assert!(
+            error.to_string().contains("Iceberg"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(state.pending_len(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Kraken accepts no iceberg conditional close order, so a limit order carrying one fails
+    /// before it is sent or awaits a response.
+    #[rstest]
+    fn test_submit_rejects_an_iceberg_conditional_close_order() {
+        let (state, mut rx) = make_state(60_000);
+        let params = KrakenWsAddOrderParams {
+            conditional: Some(KrakenWsConditionalParams {
+                order_type: KrakenOrderType::Iceberg,
+                limit_price: Some(dec!(51000)),
+                trigger_price: None,
+            }),
+            ..make_add_order_params("TKN")
+        };
+
+        let error = state
+            .submit(params, make_identity(PendingOperation::Submit), 1)
+            .expect_err("an iceberg close order must not be sent");
+
+        assert!(
+            error.to_string().contains("conditional close"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(state.pending_len(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A conditional close order of a type Kraken accepts is sent with its parent.
+    #[rstest]
+    fn test_submit_sends_a_stop_loss_limit_conditional_close_order() {
+        let (state, mut rx) = make_state(60_000);
+        let params = KrakenWsAddOrderParams {
+            conditional: Some(KrakenWsConditionalParams {
+                order_type: KrakenOrderType::StopLossLimit,
+                limit_price: Some(dec!(49000)),
+                trigger_price: Some(dec!(49100)),
+            }),
+            ..make_add_order_params("TKN")
+        };
+
+        state
+            .submit(params, make_identity(PendingOperation::Submit), 1)
+            .expect("a stop-loss-limit close order must be sent");
+
+        assert_eq!(state.pending_len(), 1);
+
+        match rx.try_recv().expect("cmd queued") {
+            SpotHandlerCommand::SendOrderRequest { payload, .. } => {
+                assert!(
+                    payload
+                        .expose_secret()
+                        .contains("\"conditional\":{\"order_type\":\"stop-loss-limit\""),
+                    "unexpected payload: {}",
+                    payload.expose_secret()
+                );
+            }
+            _ => panic!("wrong cmd variant"),
+        }
+    }
+
     #[tokio::test]
     async fn test_submit_uses_swapped_command_sender() {
         // Regression: dispatcher built before connect() must observe the
@@ -1111,6 +1223,54 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    /// A batch_add request cannot state a display quantity, so a batch holding an iceberg order fails
+    /// whole before it is sent or awaits a response.
+    #[rstest]
+    fn test_batch_add_rejects_a_batch_holding_an_iceberg_order() {
+        let (state, mut rx) = make_state(60_000);
+        let order = |order_type, cl_ord_id: &str| KrakenWsBatchAddOrder {
+            order_type,
+            side: KrakenOrderSide::Buy,
+            order_qty: dec!(0.001),
+            limit_price: Some(dec!(50000)),
+            cl_ord_id: Some(cl_ord_id.to_string()),
+            time_in_force: None,
+            expire_time: None,
+            post_only: None,
+            reduce_only: None,
+            leverage: None,
+            trigger: None,
+        };
+        let params = KrakenWsBatchAddParams {
+            symbol: "BTC/USD".to_string(),
+            orders: vec![
+                order(KrakenOrderType::Limit, "O-A"),
+                order(KrakenOrderType::Iceberg, "O-B"),
+            ],
+            token: SecretString::from("TKN"),
+        };
+        let identity = PendingRequest {
+            operation: PendingOperation::BatchAdd,
+            client_order_ids: vec![ClientOrderId::from("O-A"), ClientOrderId::from("O-B")],
+            venue_order_ids: vec![None, None],
+            ts_sent_ns: 0,
+            new_quantity: None,
+            new_price: None,
+            new_trigger_price: None,
+        };
+
+        let error = state
+            .batch_add(params, identity, 1)
+            .expect_err("a batch holding an iceberg order must not be sent");
+
+        assert!(
+            error.to_string().contains("Iceberg"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(state.pending_len(), 0);
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -1771,6 +1931,7 @@ mod tests {
             .event_rx
             .try_recv()
             .expect("matching response event");
+
         match event {
             OrderEventAny::Accepted(e) => {
                 assert_eq!(e.client_order_id, cl_ord_id);
@@ -2363,16 +2524,16 @@ mod property_tests {
         fn no_pending_leak_on_random_response_interleaving(
             ops in proptest::collection::vec(
                 prop_oneof![
-                    Just((PendingOperation::Submit, true, 1usize)),
-                    Just((PendingOperation::Submit, false, 1usize)),
-                    Just((PendingOperation::Amend, true, 1usize)),
-                    Just((PendingOperation::Amend, false, 1usize)),
-                    Just((PendingOperation::Cancel, true, 1usize)),
-                    Just((PendingOperation::Cancel, false, 1usize)),
-                    (2usize..=4usize).prop_map(|n| (PendingOperation::BatchAdd, true, n)),
-                    (2usize..=4usize).prop_map(|n| (PendingOperation::BatchAdd, false, n)),
+                    Just((PendingOperation::Submit, true, 1_usize)),
+                    Just((PendingOperation::Submit, false, 1_usize)),
+                    Just((PendingOperation::Amend, true, 1_usize)),
+                    Just((PendingOperation::Amend, false, 1_usize)),
+                    Just((PendingOperation::Cancel, true, 1_usize)),
+                    Just((PendingOperation::Cancel, false, 1_usize)),
+                    (2_usize..=4_usize).prop_map(|n| (PendingOperation::BatchAdd, true, n)),
+                    (2_usize..=4_usize).prop_map(|n| (PendingOperation::BatchAdd, false, n)),
                 ],
-                1..50usize,
+                1..50_usize,
             )
         ) {
             let h = make_harness(60_000);

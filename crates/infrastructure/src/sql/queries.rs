@@ -16,22 +16,27 @@
 use std::any::Any;
 
 use ahash::AHashMap;
-use nautilus_common::signal::Signal;
+use anyhow::Context;
 #[cfg(feature = "defi")]
-use nautilus_common::{cache::CacheSnapshotRef, defi::cache::InstrumentMigration};
+use nautilus_common::defi::cache::InstrumentMigration;
+use nautilus_common::{
+    cache::{CacheSnapshotRef, database::POSITION_OMS_KEY_PREFIX},
+    signal::Signal,
+};
 use nautilus_model::{
     accounts::AccountAny,
     data::{
         Bar, CustomData, DataType, HasTsInit, InstrumentClose, QuoteTick, TradeTick,
         greeks::{GreeksData, YieldCurve},
     },
+    enums::OmsType,
     events::{
         AccountState, OrderEvent, OrderEventAny, OrderFilled, OrderInitialized, OrderSnapshot,
         position::snapshot::PositionSnapshot,
     },
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, TraderId},
     instruments::{CryptoOption, Instrument, InstrumentAny, OptionContract, SyntheticInstrument},
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     position::Position,
     types::Currency,
 };
@@ -42,29 +47,40 @@ use nautilus_model::{
         currency::{self, TokenCurrency},
     },
     enums::OrderStatus,
-    orders::Order,
 };
-use sqlx::{FromRow, PgPool, Postgres, Row, Transaction};
+use sqlx::{FromRow, PgConnection, PgExecutor, PgPool, Postgres, Row, Transaction};
 #[cfg(feature = "defi")]
 use ustr::Ustr;
 
 use super::models::{orders::OrderSnapshotRow, positions::PositionSnapshotRow, types::SignalRow};
 #[cfg(feature = "defi")]
 use crate::defi::{contract_conflict, currency_references, integrity_error, validate_marker};
-use crate::sql::models::{
-    accounts::AccountEventRow,
-    data::{BarRow, InstrumentCloseRow, QuoteTickRow, TradeTickRow},
-    enums::{
-        AggregationSourcePg, AggressorSidePg, AssetClassPg, BarAggregationPg, CurrencyTypePg,
-        PriceTypePg, TrailingOffsetTypePg,
+use crate::{
+    order_replay::transform_order,
+    sql::models::{
+        accounts::AccountEventRow,
+        data::{BarRow, InstrumentCloseRow, QuoteTickRow, TradeTickRow},
+        enums::{
+            AggregationSourcePg, AggressorSidePg, AssetClassPg, BarAggregationPg, CurrencyTypePg,
+            PriceTypePg, TrailingOffsetTypePg,
+        },
+        general::{GeneralRow, OrderEventOrderClientIdCombination, OrderPositionIndexRow},
+        instruments::InstrumentAnyRow,
+        orders::{OrderEventAnyRow, OrderFilledRow},
+        types::CurrencyRow,
     },
-    general::{GeneralRow, OrderEventOrderClientIdCombination, OrderPositionIndexRow},
-    instruments::InstrumentAnyRow,
-    orders::{OrderEventAnyRow, OrderFilledRow},
-    types::CurrencyRow,
 };
 
 pub(super) const CACHE_DATABASE_KEY_PREFIX: &str = "cache-database:";
+const TRADER_KEY_PREFIX: &str = "trader:";
+const GENERAL_KEY_PREFIX: &str = "general:";
+
+// A replacement initialization and its first update share a transaction timestamp
+macro_rules! order_event_replay_order {
+    () => {
+        "created_at ASC, (kind <> 'OrderInitialized') ASC"
+    };
+}
 
 #[derive(Debug)]
 pub struct DatabaseQueries;
@@ -85,9 +101,9 @@ impl DatabaseQueries {
 
     /// Deletes the order, position and account rows of `trader_id` via the provided `pool`.
     ///
-    /// Shared reference data (currencies, instruments, instrument closes), market data, the
-    /// user general entries, signals, custom data, and blockchain tables are left untouched.
-    /// This trader's saved component state and heartbeat are removed; shared synthetics remain.
+    /// Also removes the trader's general entries, position OMS metadata, component state,
+    /// and heartbeat. Preserves position archive blobs, shared reference data, market data,
+    /// signals, custom data, blockchain tables, and unscoped legacy entries.
     ///
     /// # Errors
     ///
@@ -112,8 +128,14 @@ impl DatabaseQueries {
                 .map_err(|e| anyhow::anyhow!("Failed to delete rows for {trader_id}: {e}"))?;
         }
 
-        sqlx::query("DELETE FROM general WHERE starts_with(id, $1)")
+        let archive_prefix = format!(
+            "{}{}",
+            trader_general_key_prefix(*trader_id),
+            CacheSnapshotRef::POSITION_PREFIX
+        );
+        sqlx::query("DELETE FROM general WHERE starts_with(id, $1) AND NOT starts_with(id, $2)")
             .bind(trader_key_prefix(*trader_id))
+            .bind(archive_prefix)
             .execute(&mut *transaction)
             .await?;
 
@@ -129,13 +151,21 @@ impl DatabaseQueries {
     ///
     /// Returns an error if the INSERT or UPDATE operation fails.
     pub async fn add(pool: &PgPool, key: String, value: Vec<u8>) -> anyhow::Result<()> {
+        Self::upsert_general(pool, &key, &value).await
+    }
+
+    async fn upsert_general<'e>(
+        executor: impl PgExecutor<'e>,
+        key: &str,
+        value: &[u8],
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO general (id, value) VALUES ($1, $2) \
              ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(key)
         .bind(value)
-        .execute(pool)
+        .execute(executor)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to insert into general table: {e}"))
@@ -147,9 +177,13 @@ impl DatabaseQueries {
     ///
     /// Returns an error if the database operation fails.
     pub async fn delete(pool: &PgPool, key: &str) -> anyhow::Result<()> {
+        Self::delete_general(pool, key).await
+    }
+
+    async fn delete_general<'e>(executor: impl PgExecutor<'e>, key: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM general WHERE id = $1")
             .bind(key)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(())
     }
@@ -183,7 +217,7 @@ impl DatabaseQueries {
         Ok(())
     }
 
-    /// Deletes a position's fill history, snapshot, and order-position mappings for one trader.
+    /// Deletes a trader's position history, snapshot, OMS metadata, and order-position mappings.
     /// Order event histories remain available independently of the position.
     ///
     /// # Errors
@@ -208,6 +242,7 @@ impl DatabaseQueries {
                 .await?;
         }
 
+        Self::delete_general(&mut *transaction, &position_oms_key(trader_id, position_id)).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -249,6 +284,41 @@ impl DatabaseQueries {
                 cache
             })
             .map_err(|e| anyhow::anyhow!("Failed to load general table: {e}"))
+    }
+
+    pub(super) async fn load_cache_general<'e>(
+        executor: impl PgExecutor<'e>,
+        trader_id: TraderId,
+    ) -> anyhow::Result<Vec<GeneralRow>> {
+        let general_prefix = trader_general_key_prefix(trader_id);
+        let oms_prefix = position_oms_key_prefix(trader_id);
+        let unspecified = serde_json::to_vec(&OmsType::Unspecified)?;
+
+        Ok(sqlx::query_as(
+            "SELECT id, value
+             FROM general
+             WHERE starts_with(id, $1) OR starts_with(id, $2)
+             UNION ALL
+             SELECT legacy.id, $5
+             FROM general AS legacy
+             WHERE starts_with(legacy.id, $3)
+               AND EXISTS (
+                   SELECT 1 FROM position_event AS p
+                   WHERE p.trader_id = $4
+                     AND p.position_id = substr(legacy.id, length($3) + 1)
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM general AS scoped
+                   WHERE scoped.id = $2 || substr(legacy.id, length($3) + 1)
+               )",
+        )
+        .bind(general_prefix)
+        .bind(oms_prefix)
+        .bind(POSITION_OMS_KEY_PREFIX)
+        .bind(trader_id.as_str())
+        .bind(unspecified)
+        .fetch_all(executor)
+        .await?)
     }
 
     /// Inserts or ignores a `Currency` row via the provided `pool`.
@@ -322,7 +392,7 @@ impl DatabaseQueries {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load currencies: {e}"))?;
         #[cfg(feature = "defi")]
-        let mut metadata = Self::load_token_metadata(pool, None).await?;
+        let mut metadata = Self::load_token_metadata(&mut *pool.acquire().await?, None).await?;
         currencies
             .into_iter()
             .map(|row| {
@@ -340,15 +410,23 @@ impl DatabaseQueries {
     ///
     /// Returns an error if the SELECT operation fails.
     pub async fn load_currency(pool: &PgPool, code: &str) -> anyhow::Result<Option<Currency>> {
+        let mut connection = pool.acquire().await?;
+        Self::load_currency_on(&mut connection, code).await
+    }
+
+    async fn load_currency_on(
+        connection: &mut PgConnection,
+        code: &str,
+    ) -> anyhow::Result<Option<Currency>> {
         let currency = sqlx::query_as::<_, CurrencyRow>("SELECT * FROM currency WHERE id = $1")
             .bind(code)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *connection)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load currency: {e}"))?;
 
         #[cfg(feature = "defi")]
         if let Some(row) = currency {
-            let metadata = Self::load_token_metadata(pool, Some(code))
+            let metadata = Self::load_token_metadata(connection, Some(code))
                 .await?
                 .remove(&row.0.code);
             Self::restore_token_currency(row.0, metadata).map(Some)
@@ -414,15 +492,15 @@ impl DatabaseQueries {
                 id, kind, raw_symbol, base_currency, underlying, quote_currency, settlement_currency, isin, asset_class, exchange,
                 strategy_type, multiplier, option_kind, is_inverse, strike_price, activation_ns, expiration_ns, price_precision, size_precision,
                 price_increment, size_increment, margin_init, margin_maint, lot_size, max_quantity, min_quantity, max_notional,
-                min_notional, max_price, min_price, ts_init, ts_event, info, underlying_instrument_id, exercise_style, settlement_type, tick_scheme, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::asset_class, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33::json, $34, $35, $36, $37, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                min_notional, max_price, min_price, ts_init, ts_event, info, underlying_instrument_id, exercise_style, settlement_type, tick_scheme, strike_currency, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::asset_class, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33::json, $34, $35, $36, $37, $38, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT (id)
             DO UPDATE
             SET
                 kind = $2, raw_symbol = $3, base_currency= $4, underlying = $5, quote_currency = $6, settlement_currency = $7, isin = $8, asset_class = $9, exchange = $10,
                  strategy_type = $11, multiplier = $12, option_kind = $13, is_inverse = $14, strike_price = $15, activation_ns = $16, expiration_ns = $17 , price_precision = $18, size_precision = $19,
                  price_increment = $20, size_increment = $21, margin_init = $22, margin_maint = $23, lot_size = $24, max_quantity = $25,
-                 min_quantity = $26, max_notional = $27, min_notional = $28, max_price = $29, min_price = $30, ts_init = $31,  ts_event = $32, info = $33::json, underlying_instrument_id = $34, exercise_style = $35, settlement_type = $36, tick_scheme = $37, updated_at = CURRENT_TIMESTAMP
+                 min_quantity = $26, max_notional = $27, min_notional = $28, max_price = $29, min_price = $30, ts_init = $31,  ts_event = $32, info = $33::json, underlying_instrument_id = $34, exercise_style = $35, settlement_type = $36, tick_scheme = $37, strike_currency = $38, updated_at = CURRENT_TIMESTAMP
             "#)
             .bind(instrument.id().to_string())
             .bind(kind)
@@ -461,6 +539,7 @@ impl DatabaseQueries {
             .bind(exercise_style.map(|style| style.to_string()))
             .bind(settlement_type.map(|kind| kind.to_string()))
             .bind(instrument.tick_scheme().map(|scheme| scheme.to_string()))
+            .bind(instrument.strike_currency().map(|currency| currency.code.as_str()))
             .execute(executor)
             .await
             .map(|_| ())
@@ -469,11 +548,11 @@ impl DatabaseQueries {
 
     #[cfg(feature = "defi")]
     async fn load_token_metadata(
-        pool: &PgPool,
+        connection: &mut PgConnection,
         code: Option<&str>,
     ) -> anyhow::Result<AHashMap<Ustr, TokenCurrency>> {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass('defi_currency') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await
             .map_err(integrity_error)?;
 
@@ -484,7 +563,7 @@ impl DatabaseQueries {
         let rows =
             sqlx::query("SELECT * FROM defi_currency WHERE ($1::TEXT IS NULL OR currency_id = $1)")
                 .bind(code)
-                .fetch_all(pool)
+                .fetch_all(connection)
                 .await
                 .map_err(integrity_error)?;
         rows.iter()
@@ -540,7 +619,7 @@ impl DatabaseQueries {
 
     #[cfg(feature = "defi")]
     async fn restore_instrument_dependencies(
-        pool: &PgPool,
+        connection: &mut PgConnection,
         row: &sqlx::postgres::PgRow,
         metadata: &AHashMap<Ustr, TokenCurrency>,
     ) -> anyhow::Result<()> {
@@ -548,7 +627,12 @@ impl DatabaseQueries {
         let mut expected = Vec::new();
         let mut references = Vec::new();
 
-        for field in ["base_currency", "quote_currency", "settlement_currency"] {
+        for field in [
+            "base_currency",
+            "quote_currency",
+            "settlement_currency",
+            "strike_currency",
+        ] {
             if let Some(code) = row
                 .try_get::<Option<String>, _>(field)
                 .map_err(integrity_error)?
@@ -572,7 +656,7 @@ impl DatabaseQueries {
         }
 
         for code in &codes {
-            let currency = Self::load_currency(pool, code)
+            let currency = Self::load_currency_on(connection, code)
                 .await
                 .map_err(integrity_error)?
                 .ok_or_else(|| integrity_error(format!("Missing token currency {code}")))?;
@@ -748,14 +832,27 @@ impl DatabaseQueries {
         let history: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM position WHERE instrument_id = $1 UNION ALL SELECT 1 FROM position_event WHERE instrument_id = $1)")
             .bind(id).fetch_one(&mut **transaction).await?;
 
-        let archives: Vec<Vec<u8>> =
-            sqlx::query_scalar("SELECT value FROM general WHERE id LIKE $1")
-                .bind(format!("{}%", CacheSnapshotRef::POSITION_PREFIX))
-                .fetch_all(&mut **transaction)
-                .await?;
+        let prefix = CacheSnapshotRef::POSITION_PREFIX;
+        let archives: Vec<GeneralRow> = sqlx::query_as(
+            "SELECT id, value FROM general
+             WHERE starts_with(id, $1) OR (starts_with(id, $2) AND strpos(id, $3) > 0)",
+        )
+        .bind(prefix)
+        .bind(format!("{CACHE_DATABASE_KEY_PREFIX}{TRADER_KEY_PREFIX}"))
+        .bind(format!(":{GENERAL_KEY_PREFIX}{prefix}"))
+        .fetch_all(&mut **transaction)
+        .await?;
+
         let mut history = history;
-        for blob in archives {
-            history |= CacheSnapshotRef::position_instrument_id(&blob)
+
+        for archive in archives {
+            if !archive.id.starts_with(prefix)
+                && !scoped_general_key(&archive.id).is_some_and(|key| key.starts_with(prefix))
+            {
+                continue;
+            }
+
+            history |= CacheSnapshotRef::position_instrument_id(&archive.value)
                 .map_err(integrity_error)?
                 .to_string()
                 == id;
@@ -767,8 +864,14 @@ impl DatabaseQueries {
             )));
         }
 
-        let rows = sqlx::query("SELECT * FROM order_event WHERE instrument_id = $1 ORDER BY trader_id, client_order_id, created_at ASC")
-            .bind(id).fetch_all(&mut **transaction).await?;
+        let rows = sqlx::query(concat!(
+            "SELECT * FROM order_event WHERE instrument_id = $1
+             ORDER BY trader_id, client_order_id, ",
+            order_event_replay_order!()
+        ))
+        .bind(id)
+        .fetch_all(&mut **transaction)
+        .await?;
         let mut events: AHashMap<(String, String), Vec<OrderEventAny>> = AHashMap::new();
 
         for row in rows {
@@ -781,8 +884,10 @@ impl DatabaseQueries {
         }
 
         for events in events.values() {
-            let order = OrderAny::from_events(events.clone()).map_err(integrity_error)?;
-            if !order.is_closed() {
+            if Self::replay_order(events.clone())
+                .map_err(integrity_error)?
+                .is_some_and(|order| !order.is_closed())
+            {
                 return Err(integrity_error(format!(
                     "Instrument {id} has nonterminal orders"
                 )));
@@ -870,6 +975,10 @@ impl DatabaseQueries {
                     != instrument
                         .base_currency()
                         .map(|currency| currency.code.to_string())
+                    || row
+                        .try_get::<Option<String>, _>("strike_currency")
+                        .map_err(integrity_error)?
+                        != instrument.strike_currency().map(|c| c.code.to_string())
                     || quote != instrument.quote_currency().code.as_str()
                     || settlement != Some(instrument.settlement_currency().code.to_string())
                 {
@@ -918,9 +1027,17 @@ impl DatabaseQueries {
         pool: &PgPool,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<InstrumentAny>> {
+        let mut connection = pool.acquire().await?;
+        Self::load_instrument_on(&mut connection, instrument_id).await
+    }
+
+    async fn load_instrument_on(
+        connection: &mut PgConnection,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentAny>> {
         let row = sqlx::query("SELECT * FROM instrument WHERE id = $1")
             .bind(instrument_id.to_string())
-            .fetch_optional(pool)
+            .fetch_optional(&mut *connection)
             .await?;
 
         let Some(row) = row else {
@@ -929,8 +1046,8 @@ impl DatabaseQueries {
 
         #[cfg(feature = "defi")]
         {
-            let metadata = Self::load_token_metadata(pool, None).await?;
-            Self::restore_instrument_dependencies(pool, &row, &metadata).await?;
+            let metadata = Self::load_token_metadata(connection, None).await?;
+            Self::restore_instrument_dependencies(connection, &row, &metadata).await?;
         }
 
         let instrument = InstrumentAnyRow::from_row(&row)?.0;
@@ -950,11 +1067,13 @@ impl DatabaseQueries {
             .await?;
         let mut instruments = Vec::with_capacity(rows.len());
         #[cfg(feature = "defi")]
-        let metadata = Self::load_token_metadata(pool, None).await?;
+        let mut connection = pool.acquire().await?;
+        #[cfg(feature = "defi")]
+        let metadata = Self::load_token_metadata(&mut connection, None).await?;
 
         for row in rows {
             #[cfg(feature = "defi")]
-            Self::restore_instrument_dependencies(pool, &row, &metadata).await?;
+            Self::restore_instrument_dependencies(&mut connection, &row, &metadata).await?;
             let instrument = InstrumentAnyRow::from_row(&row)?.0;
             #[cfg(feature = "defi")]
             validate_marker(&instrument, &Self::instrument_marker(&row)?)?;
@@ -1281,7 +1400,17 @@ impl DatabaseQueries {
         snapshot: PositionSnapshot,
     ) -> anyhow::Result<()> {
         let mut transaction = pool.begin().await?;
+        Self::insert_position_snapshot(&mut transaction, snapshot).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
 
+    async fn insert_position_snapshot(
+        transaction: &mut Transaction<'_, Postgres>,
+        snapshot: PositionSnapshot,
+    ) -> anyhow::Result<()> {
         // Insert trader if it does not exist
         // TODO remove this when node and trader initialization is implemented
         sqlx::query(
@@ -1290,7 +1419,7 @@ impl DatabaseQueries {
         "#,
         )
         .bind(snapshot.trader_id.to_string())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
@@ -1339,14 +1468,10 @@ impl DatabaseQueries {
             .bind(snapshot.ts_init.to_string())
             .bind(snapshot.ts_last.to_string())
             .bind(snapshot.replay_state)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("Failed to insert into position table: {e}"))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to insert into position table: {e}"))
     }
 
     /// Loads a `PositionSnapshot` entry by `position_id` via the provided `pool`.
@@ -1430,17 +1555,65 @@ impl DatabaseQueries {
     ///
     /// Returns an error if the SQL INSERT or UPDATE operation fails, if serialization of
     /// `exec_algorithm_params` fails, or if the event is already persisted for another trader.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "order event persistence maps the full database schema in one transaction"
-    )]
     pub async fn add_order_event(
         pool: &PgPool,
         order_event: Box<dyn OrderEvent>,
         client_id: Option<ClientId>,
     ) -> anyhow::Result<()> {
         let mut transaction = pool.begin().await?;
+        Self::insert_order_event(&mut transaction, order_event, client_id).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
 
+    pub(super) async fn add_order_replacement(
+        pool: &PgPool,
+        init: OrderInitialized,
+        client_id: Option<ClientId>,
+        prior_event_ids: &[String],
+        next_event: Box<dyn OrderEvent>,
+    ) -> anyhow::Result<()> {
+        let trader_id = init.trader_id;
+        let client_order_id = init.client_order_id;
+        let mut transaction = pool.begin().await?;
+        Self::insert_order_event(&mut transaction, Box::new(init), client_id).await?;
+        Self::insert_order_event(&mut transaction, next_event, None).await?;
+
+        if let Some(client_id) = client_id {
+            sqlx::query(
+                r#"
+                UPDATE "order_event"
+                SET client_id = $3
+                WHERE trader_id = $1 AND client_order_id = $2 AND client_id <> $3
+                  AND id = ANY($4)
+                "#,
+            )
+            .bind(trader_id.to_string())
+            .bind(client_order_id.to_string())
+            .bind(client_id.to_string())
+            .bind(prior_event_ids)
+            .execute(&mut *transaction)
+            .await
+            .context("failed to update order client origin after replacement")?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one statement maps the full order event schema"
+    )]
+    async fn insert_order_event(
+        transaction: &mut Transaction<'_, Postgres>,
+        order_event: Box<dyn OrderEvent>,
+        client_id: Option<ClientId>,
+    ) -> anyhow::Result<()> {
         // Insert trader if it does not exist
         // TODO remove this when node and trader initialization is implemented
         sqlx::query(
@@ -1449,7 +1622,7 @@ impl DatabaseQueries {
         "#,
         )
         .bind(order_event.trader_id().to_string())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to insert into trader table: {e}"))?;
@@ -1463,7 +1636,7 @@ impl DatabaseQueries {
             "#,
             )
             .bind(client_id.to_string())
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to insert into client table: {e}"))?;
@@ -1570,7 +1743,7 @@ impl DatabaseQueries {
             .bind(order_event.is_reopened())
             .bind(info)
             .bind(order_event.causation_id().map(|x| x.to_string()))
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to insert into order_event table: {e}"))?;
 
@@ -1584,10 +1757,7 @@ impl DatabaseQueries {
             );
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to commit transaction: {e}"))
+        Ok(())
     }
 
     /// Loads all order events for a `client_order_id` via the provided `pool`.
@@ -1600,13 +1770,13 @@ impl DatabaseQueries {
         client_order_id: &ClientOrderId,
         trader_id: &TraderId,
     ) -> anyhow::Result<Vec<OrderEventAny>> {
-        sqlx::query_as::<_, OrderEventAnyRow>(
+        sqlx::query_as::<_, OrderEventAnyRow>(concat!(
             r#"
             SELECT * FROM "order_event" event
             WHERE event.client_order_id = $1 AND event.trader_id = $2
-            ORDER BY created_at ASC
-        "#,
-        )
+            ORDER BY "#,
+            order_event_replay_order!()
+        ))
         .bind(client_order_id.to_string())
         .bind(trader_id.to_string())
         .fetch_all(pool)
@@ -1625,20 +1795,10 @@ impl DatabaseQueries {
         client_order_id: &ClientOrderId,
         trader_id: &TraderId,
     ) -> anyhow::Result<Option<OrderAny>> {
-        let order_events = Self::load_order_events(pool, client_order_id, trader_id).await;
-
-        match order_events {
-            Ok(order_events) => {
-                if order_events.is_empty() {
-                    return Ok(None);
-                }
-                let order = OrderAny::from_events(order_events).map_err(|e| {
-                    anyhow::anyhow!("Failed to assemble order {client_order_id} from events: {e}")
-                })?;
-                Ok(Some(order))
-            }
-            Err(e) => anyhow::bail!("Failed to load order events: {e}"),
-        }
+        let events = Self::load_order_events(pool, client_order_id, trader_id).await?;
+        Self::replay_order(events).map_err(|e| {
+            anyhow::anyhow!("Failed to assemble order {client_order_id} from events: {e}")
+        })
     }
 
     /// Loads and assembles all `OrderAny` entries via the provided `pool`.
@@ -1665,6 +1825,7 @@ impl DatabaseQueries {
                 .collect()
         })
         .map_err(|e| anyhow::anyhow!("Failed to load order ids: {e}"))?;
+
         for id in client_order_ids {
             let order = Self::load_order(pool, &id, trader_id).await?;
             if let Some(order) = order {
@@ -1672,6 +1833,32 @@ impl DatabaseQueries {
             }
         }
         Ok(orders)
+    }
+
+    fn replay_order(events: Vec<OrderEventAny>) -> anyhow::Result<Option<OrderAny>> {
+        let mut events = events.into_iter();
+
+        let Some(initial) = events.next() else {
+            return Ok(None);
+        };
+
+        let mut order = OrderAny::from_events(vec![initial])?;
+
+        for event in events {
+            if let OrderEventAny::Initialized(init) = &event
+                && order.is_active_local()
+                && order.emulation_trigger().is_some()
+                && init.emulation_trigger.is_none()
+                && init.order_side == order.order_side()
+            {
+                let ts_init = init.ts_event;
+                order = transform_order(&order, event, ts_init)?;
+            } else {
+                order.apply(event)?;
+            }
+        }
+
+        Ok(Some(order))
     }
 
     /// Replaces the fill event log for a `position_id` via the provided `pool`.
@@ -1683,6 +1870,16 @@ impl DatabaseQueries {
         pool: &PgPool,
         position_id: PositionId,
         event: &OrderFilled,
+    ) -> anyhow::Result<()> {
+        Self::replace_position(pool, position_id, event, None, None).await
+    }
+
+    pub(super) async fn replace_position(
+        pool: &PgPool,
+        position_id: PositionId,
+        event: &OrderFilled,
+        snapshot: Option<PositionSnapshot>,
+        oms_type: Option<OmsType>,
     ) -> anyhow::Result<()> {
         let event_position_id = Self::event_position_id(event)?;
         if event_position_id != position_id {
@@ -1707,6 +1904,26 @@ impl DatabaseQueries {
             .map_err(|e| anyhow::anyhow!("Failed to delete position_event rows: {e}"))?;
 
         Self::insert_position_event(&mut transaction, event).await?;
+        if let Some(snapshot) = snapshot {
+            Self::insert_position_snapshot(&mut transaction, snapshot).await?;
+        } else {
+            sqlx::query(
+                r#"UPDATE "position" SET replay_state = NULL
+                   WHERE id = $1 AND trader_id = $2 AND replay_state IS NOT NULL"#,
+            )
+            .bind(position_id.to_string())
+            .bind(event.trader_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to clear position replay state: {e}"))?;
+        }
+
+        if let Some(oms_type) = oms_type {
+            let key = position_oms_key(event.trader_id, position_id);
+            let value = serde_json::to_vec(&oms_type)?;
+            Self::upsert_general(&mut *transaction, &key, &value).await?;
+        }
+
         transaction
             .commit()
             .await
@@ -1779,20 +1996,51 @@ impl DatabaseQueries {
         position_id: &PositionId,
         trader_id: &TraderId,
     ) -> anyhow::Result<Option<Position>> {
-        if let Some(snapshot) = Self::load_position_snapshot(pool, position_id, trader_id).await?
-            && let Some(replay_state) = snapshot.replay_state
-        {
+        let mut connection = pool.acquire().await?;
+        Self::load_position_on(&mut connection, position_id, trader_id).await
+    }
+
+    async fn load_position_on(
+        connection: &mut PgConnection,
+        position_id: &PositionId,
+        trader_id: &TraderId,
+    ) -> anyhow::Result<Option<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT snapshot.replay_state, fill.*
+            FROM (VALUES ($1::text, $2::text)) AS target(position_id, trader_id)
+            LEFT JOIN "position" AS snapshot
+                ON snapshot.id = target.position_id AND snapshot.trader_id = target.trader_id
+            LEFT JOIN position_event AS fill
+                ON snapshot.replay_state IS NULL
+                AND fill.position_id = target.position_id AND fill.trader_id = target.trader_id
+            WHERE snapshot.replay_state IS NOT NULL OR fill.event_sequence IS NOT NULL
+            ORDER BY fill.event_sequence ASC
+        "#,
+        )
+        .bind(position_id.to_string())
+        .bind(trader_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load position replay state or events: {e}"))?;
+
+        let Some((first, remaining)) = rows.split_first() else {
+            return Ok(None);
+        };
+
+        let replay_state: Option<serde_json::Value> = first.try_get("replay_state")?;
+        if let Some(replay_state) = replay_state {
             let position: Position = serde_json::from_value(replay_state)
                 .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"))?;
             position.check_accounting()?;
             return Ok(Some(position));
         }
 
-        let fills = Self::load_position_events(pool, position_id, trader_id).await?;
-        let Some((first_fill, remaining_fills)) = fills.split_first() else {
-            return Ok(None);
-        };
-        let Some(instrument) = Self::load_instrument(pool, &first_fill.instrument_id).await? else {
+        let first_fill = OrderFilledRow::from_row(first)?.0;
+
+        let Some(instrument) =
+            Self::load_instrument_on(connection, &first_fill.instrument_id).await?
+        else {
             log::error!(
                 "Instrument not found for position {position_id}: {}",
                 first_fill.instrument_id
@@ -1800,8 +2048,10 @@ impl DatabaseQueries {
             return Ok(None);
         };
 
-        let mut position = Position::new_checked(&instrument, first_fill.clone())?;
-        for fill in remaining_fills {
+        let mut position = Position::new_checked(&instrument, first_fill)?;
+
+        for row in remaining {
+            let fill = OrderFilledRow::from_row(row)?.0;
             if position.trade_ids.contains(&fill.trade_id) {
                 anyhow::bail!(
                     "Duplicate fill event for position {position_id}: {}",
@@ -1809,7 +2059,7 @@ impl DatabaseQueries {
                 );
             }
 
-            position.try_apply(fill)?;
+            position.try_apply(&fill)?;
         }
 
         Ok(Some(position))
@@ -1817,16 +2067,47 @@ impl DatabaseQueries {
 
     /// Loads and replays all `Position` entries via the provided `pool`.
     ///
-    /// Only positions written by `trader_id` are loaded.
+    /// Loads positions written by `trader_id` and logs unreadable positions before skipping them.
     ///
     /// # Errors
     ///
-    /// Returns an error if loading position IDs or replaying any position fails.
+    /// Returns an error if loading or validating position IDs fails.
     pub async fn load_positions(
         pool: &PgPool,
         trader_id: &TraderId,
     ) -> anyhow::Result<Vec<Position>> {
-        let position_ids: Vec<PositionId> = sqlx::query(
+        let mut connection = pool.acquire().await?;
+        Self::load_positions_on(&mut connection, trader_id, false).await
+    }
+
+    pub(super) async fn load_positions_and_general(
+        pool: &PgPool,
+        trader_id: TraderId,
+    ) -> anyhow::Result<(Vec<GeneralRow>, Vec<Position>)> {
+        let mut transaction = pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        let general = Self::load_cache_general(&mut *transaction, trader_id).await?;
+        let oms_prefix = position_oms_key_prefix(trader_id);
+        for row in &general {
+            if let Some(position_id) = row.id.strip_prefix(&oms_prefix) {
+                serde_json::from_slice::<OmsType>(&row.value).with_context(|| {
+                    format!("invalid OMS metadata for trader {trader_id}, position {position_id}")
+                })?;
+            }
+        }
+
+        let positions = Self::load_positions_on(&mut transaction, &trader_id, true).await?;
+        transaction.commit().await?;
+        Ok((general, positions))
+    }
+
+    async fn load_positions_on(
+        connection: &mut PgConnection,
+        trader_id: &TraderId,
+        require_complete: bool,
+    ) -> anyhow::Result<Vec<Position>> {
+        let position_ids: Vec<String> = sqlx::query_scalar(
             r#"
             SELECT DISTINCT position_id
             FROM "position_event"
@@ -1835,22 +2116,25 @@ impl DatabaseQueries {
         "#,
         )
         .bind(trader_id.to_string())
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| PositionId::from(row.get::<&str, _>(0)))
-                .collect()
-        })
-        .map_err(|e| anyhow::anyhow!("Failed to load position ids: {e}"))?;
+        .context("failed to load position IDs")?;
 
-        let mut positions = Vec::new();
-
+        let mut positions = Vec::with_capacity(position_ids.len());
         for id in position_ids {
-            match Self::load_position(pool, &id, trader_id).await {
-                Ok(Some(position)) => positions.push(position),
-                Ok(None) => log::error!("Position not found: {id}"),
-                Err(e) => log::error!("Failed to load position {id}: {e}"),
+            let id = PositionId::new_checked(&id).context("invalid persisted position ID")?;
+
+            let position = Self::load_position_on(connection, &id, trader_id)
+                .await
+                .with_context(|| format!("failed to load position {id}"))
+                .and_then(|position| {
+                    position.with_context(|| format!("missing replay data for position {id}"))
+                });
+
+            match position {
+                Ok(position) => positions.push(position),
+                Err(e) if require_complete => return Err(e),
+                Err(e) => log::error!("Skipping unreadable position: {e:#}"),
             }
         }
 
@@ -2125,6 +2409,7 @@ impl DatabaseQueries {
                 .collect()
         })
         .map_err(|e| anyhow::anyhow!("Failed to load account ids: {e}"))?;
+
         for id in account_ids {
             let account = Self::load_account(pool, &id, trader_id).await?;
             if let Some(account) = account {
@@ -2408,7 +2693,7 @@ impl DatabaseQueries {
         .bind(trader_id.to_string())
         .fetch_all(pool)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to load account ids: {e}"))?;
+        .context("failed to load order client index")?;
 
         for id in result {
             map.insert(id.client_order_id, id.client_id);
@@ -2755,9 +3040,33 @@ impl DatabaseQueries {
 
 pub(super) fn trader_key_prefix(trader_id: TraderId) -> String {
     format!(
-        "{CACHE_DATABASE_KEY_PREFIX}trader:{}:{trader_id}:",
+        "{CACHE_DATABASE_KEY_PREFIX}{TRADER_KEY_PREFIX}{}:{trader_id}:",
         trader_id.as_str().len()
     )
+}
+
+pub(super) fn trader_general_key_prefix(trader_id: TraderId) -> String {
+    format!("{}{GENERAL_KEY_PREFIX}", trader_key_prefix(trader_id))
+}
+
+#[cfg(feature = "defi")]
+fn scoped_general_key(key: &str) -> Option<&str> {
+    let (trader_len, suffix) = key
+        .strip_prefix(CACHE_DATABASE_KEY_PREFIX)?
+        .strip_prefix(TRADER_KEY_PREFIX)?
+        .split_once(':')?;
+    let key = suffix
+        .get(trader_len.parse::<usize>().ok()?..)?
+        .strip_prefix(':')?;
+    key.strip_prefix(GENERAL_KEY_PREFIX)
+}
+
+fn position_oms_key(trader_id: TraderId, position_id: PositionId) -> String {
+    format!("{}{position_id}", position_oms_key_prefix(trader_id))
+}
+
+fn position_oms_key_prefix(trader_id: TraderId) -> String {
+    format!("{}{POSITION_OMS_KEY_PREFIX}", trader_key_prefix(trader_id))
 }
 
 #[cfg(all(test, feature = "defi"))]

@@ -53,7 +53,7 @@ use crate::{
         curve::{SCALAR_BYTES, Scalar},
         field::Fp,
         hash::hash_to_quintic_extension,
-        schnorr::{PrivateKey, SIG_BYTES},
+        schnorr::{InvalidSigningNonce, PrivateKey, SIG_BYTES},
     },
 };
 
@@ -93,6 +93,9 @@ pub enum AuthTokenError {
         /// Byte offset of the offending 8-byte chunk in the input.
         offset: usize,
     },
+    /// The supplied Schnorr signing nonce is zero or non-canonical.
+    #[error(transparent)]
+    InvalidSigningNonce(#[from] InvalidSigningNonce),
 }
 
 /// Default deadline applied by [`build_auth_token_for`] when the caller does
@@ -138,17 +141,15 @@ pub fn build_auth_token_for(
 /// Draws a fresh nonzero canonical [`Scalar`] from the operating system's
 /// cryptographic random number source for the per-signature `k` nonce.
 ///
-/// The Schnorr binding requires `k` to be drawn from a cryptographic RNG and
-/// used at most once per signature; see [`PrivateKey::sign`] for the full
-/// contract. Rejection sampling gives a uniform scalar in `[1, n)`, where
-/// `n` is the curve order. Direct OS randomness avoids duplicating a userspace RNG's state
-/// across a process fork.
+/// See [`PrivateKey::sign`] for the nonce requirements. Rejection sampling
+/// gives a uniform scalar in `[1, n)`, where `n` is the curve order. Direct OS
+/// randomness avoids duplicating a userspace RNG's state across a process fork.
 ///
 /// # Errors
 ///
 /// Returns an error if the operating system's random number source fails.
 pub fn fresh_k() -> anyhow::Result<Scalar> {
-    let mut bytes = [0u8; SCALAR_BYTES];
+    let mut bytes = [0_u8; SCALAR_BYTES];
 
     loop {
         SysRng
@@ -165,11 +166,14 @@ pub fn fresh_k() -> anyhow::Result<Scalar> {
 ///
 /// Validates the deadline against [`LIGHTER_AUTH_TOKEN_MAX_TTL`]. See
 /// [`build_auth_token_at`] for an injectable-`now` variant suitable for tests.
+/// See [`PrivateKey::sign`] for the nonce requirements.
 ///
 /// # Errors
 ///
-/// Returns an error if `deadline_unix_secs <= now`, if it exceeds the venue cap, or if the system
-/// clock predates the UNIX epoch.
+/// Returns an error if:
+/// - The deadline is at or before the current time or exceeds the venue cap.
+/// - The system clock predates the UNIX epoch.
+/// - The signing nonce is zero or non-canonical.
 pub fn build_auth_token(
     deadline_unix_secs: i64,
     account_index: i64,
@@ -234,13 +238,15 @@ pub fn build_auth_token_at(
 ///
 /// Public so tests and oracle round-trips can produce tokens whose deadline
 /// would otherwise trip the venue cap. Production callers should use
-/// [`build_auth_token`] or [`build_auth_token_at`].
+/// [`build_auth_token`] or [`build_auth_token_at`]. See [`PrivateKey::sign`]
+/// for the nonce requirements.
 ///
 /// # Errors
 ///
-/// Returns an error if the rendered message contains an 8-byte chunk that does not decode as a
-/// canonical Goldilocks element. The auth-token format keeps every byte ASCII, so this case is
-/// unreachable for the production callers.
+/// Returns an error if:
+/// - The rendered message contains a non-canonical Goldilocks limb. The ASCII token format rules
+///   out this case.
+/// - The signing nonce is zero or non-canonical.
 pub fn build_auth_token_unchecked(
     deadline_unix_secs: i64,
     account_index: i64,
@@ -292,7 +298,7 @@ fn sign_message(
 ) -> Result<[u8; SIG_BYTES], AuthTokenError> {
     let elems = ascii_to_fp_limbs(message.as_bytes())?;
     let digest = hash_to_quintic_extension(&elems);
-    Ok(sk.sign(digest, k).to_le_bytes())
+    Ok(sk.sign(digest, k)?.to_le_bytes())
 }
 
 fn ascii_to_fp_limbs(bytes: &[u8]) -> Result<Vec<Fp>, AuthTokenError> {
@@ -301,7 +307,7 @@ fn ascii_to_fp_limbs(bytes: &[u8]) -> Result<Vec<Fp>, AuthTokenError> {
 
     while i < bytes.len() {
         let end = core::cmp::min(i + 8, bytes.len());
-        let mut limb = [0u8; 8];
+        let mut limb = [0_u8; 8];
         limb[..end - i].copy_from_slice(&bytes[i..end]);
         let fp =
             Fp::try_from_le_bytes(limb).ok_or(AuthTokenError::MessageEncoding { offset: i })?;
@@ -331,7 +337,10 @@ mod tests {
 
     use super::*;
     use crate::signing::{
-        curve::SCALAR_BYTES, field::Fp5, fixtures::hex_to_array, schnorr::Signature,
+        curve::{ORDER, SCALAR_BYTES},
+        field::Fp5,
+        fixtures::hex_to_array,
+        schnorr::Signature,
     };
 
     fn fixed_sk() -> PrivateKey {
@@ -346,7 +355,7 @@ mod tests {
     }
 
     fn nonzero_k() -> Scalar {
-        let mut bytes = [0u8; SCALAR_BYTES];
+        let mut bytes = [0_u8; SCALAR_BYTES];
         bytes[0] = 0x42;
         bytes[7] = 0x01;
         Scalar::from_le_bytes_reduce(bytes)
@@ -370,8 +379,8 @@ mod tests {
             .as_secs();
         let now_i64 = i64::try_from(now).unwrap();
         let deadline = now_i64 + 600;
-        let account_index = 12345i64;
-        let api_key_index = 5u8;
+        let account_index = 12345_i64;
+        let api_key_index = 5_u8;
         let token = build_auth_token(
             deadline,
             account_index,
@@ -439,8 +448,34 @@ mod tests {
     }
 
     #[rstest]
-    fn deadline_in_past_errors() {
-        let err = build_auth_token_at(1_000, 999, 1, 0, &fixed_sk(), nonzero_k())
+    #[case::zero(Scalar::ZERO)]
+    #[case::order(ORDER)]
+    fn auth_token_builders_reject_invalid_signing_nonce(#[case] k: Scalar) {
+        let sk = fixed_sk();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let now = i64::try_from(now.as_secs()).unwrap();
+        let deadline = now + 600;
+        let expected = AuthTokenError::InvalidSigningNonce(InvalidSigningNonce);
+
+        assert_eq!(
+            build_auth_token(deadline, 12345, 5, &sk, k).unwrap_err(),
+            expected,
+        );
+        assert_eq!(
+            build_auth_token_at(now, deadline, 12345, 5, &sk, k).unwrap_err(),
+            expected,
+        );
+        assert_eq!(
+            build_auth_token_unchecked(deadline, 12345, 5, &sk, k).unwrap_err(),
+            expected,
+        );
+    }
+
+    #[rstest]
+    #[case::valid_nonce(nonzero_k())]
+    #[case::invalid_nonce(Scalar::ZERO)]
+    fn deadline_in_past_errors(#[case] k: Scalar) {
+        let err = build_auth_token_at(1_000, 999, 1, 0, &fixed_sk(), k)
             .expect_err("must reject past deadline");
         assert_eq!(
             err,
@@ -512,8 +547,8 @@ mod tests {
     #[rstest]
     fn hash_input_rejects_non_canonical_limb() {
         // u64::MAX > MODULUS so the 8-byte chunk is non-canonical.
-        let mut bytes = [0xFFu8; 8];
-        bytes[7] = 0xFF;
+        let mut bytes = [0xff_u8; 8];
+        bytes[7] = 0xff;
         let err = super::ascii_to_fp_limbs(&bytes).expect_err("must reject non-canonical");
         assert_eq!(err, AuthTokenError::MessageEncoding { offset: 0 });
     }
@@ -527,7 +562,7 @@ mod tests {
 
     fn decode_sig(hex: &str) -> Signature {
         assert_eq!(hex.len(), SIG_BYTES * 2);
-        let mut buf = [0u8; SIG_BYTES];
+        let mut buf = [0_u8; SIG_BYTES];
         for (i, slot) in buf.iter_mut().enumerate() {
             *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
         }
@@ -541,7 +576,7 @@ mod tests {
         /// below the Goldilocks modulus, so encoding never errors.
         #[rstest]
         fn prop_ascii_to_fp_limbs_round_trip(
-            input in proptest::collection::vec(0u8..=0x7F, 0..64),
+            input in proptest::collection::vec(0_u8..=0x7F, 0..64),
         ) {
             let limbs = super::ascii_to_fp_limbs(&input).expect("ASCII input must encode");
             prop_assert_eq!(limbs.len(), input.len().div_ceil(8));
@@ -570,17 +605,17 @@ mod tests {
         /// any non-zero `k` and any in-range deadline.
         #[rstest]
         fn prop_self_issued_token_verifies(
-            account_index in 0i64..1_000_000_000,
-            api_key_index in 0u8..=255,
-            ttl_secs in 1i64..(LIGHTER_AUTH_TOKEN_MAX_TTL.as_secs() as i64),
-            k_seed in 1u64..u64::MAX,
+            account_index in 0_i64..1_000_000_000,
+            api_key_index in 0_u8..=255,
+            ttl_secs in 1_i64..(LIGHTER_AUTH_TOKEN_MAX_TTL.as_secs() as i64),
+            k_seed in 1_u64..u64::MAX,
         ) {
             let sk = fixed_sk();
             let pk = sk.public_key();
             let now = 1_700_000_000;
             let deadline = now + ttl_secs;
 
-            let mut k_bytes = [0u8; SCALAR_BYTES];
+            let mut k_bytes = [0_u8; SCALAR_BYTES];
             k_bytes[..8].copy_from_slice(&k_seed.to_le_bytes());
             let k = Scalar::from_le_bytes_reduce(k_bytes);
             prop_assume!(!k.is_zero());

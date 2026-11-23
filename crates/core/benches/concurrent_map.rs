@@ -76,6 +76,7 @@ fn populated_dashmap(keys: &[String]) -> Arc<DashMap<String, u64>> {
     for (i, key) in keys.iter().enumerate() {
         map.insert(key.clone(), i as u64);
     }
+
     Arc::new(map)
 }
 
@@ -84,6 +85,7 @@ fn populated_rwlock(keys: &[String]) -> Arc<RwLock<AHashMap<String, u64>>> {
     for (i, key) in keys.iter().enumerate() {
         map.insert(key.clone(), i as u64);
     }
+
     Arc::new(RwLock::new(map))
 }
 
@@ -92,6 +94,7 @@ fn populated_atomic_map(keys: &[String]) -> Arc<AtomicMap<String, u64>> {
     for (i, key) in keys.iter().enumerate() {
         map.insert(key.clone(), i as u64);
     }
+
     Arc::new(AtomicMap::from(map))
 }
 
@@ -103,7 +106,7 @@ fn bench_single_thread_read(c: &mut Criterion) {
 
         let dash = populated_dashmap(&keys);
         group.bench_with_input(BenchmarkId::new("DashMap", size), &size, |b, _| {
-            let mut idx = 0usize;
+            let mut idx = 0_usize;
             b.iter(|| {
                 let key = &keys[idx % keys.len()];
                 let val = dash.get(key).map(|r| *r.value());
@@ -114,7 +117,7 @@ fn bench_single_thread_read(c: &mut Criterion) {
 
         let rwl = populated_rwlock(&keys);
         group.bench_with_input(BenchmarkId::new("RwLockAHashMap", size), &size, |b, _| {
-            let mut idx = 0usize;
+            let mut idx = 0_usize;
             b.iter(|| {
                 let key = &keys[idx % keys.len()];
                 let guard = rwl.read();
@@ -127,7 +130,7 @@ fn bench_single_thread_read(c: &mut Criterion) {
 
         let atomic = populated_atomic_map(&keys);
         group.bench_with_input(BenchmarkId::new("AtomicMap", size), &size, |b, _| {
-            let mut idx = 0usize;
+            let mut idx = 0_usize;
             b.iter(|| {
                 let key = &keys[idx % keys.len()];
                 let val = atomic.load().get(key).copied();
@@ -136,6 +139,7 @@ fn bench_single_thread_read(c: &mut Criterion) {
             });
         });
     }
+
     group.finish();
 }
 
@@ -226,6 +230,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
             });
         }
     }
+
     group.finish();
 }
 
@@ -243,6 +248,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
             if threads < 2 {
                 continue;
             }
+
             let readers = threads - 1;
             let param = format!("{size}_entries/{readers}r_1w");
 
@@ -351,6 +357,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
                                     m.insert(key.clone(), (size + i) as u64);
                                 }
                             });
+
                             map.rcu(|m| {
                                 for key in wk.iter() {
                                     m.remove(key);
@@ -377,6 +384,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
             });
         }
     }
+
     group.finish();
 }
 
@@ -467,6 +475,7 @@ fn bench_write_once_read_many(c: &mut Criterion) {
             });
         }
     }
+
     group.finish();
 }
 
@@ -478,23 +487,24 @@ fn bench_atomic_map_read_patterns(c: &mut Criterion) {
     group.throughput(Throughput::Elements(ATOMIC_MAP_LOOKUPS_PER_ITER as u64));
 
     group.bench_function("get_cloned_each_lookup", |b| {
-        let mut idx = 0usize;
+        let mut idx = 0_usize;
         b.iter(|| {
-            let mut sum = 0u64;
+            let mut sum = 0_u64;
 
             for _ in 0..ATOMIC_MAP_LOOKUPS_PER_ITER {
                 let key = &keys[idx % keys.len()];
                 sum = sum.wrapping_add(atomic.get_cloned(key).unwrap_or_default());
                 idx = idx.wrapping_add(1);
             }
+
             black_box(sum)
         });
     });
 
     group.bench_function("load_each_lookup", |b| {
-        let mut idx = 0usize;
+        let mut idx = 0_usize;
         b.iter(|| {
-            let mut sum = 0u64;
+            let mut sum = 0_u64;
 
             for _ in 0..ATOMIC_MAP_LOOKUPS_PER_ITER {
                 let key = &keys[idx % keys.len()];
@@ -502,21 +512,23 @@ fn bench_atomic_map_read_patterns(c: &mut Criterion) {
                 sum = sum.wrapping_add(guard.get(key).copied().unwrap_or_default());
                 idx = idx.wrapping_add(1);
             }
+
             black_box(sum)
         });
     });
 
     group.bench_function("load_once_guard", |b| {
-        let mut idx = 0usize;
+        let mut idx = 0_usize;
         b.iter(|| {
             let guard = atomic.load();
-            let mut sum = 0u64;
+            let mut sum = 0_u64;
 
             for _ in 0..ATOMIC_MAP_LOOKUPS_PER_ITER {
                 let key = &keys[idx % keys.len()];
                 sum = sum.wrapping_add(guard.get(key).copied().unwrap_or_default());
                 idx = idx.wrapping_add(1);
             }
+
             black_box(sum)
         });
     });

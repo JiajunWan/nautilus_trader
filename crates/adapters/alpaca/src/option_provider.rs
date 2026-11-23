@@ -405,6 +405,7 @@ impl AlpacaOptionContract {
             "specification_source": qualification.source(),
             "underlying_name": index_product(&self.underlying_symbol).map(|p| p.name),
         }))?;
+        let currency = Currency::USD();
         // Price increments here describe the minimum granularity. Alpaca enforces
         // the order tick based on the series and premium.
         Ok(OptionContract::builder()
@@ -417,7 +418,9 @@ impl AlpacaOptionContract {
             .exercise_style(exercise_style)
             .settlement_type(settlement_type)
             .strike_price(Price::from_decimal(strike_price)?)
-            .currency(Currency::USD())
+            .strike_currency(currency)
+            .quote_currency(currency)
+            .settlement_currency(currency)
             .activation_ns(UnixNanos::default())
             .expiration_ns(UnixNanos::from(u64::try_from(expiry.as_nanosecond())?))
             .price_precision(price_increment.precision)
@@ -692,6 +695,9 @@ mod tests {
         assert_eq!(option.asset_class, AssetClass::Equity);
         assert_eq!(option.exercise_style, Some(ExerciseStyle::American));
         assert_eq!(option.settlement_type, Some(SettlementType::Physical));
+        assert_eq!(option.strike_currency, Currency::USD());
+        assert_eq!(option.quote_currency, Currency::USD());
+        assert_eq!(option.settlement_currency, Currency::USD());
         assert_eq!(option.option_kind, OptionKind::Call);
         assert_eq!(
             option.strike_price.as_decimal(),

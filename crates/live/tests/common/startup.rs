@@ -20,6 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -29,7 +30,11 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::Clock,
     factories::{ClientConfig, ExecutionClientFactory},
-    messages::execution::CancelOrder,
+    live::{
+        dst::time,
+        runner::{get_data_event_sender, get_exec_event_sender},
+    },
+    messages::{DataEvent, ExecutionEvent, execution::CancelOrder},
     msgbus::{self, MessagingSwitchboard},
     nautilus_actor,
 };
@@ -71,6 +76,9 @@ pub(crate) struct StartupMassStatusClientState {
     pub(crate) factory_trader_id: Arc<Mutex<Option<TraderId>>>,
     pub(crate) factory_clock_id: Arc<Mutex<Option<usize>>>,
     pub(crate) mass_status_requested: Arc<AtomicBool>,
+    pub(crate) mass_status_delay: Duration,
+    pub(crate) connect_account: Arc<Mutex<Option<AccountState>>>,
+    pub(crate) connect_instrument: Arc<Mutex<Option<InstrumentAny>>>,
     pub(crate) recovered_instrument: Arc<Mutex<Option<InstrumentAny>>>,
     pub(crate) instrument_updates: Arc<AtomicUsize>,
     pub(crate) mass_status: Arc<Mutex<Option<ExecutionMassStatus>>>,
@@ -96,6 +104,7 @@ pub(crate) struct StartupMassStatusExecutionClient {
     venue: Venue,
     oms_type: OmsType,
     handles_all_order_venues: bool,
+    cache: CacheView,
 }
 
 #[derive(Debug)]
@@ -114,26 +123,6 @@ pub(crate) struct StartupMassStatusExecutionClientFactory {
 
 impl StartupMassStatusExecutionClient {
     pub(crate) const CLIENT_ID: &'static str = "STARTUP-MASS-STATUS";
-
-    fn new(
-        state: StartupMassStatusClientState,
-        behavior: StartupMassStatusBehavior,
-        client_id: ClientId,
-        account_id: AccountId,
-        venue: Venue,
-        oms_type: OmsType,
-        handles_all_order_venues: bool,
-    ) -> Self {
-        Self {
-            state,
-            behavior,
-            client_id,
-            account_id,
-            venue,
-            oms_type,
-            handles_all_order_venues,
-        }
-    }
 }
 
 impl ClientConfig for StartupMassStatusExecutionClientConfig {
@@ -188,20 +177,21 @@ impl ExecutionClientFactory for StartupMassStatusExecutionClientFactory {
         trader_id: TraderId,
         _name: &str,
         _config: &dyn ClientConfig,
-        _cache: CacheView,
+        cache: CacheView,
         clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         *self.state.factory_trader_id.lock() = Some(trader_id);
         *self.state.factory_clock_id.lock() = Some(Rc::as_ptr(&clock).cast::<()>() as usize);
-        Ok(Box::new(StartupMassStatusExecutionClient::new(
-            self.state.clone(),
-            self.behavior,
-            self.client_id,
-            self.account_id,
-            self.venue,
-            self.oms_type,
-            self.handles_all_order_venues,
-        )))
+        Ok(Box::new(StartupMassStatusExecutionClient {
+            state: self.state.clone(),
+            behavior: self.behavior,
+            client_id: self.client_id,
+            account_id: self.account_id,
+            venue: self.venue,
+            oms_type: self.oms_type,
+            handles_all_order_venues: self.handles_all_order_venues,
+            cache,
+        }))
     }
 
     fn name(&self) -> &'static str {
@@ -281,6 +271,22 @@ impl ExecutionClient for StartupMassStatusExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        let instrument = self.state.connect_instrument.lock().take();
+        if let Some(instrument) = instrument {
+            let event = DataEvent::Data(instrument.into());
+            get_data_event_sender().send(event)?;
+        }
+
+        let account = self.state.connect_account.lock().take();
+        if let Some(account) = account {
+            let account_id = account.account_id;
+            get_exec_event_sender().send(ExecutionEvent::Account(account))?;
+
+            while self.cache.borrow().account(&account_id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        }
+
         self.state.connected.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -300,6 +306,10 @@ impl ExecutionClient for StartupMassStatusExecutionClient {
         self.state
             .mass_status_requested
             .store(true, Ordering::Relaxed);
+
+        if !self.state.mass_status_delay.is_zero() {
+            time::sleep(self.state.mass_status_delay).await;
+        }
 
         let recovered = self.state.recovered_instrument.lock().take();
         if let Some(instrument) = recovered {

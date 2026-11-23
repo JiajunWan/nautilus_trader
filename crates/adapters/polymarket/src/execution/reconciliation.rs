@@ -489,6 +489,7 @@ fn validate_client_bound_order_row(
         .expire_time()
         .filter(|value| !value.is_zero())
         .map(|value| value.as_seconds());
+
     if cached_order.time_in_force() == TimeInForce::Gtd {
         anyhow::ensure!(
             cached_expire_seconds == provider_expire_seconds,
@@ -1191,7 +1192,7 @@ pub(crate) fn build_order_reports_from_orders(
     load_ids: Option<&[InstrumentId]>,
 ) -> anyhow::Result<(Vec<OrderStatusReport>, usize)> {
     let mut reports = Vec::new();
-    let mut filtered = 0usize;
+    let mut filtered = 0_usize;
     let mut selected_orders = AHashMap::new();
 
     for order in orders {
@@ -1593,6 +1594,44 @@ pub(crate) async fn generate_mass_status(
     Ok(Some(mass_status))
 }
 
+pub(crate) async fn wallet_instrument_ids(
+    http_client: &PolymarketClobHttpClient,
+    data_api_client: &PolymarketDataApiHttpClient,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    ctx: &FillContext<'_>,
+    load_ids: Option<&[InstrumentId]>,
+    resolved_balances: &ResolvedBalanceScope,
+) -> anyhow::Result<Vec<InstrumentId>> {
+    let mut orders = http_client
+        .get_orders(GetOrdersParams::default())
+        .await
+        .context("failed to fetch wallet orders")?;
+
+    let mut required =
+        filter_unsupported_orders(http_client, &mut orders, instruments, ctx, None, load_ids)
+            .await?;
+
+    if ctx.signer_type != PolymarketSignerType::Session {
+        let mut positions = data_api_client
+            .get_positions(ctx.user_address)
+            .await
+            .context("failed to fetch wallet positions")?;
+
+        let position_ids = filter_unsupported_positions(
+            http_client,
+            &mut positions,
+            instruments,
+            None,
+            load_ids,
+            resolved_balances,
+        )
+        .await?;
+        required.extend(position_ids);
+    }
+
+    Ok(required)
+}
+
 pub(crate) async fn filter_unsupported_orders(
     http_client: &PolymarketClobHttpClient,
     orders: &mut Vec<PolymarketOpenOrder>,
@@ -1600,7 +1639,7 @@ pub(crate) async fn filter_unsupported_orders(
     ctx: &FillContext<'_>,
     instrument_filter: Option<InstrumentId>,
     load_ids: Option<&[InstrumentId]>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<InstrumentId>> {
     orders.retain(|order| {
         instruments
             .get_cloned(&order.asset_id)
@@ -1642,7 +1681,13 @@ pub(crate) async fn filter_unsupported_orders(
         true
     });
 
-    Ok(())
+    Ok(orders
+        .iter()
+        .filter(|order| requires_lookup(order))
+        .map(|order| {
+            instrument_id_from_market_token(order.market.as_str(), order.asset_id.as_str())
+        })
+        .collect())
 }
 
 pub(crate) async fn filter_unsupported_positions(
@@ -1652,7 +1697,7 @@ pub(crate) async fn filter_unsupported_positions(
     instrument_filter: Option<InstrumentId>,
     load_ids: Option<&[InstrumentId]>,
     resolved_balances: &ResolvedBalanceScope,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<InstrumentId>> {
     let collection_load_ids = instrument_filter.is_none().then_some(load_ids).flatten();
 
     positions.retain(|position| {
@@ -1688,7 +1733,11 @@ pub(crate) async fn filter_unsupported_positions(
         true
     });
 
-    Ok(())
+    Ok(positions
+        .iter()
+        .filter(|position| requires_lookup(position))
+        .map(|position| instrument_id_from_market_token(&position.condition_id, &position.asset))
+        .collect())
 }
 
 fn execution_protocol_supported(instrument: &InstrumentAny) -> bool {
@@ -2364,7 +2413,10 @@ fn instrument_in_load_ids_scope(
     }
 }
 
-fn polymarket_instrument_ids_equivalent(left: InstrumentId, right: InstrumentId) -> bool {
+pub(super) fn polymarket_instrument_ids_equivalent(
+    left: InstrumentId,
+    right: InstrumentId,
+) -> bool {
     if left == right {
         return true;
     }
@@ -3102,7 +3154,7 @@ mod tests {
                 Some(&cached),
                 None,
             ),
-            UnixNanos::from(123_000_000_000u64),
+            UnixNanos::from(123_000_000_000_u64),
         );
 
         if let Some(expected_error) = expected_error {
@@ -3131,7 +3183,7 @@ mod tests {
             "../../test_data/decimal_precision_position.json"
         ))
         .unwrap();
-        let ts = UnixNanos::from(123_456_789u64);
+        let ts = UnixNanos::from(123_456_789_u64);
         let account_id = AccountId::from("POLYMARKET-001");
         let report =
             build_position_report_from_reportable_position(&position, account_id, ts).unwrap();
@@ -3165,7 +3217,7 @@ mod tests {
         let report = build_position_report_from_reportable_position(
             &positions[position_index],
             AccountId::from("POLYMARKET-001"),
-            UnixNanos::from(1_000_000_000u64),
+            UnixNanos::from(1_000_000_000_u64),
         )
         .expect("fixture position is reportable");
 
@@ -3183,7 +3235,7 @@ mod tests {
         let report = build_position_report_from_reportable_position(
             &position,
             AccountId::from("POLYMARKET-001"),
-            UnixNanos::from(1_000_000_000u64),
+            UnixNanos::from(1_000_000_000_u64),
         )
         .expect("fixture position is reportable");
 

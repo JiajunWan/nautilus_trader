@@ -190,37 +190,41 @@ step.
 
 ### Strategy and cache renames
 
-`QuoteTick`, `TradeTick`, and `register_indicator_for_*_ticks` retain their names:
+`QuoteTick` and `TradeTick` retain their names:
 
-| v1 name                              | v2 name                        |
-| ------------------------------------ | ------------------------------ |
-| `on_quote_tick`                      | `on_quote`                     |
-| `on_trade_tick`                      | `on_trade`                     |
-| `on_order_book`                      | `on_book`                      |
-| `on_order_book_deltas`               | `on_book_deltas`               |
-| `on_order_book_depth`                | `on_book_depth`                |
-| `subscribe_quote_ticks`              | `subscribe_quotes`             |
-| `subscribe_trade_ticks`              | `subscribe_trades`             |
-| `unsubscribe_quote_ticks`            | `unsubscribe_quotes`           |
-| `unsubscribe_trade_ticks`            | `unsubscribe_trades`           |
-| `request_quote_ticks`                | `request_quotes`               |
-| `request_trade_ticks`                | `request_trades`               |
-| `subscribe_order_book_deltas`        | `subscribe_book_deltas`        |
-| `subscribe_order_book_depth`         | `subscribe_book_depth`         |
-| `subscribe_order_book_at_interval`   | `subscribe_book_at_interval`   |
-| `unsubscribe_order_book_deltas`      | `unsubscribe_book_deltas`      |
-| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth`       |
-| `unsubscribe_order_book_at_interval` | `unsubscribe_book_at_interval` |
-| `request_order_book_snapshot`        | `request_book_snapshot`        |
-| `request_order_book_deltas`          | `request_book_deltas`          |
-| `request_order_book_depth`           | `request_book_depth`           |
-| `cache.quote_tick`                   | `cache.quote`                  |
-| `cache.trade_tick`                   | `cache.trade`                  |
-| `cache.quote_ticks`                  | `cache.quotes`                 |
-| `cache.trade_ticks`                  | `cache.trades`                 |
-| `cache.quote_tick_count`             | `cache.quote_count`            |
-| `cache.trade_tick_count`             | `cache.trade_count`            |
-| `CacheConfig.tick_capacity`          | `CacheConfig.data_capacity`    |
+| v1 name                              | v2 name                         |
+| ------------------------------------ | ------------------------------- |
+| `on_quote_tick`                      | `on_quote`                      |
+| `on_trade_tick`                      | `on_trade`                      |
+| `on_order_book`                      | `on_book`                       |
+| `on_order_book_deltas`               | `on_book_deltas`                |
+| `on_order_book_depth`                | `on_book_depth`                 |
+| `subscribe_quote_ticks`              | `subscribe_quotes`              |
+| `subscribe_trade_ticks`              | `subscribe_trades`              |
+| `unsubscribe_quote_ticks`            | `unsubscribe_quotes`            |
+| `unsubscribe_trade_ticks`            | `unsubscribe_trades`            |
+| `request_quote_ticks`                | `request_quotes`                |
+| `request_trade_ticks`                | `request_trades`                |
+| `subscribe_order_book_deltas`        | `subscribe_book_deltas`         |
+| `subscribe_order_book_depth`         | `subscribe_book_depth`          |
+| `subscribe_order_book_at_interval`   | `subscribe_book_at_interval`    |
+| `unsubscribe_order_book_deltas`      | `unsubscribe_book_deltas`       |
+| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth`        |
+| `unsubscribe_order_book_at_interval` | `unsubscribe_book_at_interval`  |
+| `request_order_book_snapshot`        | `request_book_snapshot`         |
+| `request_order_book_deltas`          | `request_book_deltas`           |
+| `request_order_book_depth`           | `request_book_depth`            |
+| `register_indicator_for_quote_ticks` | `register_indicator_for_quotes` |
+| `register_indicator_for_trade_ticks` | `register_indicator_for_trades` |
+| `cache.quote_tick`                   | `cache.quote`                   |
+| `cache.trade_tick`                   | `cache.trade`                   |
+| `cache.quote_ticks`                  | `cache.quotes`                  |
+| `cache.trade_ticks`                  | `cache.trades`                  |
+| `cache.quote_tick_count`             | `cache.quote_count`             |
+| `cache.trade_tick_count`             | `cache.trade_count`             |
+| `cache.has_quote_ticks`              | `cache.has_quotes`              |
+| `cache.has_trade_ticks`              | `cache.has_trades`              |
+| `CacheConfig.tick_capacity`          | `CacheConfig.data_capacity`     |
 
 ### Data subscription lists
 
@@ -784,8 +788,10 @@ Rust models compose at compile time; v1 provided no runtime native model plugins
 subclasses are also accepted; see [behavioral models](docs/concepts/behavioral_models.md#supplying-implementations).
 
 - Backtest venues no longer accept `settlement_prices`. Add `InstrumentClose` data with
-  `close_type=InstrumentCloseType.CONTRACT_EXPIRED`; its exact `close_price` settles futures, binary
-  contracts, and option close legs at expiry.
+  `close_type=InstrumentCloseType.CONTRACT_EXPIRED` to supply the expiry close price.
+- Simulated vanilla option expiry requires `underlying_instrument_id` and `settlement_type`.
+  Populate those fields if the loaded definitions omit them. See
+  [simulated expiry settlement](docs/concepts/options.md#simulated-expiry-settlement).
 - An omitted backtest `default_leverage` now selects 10x for margin accounts and 1x for cash
   accounts. Set `default_leverage=Decimal(1)` to retain v1's unleveraged behavior.
 - Adding an instrument that is already registered no longer replaces its matching engine. An
@@ -911,7 +917,7 @@ See the [Python adapter guide](docs/developer_guide/python_adapters.md) and
 ### Catalog queries and legacy data
 
 `DataBackendSession`, `DataQueryResult`, and `ParquetDataCatalog.backend_session()` are removed. Query a
-catalog with `ParquetDataCatalog.query(...)` or a typed method such as `query_quote_ticks(...)`, which return
+catalog with `ParquetDataCatalog.query(...)` or a typed method such as `query_quotes(...)`, which return
 typed Python objects, or stream Arrow data with `query_data_arrow_stream(...)`.
 
 The v2 Python catalog API and Arrow schemas differ from v1. Migrate recognized legacy files before querying

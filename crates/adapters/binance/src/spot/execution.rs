@@ -2380,12 +2380,25 @@ impl ExecutionClient for BinanceSpotExecutionClient {
     }
 }
 
+const BINANCE_SPOT_SUPPORTED_ORDER_TYPES: &[OrderType] = &[
+    OrderType::Market,
+    OrderType::Limit,
+    OrderType::StopMarket,
+    OrderType::StopLimit,
+    OrderType::MarketIfTouched,
+    OrderType::LimitIfTouched,
+];
+
 fn validate_order(order: &impl Order, use_gtd: bool) -> Result<(), OrderDeniedReason> {
     if order.is_reduce_only() {
         return Err(OrderDeniedReason::UnsupportedReduceOnly);
     }
 
     let order_type = order.order_type();
+    if !BINANCE_SPOT_SUPPORTED_ORDER_TYPES.contains(&order_type) {
+        return Err(OrderDeniedReason::UnsupportedOrderType { order_type });
+    }
+
     let venue_type = order_type_to_binance_spot(order_type, order.is_post_only())
         .map_err(|_| OrderDeniedReason::UnsupportedOrderType { order_type })?;
 
@@ -5024,7 +5037,7 @@ mod tests {
         let (emitter, mut rx) = create_test_emitter(clock);
         let client = create_test_http_client(clock);
         let account_id = AccountId::from("BINANCE-001");
-        let ts_init = UnixNanos::from(1_734_300_000_999_888_000u64);
+        let ts_init = UnixNanos::from(1_734_300_000_999_888_000_u64);
         let seen = Arc::new(Mutex::new(FifoCache::new()));
         let json = crate::common::testing::load_fixture_string(
             "spot/user_data_json/execution_report_new.json",
@@ -5863,7 +5876,7 @@ mod tests {
         );
         let mut report: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
         report.execution_type = terminal_type;
-        let ts_init = UnixNanos::from(1_734_300_000_999_888_000u64);
+        let ts_init = UnixNanos::from(1_734_300_000_999_888_000_u64);
 
         let dispatch = |report: &BinanceSpotExecutionReport| {
             dispatch_execution_report(
@@ -5927,7 +5940,7 @@ mod tests {
             LiquiditySide::Maker,
             Some(cid),
             None,
-            UnixNanos::from(1_709_654_401_000_000_000u64),
+            UnixNanos::from(1_709_654_401_000_000_000_u64),
             ts_init,
             Some(fill.report_id),
         );
@@ -6304,7 +6317,7 @@ mod tests {
                 false,
                 &state,
                 &seen_trade_ids,
-                UnixNanos::from(1709654402000000000),
+                UnixNanos::from(1_709_654_402_000_000_000),
             );
         };
 
@@ -6727,7 +6740,7 @@ mod tests {
         .unwrap();
 
         assert!(cancel_id.len() <= 36);
-        assert_eq!(params.cancel_order_id, Some(12345678));
+        assert_eq!(params.cancel_order_id, Some(12_345_678));
         assert_eq!(
             params.cancel_new_client_order_id.as_deref(),
             Some(cancel_id.as_str())
@@ -6949,7 +6962,7 @@ mod tests {
                 assert_eq!(event.venue_order_id, Some(VenueOrderId::from("12345678")));
                 assert_eq!(
                     event.ts_event,
-                    UnixNanos::from(1_709_654_402_000_000_000u64)
+                    UnixNanos::from(1_709_654_402_000_000_000_u64)
                 );
             }
             other => panic!("Expected OrderCanceled, was {other:?}"),
@@ -7047,7 +7060,7 @@ mod tests {
                 assert_eq!(report.order_status, OrderStatus::Canceled);
                 assert_eq!(
                     report.ts_last,
-                    UnixNanos::from(1_709_654_402_000_000_000u64)
+                    UnixNanos::from(1_709_654_402_000_000_000_u64)
                 );
             }
             other => panic!("Expected order status report, was {other:?}"),
