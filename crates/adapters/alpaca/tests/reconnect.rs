@@ -31,15 +31,17 @@ use nautilus_alpaca::{
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::set_exec_event_sender,
-    messages::{ExecutionEvent, ExecutionReport, execution::SubmitOrder},
+    live::runner::{set_data_event_sender, set_exec_event_sender},
+    messages::{DataEvent, ExecutionEvent, ExecutionReport, execution::SubmitOrder},
 };
 use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
+    data::Data,
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TraderId},
+    instruments::Instrument,
     orders::OrderTestBuilder,
     types::{Price, Quantity},
 };
@@ -52,6 +54,97 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 const TS: &str = "2026-11-18T16:00:00Z";
+
+#[rstest]
+#[case::open_orders_and_positions(true)]
+#[case::unavailable_open_orders(false)]
+#[tokio::test]
+async fn publishes_uncached_account_instruments_during_connect(#[case] orders_available: bool) {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .build();
+    let (requests, mut requested) = mpsc::unbounded_channel();
+    let app = Router::new()
+        .route("/v2/account", get(|| async {
+            Json(json!({"account_number":"TEST","currency":"USD","cash":"10000"}))
+        }))
+        .route("/v2/orders", get(move |Query(query): Query<HashMap<String, String>>| async move {
+            assert_eq!(query["status"], "open");
+            if !orders_available {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            let mut qqq = order("QQQ-OPEN", false);
+            qqq["symbol"] = json!("QQQ");
+            Ok(Json(json!([order("SPY-OPEN", false), qqq])))
+        }))
+        .route("/v2/positions", get(|| async {
+            Json(json!([
+                {"symbol":"SPY","asset_class":"us_equity","qty":"1","side":"long","avg_entry_price":"650"},
+                {"symbol":"MISSING","asset_class":"us_equity","qty":"1","side":"long","avg_entry_price":"10"},
+                {"symbol":"BTCUSD","asset_class":"crypto","qty":"1","side":"long","avg_entry_price":"90000"}
+            ]))
+        }))
+        .route("/v2/assets/{symbol}", get(async move |axum::extract::Path(symbol): axum::extract::Path<String>| {
+            requests.send(symbol.clone()).unwrap();
+            if symbol == "MISSING" {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            Ok(Json(json!({
+                "symbol":symbol,"class":"us_equity","exchange":"NYSE",
+                "status":"active","tradable":true,"fractionable":true
+            })))
+        }));
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+    let (data_tx, mut data) = mpsc::unbounded_channel();
+    set_data_event_sender(data_tx);
+    let (exec_tx, _exec) = mpsc::unbounded_channel();
+    set_exec_event_sender(exec_tx);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let core = ExecutionClientCore::new(
+        TraderId::from("TEST-001"),
+        ClientId::from("ALPACA"),
+        *ALPACA_VENUE,
+        OmsType::Netting,
+        AccountId::from("ALPACA-001"),
+        AccountType::Margin,
+        None,
+        cache.clone(),
+    );
+    let mut client = AlpacaExecutionClient::new(core, &config).unwrap();
+    let (connected, _socket) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client.connect(), accept_private(&ws))
+    })
+    .await
+    .unwrap();
+    connected.unwrap();
+    assert!(client.is_connected());
+
+    let mut lookups = Vec::new();
+    while let Ok(symbol) = requested.try_recv() {
+        lookups.push(symbol);
+    }
+    lookups.sort_unstable();
+    let mut symbols = Vec::new();
+    while let Ok(DataEvent::Data(Data::Instrument(instrument))) = data.try_recv() {
+        assert!(cache.borrow().instrument(&instrument.id()).is_none());
+        symbols.push(instrument.id().symbol.to_string());
+    }
+    symbols.sort_unstable();
+    if orders_available {
+        assert_eq!(lookups, ["MISSING", "QQQ", "SPY"]);
+        assert_eq!(symbols, ["QQQ", "SPY"]);
+    } else {
+        assert_eq!(lookups, ["MISSING", "SPY"]);
+        assert_eq!(symbols, ["SPY"]);
+    }
+    client.disconnect().await.unwrap();
+    server.abort();
+}
 
 fn order(id: &str, filled: bool) -> Value {
     json!({
@@ -273,15 +366,16 @@ async fn exercise_recovery(fault: StatusCode, reconnect_again: bool) {
         events.recv().await,
         Some(ExecutionEvent::Account(_))
     ));
-    assert!(client.is_connected());
 
-    // The broker can replay the REST fill on the new private connection
+    // The next stream report arrives after recovery marks the epoch ready
+    // and the broker's replayed fill has been deduplicated.
     stream_update(&mut replacement, "GAP", true).await;
     stream_update(&mut replacement, "BARRIER", false).await;
     assert!(
         matches!(events.recv().await, Some(ExecutionEvent::Report(ExecutionReport::Order(o)))
         if o.venue_order_id.as_str() == "BARRIER")
     );
+    assert!(client.is_connected());
     submit(&client, "AFTER");
     assert_eq!(posts.recv().await.unwrap(), "AFTER");
     client.disconnect().await.unwrap();

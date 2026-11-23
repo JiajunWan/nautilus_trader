@@ -25,7 +25,12 @@ use nautilus_model::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{common::ALPACA, http::AlpacaHttpClient};
+use crate::{
+    common::ALPACA,
+    http::AlpacaHttpClient,
+    option_provider::{is_option_symbol, load_option_contract},
+    option_spread,
+};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AlpacaAsset {
@@ -71,6 +76,20 @@ impl AlpacaAsset {
 
 pub(crate) fn instrument_id(symbol: &str) -> anyhow::Result<InstrumentId> {
     Ok(InstrumentId::new(Symbol::new_checked(symbol)?, *ALPACA))
+}
+
+pub(crate) async fn load_instrument(
+    http: &AlpacaHttpClient,
+    id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    if option_spread::is_spread(id) {
+        option_spread::load(http, id, ts_init).await
+    } else if is_option_symbol(id.symbol.as_str()) {
+        load_option_contract(http, id, ts_init).await
+    } else {
+        load_asset(http, id).await?.instrument(ts_init)
+    }
 }
 
 pub(crate) async fn load_asset(

@@ -35,14 +35,11 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    Params, UUID4, UnixNanos, datetime::datetime_to_unix_nanos, string::secret::SecretString,
+    Params, UUID4, datetime::datetime_to_unix_nanos, string::secret::SecretString,
     time::get_atomic_clock_realtime,
 };
 use nautilus_live::task::TaskGroup;
-use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, Venue},
-    instruments::InstrumentAny,
-};
+use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
 use nautilus_network::websocket::WebSocketClient;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
@@ -58,7 +55,7 @@ use crate::{
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
     option_provider::{is_option_symbol, load_option_chain, load_option_contract},
     option_spread,
-    provider::{instrument_id, load_asset, load_assets, load_selected_assets},
+    provider::{instrument_id, load_assets, load_instrument, load_selected_assets},
 };
 
 /// Native Alpaca quotes, trades, equity bars and instrument definitions.
@@ -604,21 +601,6 @@ impl DataClient for AlpacaDataClient {
                 request.params,
             )))
         })
-    }
-}
-
-async fn load_instrument(
-    http: &AlpacaHttpClient,
-    id: InstrumentId,
-    ts_init: UnixNanos,
-) -> anyhow::Result<InstrumentAny> {
-    if option_spread::is_spread(id) {
-        option_spread::load(http, id, ts_init).await
-    } else if is_option_symbol(id.symbol.as_str()) {
-        load_option_contract(http, id, ts_init).await
-    } else {
-        let asset = load_asset(http, id).await?;
-        asset.instrument(ts_init)
     }
 }
 

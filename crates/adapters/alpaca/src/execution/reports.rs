@@ -210,10 +210,16 @@ where
 #[derive(Debug, Deserialize)]
 pub(super) struct Position {
     pub symbol: String,
-    pub asset_class: String,
+    asset_class: String,
     qty: Decimal,
     side: String,
     avg_entry_price: Decimal,
+}
+
+pub(super) async fn positions(http: &AlpacaHttpClient) -> anyhow::Result<Vec<Position>> {
+    let mut positions: Vec<Position> = http.get("/v2/positions", &()).await?;
+    positions.retain(|position| matches!(position.asset_class.as_str(), "us_equity" | "us_option"));
+    Ok(positions)
 }
 
 impl Position {

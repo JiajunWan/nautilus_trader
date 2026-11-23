@@ -15,6 +15,7 @@
 
 //! Alpaca Trading API execution client for US equities and options.
 
+mod account_instruments;
 mod advanced;
 #[cfg(test)]
 mod combo_tests;
@@ -81,7 +82,7 @@ use self::{
         extended_hours, option_order_request, order_list_request, order_request,
         replacement_instructions,
     },
-    reports::{Account, BrokerOrder, FillActivity, Position},
+    reports::{Account, BrokerOrder, FillActivity},
     updates::{OrderState, TradeUpdate},
 };
 use crate::{
@@ -422,6 +423,9 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Err(error);
         }
 
+        let last_seen = now();
+        self.publish_account_instruments().await;
+
         if let Err(error) =
             self.emitter
                 .try_emit_account_state(vec![balance], Vec::new(), true, now(), None)
@@ -436,7 +440,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             http: self.http.clone(),
             emitter: self.emitter.clone(),
             state: Arc::clone(&self.orders),
-            last_seen: now(),
+            last_seen,
             ready_epoch: Arc::clone(&self.ready_epoch),
         };
         self.ready_epoch.store(epoch, Ordering::Release);
@@ -839,7 +843,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             .transpose()?
             .map(|duration| ts_init.saturating_sub(duration));
         let snapshot = reconciliation::snapshot(&self.http, &self.orders, start, true).await?;
-        let positions: Vec<Position> = self.http.get("/v2/positions", &()).await?;
+        let positions = reports::positions(&self.http).await?;
         let account_id = self.core.account_id;
         let mut status =
             ExecutionMassStatus::new(self.core.client_id, account_id, *ALPACA, ts_init, None);
@@ -851,9 +855,6 @@ impl ExecutionClient for AlpacaExecutionClient {
         status.add_position_reports(
             positions
                 .into_iter()
-                .filter(|position| {
-                    matches!(position.asset_class.as_str(), "us_equity" | "us_option")
-                })
                 .map(|position| position.to_report(account_id, ts_init))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         );
@@ -864,10 +865,9 @@ impl ExecutionClient for AlpacaExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let positions: Vec<Position> = self.http.get("/v2/positions", &()).await?;
-        positions
+        reports::positions(&self.http)
+            .await?
             .into_iter()
-            .filter(|position| matches!(position.asset_class.as_str(), "us_equity" | "us_option"))
             .filter(|position| {
                 cmd.instrument_id
                     .is_none_or(|id| id.symbol.as_str() == position.symbol)
