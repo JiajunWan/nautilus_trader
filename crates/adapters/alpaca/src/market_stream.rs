@@ -380,41 +380,53 @@ async fn update_subscriptions(
 
 fn dispatch(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> {
     for message in serde_json::from_slice::<Vec<&RawValue>>(body)? {
-        let header: Header<'_> = serde_json::from_str(message.get())?;
-        if header.kind == "error" {
-            anyhow::bail!(
-                "Market data subscription rejected by Alpaca (code {:?}): {}",
-                header.code,
-                header.msg.unwrap_or("unknown error"),
-            );
-        }
-        if !matches!(header.kind, "q" | "t" | "b") {
-            continue;
-        }
-        let symbol = header
-            .symbol
-            .context("Missing symbol in Alpaca market message")?;
-        let id = instrument_id(symbol)?;
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let data = match header.kind {
-            "q" => Data::Quote(
-                serde_json::from_str::<StockQuote>(message.get())?.tick(id, Some(ts_init))?,
-            ),
-            "t" => Data::Trade(
-                serde_json::from_str::<StockTrade>(message.get())?.tick(id, Some(ts_init))?,
-            ),
-            "b" => {
+        let raw = message.get();
+
+        // The SIP feed normally puts T first. Use the header decoder for other JSON layouts
+        let (channel, known_id) = if raw.starts_with(r#"{"T":"q","#) {
+            (StockChannel::Quotes, None)
+        } else if raw.starts_with(r#"{"T":"t","#) {
+            (StockChannel::Trades, None)
+        } else if raw.starts_with(r#"{"T":"b","#) {
+            (StockChannel::Bars, None)
+        } else {
+            let header: Header<'_> = serde_json::from_str(raw)?;
+            let channel = match header.kind {
+                "q" => StockChannel::Quotes,
+                "t" => StockChannel::Trades,
+                "b" => StockChannel::Bars,
+                "error" => anyhow::bail!(
+                    "Market data subscription rejected by Alpaca (code {:?}): {}",
+                    header.code,
+                    header.msg.unwrap_or("unknown error"),
+                ),
+                _ => continue,
+            };
+            let symbol = header
+                .symbol
+                .context("Missing symbol in Alpaca market message")?;
+            (channel, Some(instrument_id(symbol)?))
+        };
+
+        let ts_init = Some(get_atomic_clock_realtime().get_time_ns());
+        let data = match channel {
+            StockChannel::Quotes => {
+                let (id, quote) = StockQuote::from_stream(raw, known_id)?;
+                Data::Quote(quote.tick(id, ts_init)?)
+            }
+            StockChannel::Trades => {
+                let (id, trade) = StockTrade::from_stream(raw, known_id)?;
+                Data::Trade(trade.tick(id, ts_init)?)
+            }
+            StockChannel::Bars => {
+                let (id, bar) = StockBar::from_stream(raw, known_id)?;
                 let bar_type = BarType::new(
                     id,
                     BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
                     AggregationSource::External,
                 );
-                Data::Bar(
-                    serde_json::from_str::<StockBar>(message.get())?
-                        .bar(bar_type, Some(ts_init))?,
-                )
+                Data::Bar(bar.bar(bar_type, ts_init)?)
             }
-            _ => unreachable!(),
         };
         sender
             .send(DataEvent::Data(data))
@@ -448,7 +460,67 @@ pub(crate) fn validate_live_bar(bar_type: BarType) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::datetime::iso8601_to_unix_nanos;
+    use rstest::rstest;
+
     use super::*;
+
+    const MIXED: &str = include_str!("../test_data/stock_stream_mixed.json");
+
+    #[rstest]
+    fn dispatch_preserves_mixed_stock_order_and_precision() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        dispatch(MIXED.as_bytes(), &tx.into()).unwrap();
+
+        let DataEvent::Data(Data::Quote(quote)) = rx.try_recv().unwrap() else {
+            panic!("expected quote first");
+        };
+        let DataEvent::Data(Data::Trade(trade)) = rx.try_recv().unwrap() else {
+            panic!("expected trade second");
+        };
+        let DataEvent::Data(Data::Bar(bar)) = rx.try_recv().unwrap() else {
+            panic!("expected bar third");
+        };
+
+        assert_eq!(quote.instrument_id.to_string(), "SPY.ALPACA");
+        assert_eq!(quote.bid_price.to_string(), "12.34567891");
+        assert_eq!(quote.ask_price.to_string(), "12.34567899");
+        assert_eq!(quote.bid_size.to_string(), "1.50");
+        assert_eq!(quote.ask_size.to_string(), "2.25");
+        assert_eq!(
+            quote.ts_event,
+            iso8601_to_unix_nanos("2026-11-23T20:59:59.123456789Z").unwrap()
+        );
+        assert_eq!(trade.instrument_id.to_string(), "QQQ.ALPACA");
+        assert_eq!(trade.price.to_string(), "513.1250");
+        assert_eq!(trade.size.to_string(), "2.5");
+        assert_eq!(
+            bar.bar_type.to_string(),
+            "AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL"
+        );
+        assert_eq!(bar.close.to_string(), "203.0000");
+        assert_eq!(bar.volume.to_string(), "71");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case(r#"{"T":"error","code":405,"msg":"symbol limit"}"#, "symbol limit")]
+    #[case(r#"{"T":"q","T":"error"}"#, "duplicate field `T`")]
+    #[case(r#"{"T":"b","S":"AAA","S":"BBB"}"#, "duplicate field `S`")]
+    #[case(r#"{"T":"t","code":"bad"}"#, "u16")]
+    #[case(r#"{"T":"q","msg":42}"#, "borrowed string")]
+    fn dispatch_stops_at_the_first_invalid_stock_row(#[case] row: &str, #[case] reason: &str) {
+        let rows: Vec<&RawValue> = serde_json::from_str(MIXED).unwrap();
+        let quote = rows[0].get();
+        let batch = format!("[{quote},{row},{quote}]");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let error = dispatch(batch.as_bytes(), &tx.into()).unwrap_err();
+
+        assert!(error.to_string().contains(reason), "{error:#}");
+        assert!(matches!(rx.try_recv(), Ok(DataEvent::Data(Data::Quote(_)))));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn subscription_changes_preserve_both_wire_formats() {

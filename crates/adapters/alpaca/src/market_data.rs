@@ -32,7 +32,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::value::RawValue;
 
-use crate::http::AlpacaHttpClient;
+use crate::{http::AlpacaHttpClient, provider::instrument_id};
 
 const MAX_PAGE: usize = 10_000;
 
@@ -42,18 +42,59 @@ fn decimal<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Err
     Decimal::from_str_exact(value).map_err(serde::de::Error::custom)
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct StockQuote {
-    #[serde(rename = "bp", deserialize_with = "decimal")]
-    bid: Decimal,
-    #[serde(rename = "ap", deserialize_with = "decimal")]
-    ask: Decimal,
-    #[serde(rename = "bs", deserialize_with = "decimal")]
-    bid_size: Decimal,
-    #[serde(rename = "as", deserialize_with = "decimal")]
-    ask_size: Decimal,
-    #[serde(rename = "t")]
-    time: String,
+// REST rows get their symbol from the page. Stream rows carry it alongside the same fields.
+// Derive both flat wire shapes so decimal() always sees the original JSON token.
+macro_rules! stock_payload {
+    ($payload:ident { $( $(#[$attr:meta])* $field:ident: $ty:ty, )* }) => {
+        #[derive(Debug, Deserialize)]
+        pub(crate) struct $payload {
+            $( $(#[$attr])* $field: $ty, )*
+        }
+
+        impl $payload {
+            pub(super) fn from_stream(
+                raw: &str,
+                known_id: Option<InstrumentId>,
+            ) -> anyhow::Result<(InstrumentId, Self)> {
+                #[derive(Deserialize)]
+                struct Row<'a> {
+                    #[serde(rename = "T")]
+                    _kind: &'a str,
+                    #[serde(rename = "S")]
+                    symbol: Option<&'a str>,
+                    #[serde(rename = "code")]
+                    _code: Option<u16>,
+                    #[serde(rename = "msg")]
+                    _msg: Option<&'a str>,
+                    $( $(#[$attr])* $field: $ty, )*
+                }
+
+                // A nonstandard layout has already supplied its header
+                if let Some(id) = known_id {
+                    return Ok((id, serde_json::from_str(raw)?));
+                }
+
+                let row: Row<'_> = serde_json::from_str(raw)?;
+                let symbol = row.symbol.context("Missing symbol in Alpaca market message")?;
+                Ok((instrument_id(symbol)?, Self { $( $field: row.$field, )* }))
+            }
+        }
+    };
+}
+
+stock_payload! {
+    StockQuote {
+        #[serde(rename = "bp", deserialize_with = "decimal")]
+        bid: Decimal,
+        #[serde(rename = "ap", deserialize_with = "decimal")]
+        ask: Decimal,
+        #[serde(rename = "bs", deserialize_with = "decimal")]
+        bid_size: Decimal,
+        #[serde(rename = "as", deserialize_with = "decimal")]
+        ask_size: Decimal,
+        #[serde(rename = "t")]
+        time: String,
+    }
 }
 
 impl StockQuote {
@@ -77,18 +118,19 @@ impl StockQuote {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct StockTrade {
-    #[serde(rename = "i")]
-    id: u64,
-    #[serde(rename = "x")]
-    exchange: String,
-    #[serde(rename = "p", deserialize_with = "decimal")]
-    price: Decimal,
-    #[serde(rename = "s", deserialize_with = "decimal")]
-    size: Decimal,
-    #[serde(rename = "t")]
-    time: String,
+stock_payload! {
+    StockTrade {
+        #[serde(rename = "i")]
+        id: u64,
+        #[serde(rename = "x")]
+        exchange: String,
+        #[serde(rename = "p", deserialize_with = "decimal")]
+        price: Decimal,
+        #[serde(rename = "s", deserialize_with = "decimal")]
+        size: Decimal,
+        #[serde(rename = "t")]
+        time: String,
+    }
 }
 
 impl StockTrade {
@@ -116,20 +158,21 @@ impl StockTrade {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct StockBar {
-    #[serde(rename = "o", deserialize_with = "decimal")]
-    open: Decimal,
-    #[serde(rename = "h", deserialize_with = "decimal")]
-    high: Decimal,
-    #[serde(rename = "l", deserialize_with = "decimal")]
-    low: Decimal,
-    #[serde(rename = "c", deserialize_with = "decimal")]
-    close: Decimal,
-    #[serde(rename = "v", deserialize_with = "decimal")]
-    volume: Decimal,
-    #[serde(rename = "t")]
-    time: String,
+stock_payload! {
+    StockBar {
+        #[serde(rename = "o", deserialize_with = "decimal")]
+        open: Decimal,
+        #[serde(rename = "h", deserialize_with = "decimal")]
+        high: Decimal,
+        #[serde(rename = "l", deserialize_with = "decimal")]
+        low: Decimal,
+        #[serde(rename = "c", deserialize_with = "decimal")]
+        close: Decimal,
+        #[serde(rename = "v", deserialize_with = "decimal")]
+        volume: Decimal,
+        #[serde(rename = "t")]
+        time: String,
+    }
 }
 
 impl StockBar {
