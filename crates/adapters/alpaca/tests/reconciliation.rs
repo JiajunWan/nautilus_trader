@@ -23,7 +23,7 @@ use nautilus_alpaca::{
 use nautilus_common::{cache::Cache, clients::ExecutionClient};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderStatus},
+    enums::{AccountType, AvgPxReconciliation, OmsType, OrderStatus},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TraderId, VenueOrderId},
     types::{Price, Quantity},
 };
@@ -134,9 +134,13 @@ async fn startup_retains_old_working_orders_and_resolves_fill_only_orders() {
     );
     assert_eq!(known[0].last_qty, Quantity::from(1));
     assert_eq!(known[0].last_px, Price::from("650.00"));
+    let positions = mass.position_reports();
+    let qqq = &positions[&InstrumentId::from("QQQ.ALPACA")][0];
+    assert_eq!(qqq.quantity, Quantity::from(1));
+    assert_eq!(qqq.avg_px_open.unwrap(), rust_decimal::Decimal::from(650));
     assert_eq!(
-        mass.position_reports()[&InstrumentId::from("QQQ.ALPACA")][0].quantity,
-        Quantity::from(1),
+        qqq.avg_px_open_reconciliation,
+        AvgPxReconciliation::OpeningOnly
     );
     fixture.await.unwrap();
 }

@@ -198,6 +198,11 @@ account positions query, startup reports a flat position for each previously
 open or traded equity or option contract absent from the snapshot. This lets
 Nautilus recover offline closing fills and their realized PnL on restart.
 
+Alpaca uses a weighted average for intraday equity positions and compressed FIFO
+for overnight holdings. Equity reports supply the broker average to establish a
+position from flat. Existing positions retain their fill-based entry average
+when Alpaca updates the cost basis overnight.
+
 The execution client reauthenticates the private stream and catches up on order
 updates and fills after a reconnect. If a fill references an order not yet visible
 in REST, or a recovery read encounters a transient HTTP or transport error,

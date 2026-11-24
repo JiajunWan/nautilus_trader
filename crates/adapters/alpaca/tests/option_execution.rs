@@ -30,7 +30,7 @@ use nautilus_common::{
 use nautilus_core::UUID4;
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderStatus, PositionSide},
+    enums::{AccountType, AvgPxReconciliation, OmsType, OrderStatus, PositionSide},
     identifiers::{AccountId, ClientId, InstrumentId, TraderId, VenueOrderId},
     types::{Price, Quantity},
 };
@@ -175,6 +175,10 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
         .unwrap();
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].position_side, PositionSide::Long);
+    assert_eq!(
+        positions[0].avg_px_open_reconciliation,
+        AvgPxReconciliation::Match
+    );
     assert_eq!(positions[0].quantity, Quantity::from(1));
     assert_eq!(positions[0].instrument_id, instrument);
     let all = client

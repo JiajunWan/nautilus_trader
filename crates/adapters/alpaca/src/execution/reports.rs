@@ -16,7 +16,10 @@
 use anyhow::{Context, ensure};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, PositionSide, TrailingOffsetType, TriggerType},
+    enums::{
+        AvgPxReconciliation, LiquiditySide, OrderSide, PositionSide, TrailingOffsetType,
+        TriggerType,
+    },
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
@@ -233,7 +236,7 @@ impl Position {
             "short" => PositionSide::Short,
             other => anyhow::bail!("Unknown Alpaca position side {other}"),
         };
-        Ok(PositionStatusReport::new(
+        let report = PositionStatusReport::new(
             account_id,
             instrument_id(&self.symbol)?,
             side,
@@ -243,7 +246,13 @@ impl Position {
             None,
             None,
             Some(self.avg_entry_price),
-        ))
+        );
+        // Alpaca switches equity cost basis from intraday weighted average to compressed FIFO overnight.
+        Ok(if self.asset_class == "us_equity" {
+            report.with_avg_px_open_reconciliation(AvgPxReconciliation::OpeningOnly)
+        } else {
+            report
+        })
     }
 }
 
