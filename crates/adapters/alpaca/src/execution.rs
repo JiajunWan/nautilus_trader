@@ -206,7 +206,7 @@ impl AlpacaExecutionClient {
             let mut state = self.order_state()?;
             for order in &orders {
                 self.emitter.try_emit_order_submitted(order)?;
-                state.register(order.clone());
+                state.register(order);
             }
             if let Some((root, list, class)) = group {
                 state.begin_group(list, root, class.to_owned());
@@ -432,9 +432,7 @@ impl ExecutionClient for AlpacaExecutionClient {
                 Some(&self.core.account_id),
                 None,
             ) {
-                if !order.is_closed() || option_spread::is_spread(order.instrument_id()) {
-                    state.register(order.as_ref().clone());
-                }
+                state.restore(order.as_ref());
             }
         }
 
@@ -669,7 +667,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         payload.insert("client_order_id".to_string(), json!(replacement_client_id));
         {
             let mut state = self.order_state()?;
-            state.register(order.clone());
+            state.register(&order);
             state.register_alias(replacement_client_id.clone(), order.client_order_id());
             if let Some(instructions) = advanced.or(existing) {
                 state.stage_advanced_instructions(replacement_client_id.clone(), instructions);
@@ -726,7 +724,7 @@ impl ExecutionClient for AlpacaExecutionClient {
                 return Ok(());
             }
         };
-        self.order_state()?.register(order.clone());
+        self.order_state()?.register(&order);
         let emitter = self.emitter.clone();
         let http = self.http.clone();
         self.spawn("cancel_order", async move {

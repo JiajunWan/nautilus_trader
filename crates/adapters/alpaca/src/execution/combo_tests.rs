@@ -487,7 +487,7 @@ async fn exercise_superseded_lookup(reconciliation: bool) {
         .build();
     let ts = reports::timestamp(TS).unwrap();
     let mut state = OrderState::default();
-    state.register(order);
+    state.register(&order);
     state
         .handle_combo(
             &serde_json::from_value(response(name, "new")).unwrap(),

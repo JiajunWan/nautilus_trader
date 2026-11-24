@@ -19,13 +19,22 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
 use axum::{Json, Router, extract::Query, routing::get};
 use nautilus_alpaca::{
-    config::AlpacaExecutionClientConfig, factories::AlpacaExecutionClientFactory,
+    common::ALPACA_VENUE, config::AlpacaExecutionClientConfig, execution::AlpacaExecutionClient,
+    factories::AlpacaExecutionClientFactory,
 };
-use nautilus_common::actor::DataActor;
+use nautilus_common::{
+    actor::DataActor,
+    cache::Cache,
+    clients::ExecutionClient,
+    live::runner::{set_data_event_sender, set_exec_event_sender},
+    messages::{ExecutionEvent, ExecutionReport},
+};
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_live::{builder::LiveNodeBuilder, config::LiveNodeConfig, node::LiveNodeHandle};
+use nautilus_live::{
+    ExecutionClientCore, builder::LiveNodeBuilder, config::LiveNodeConfig, node::LiveNodeHandle,
+};
 use nautilus_model::{
-    enums::{OmsType, OrderSide, OrderStatus, OrderType},
+    enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
         TraderId, VenueOrderId,
@@ -37,9 +46,9 @@ use nautilus_model::{
 };
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 
-use super::accept_private;
+use super::{accept_private, stream_update};
 
 #[derive(Debug)]
 struct ClosingStrategy {
@@ -279,4 +288,103 @@ async fn offline_close_replays_once_before_strategy_starts() {
     let rounds = observed.borrow();
     assert_eq!(rounds.len(), 2);
     assert_eq!(rounds[0], rounds[1]);
+}
+
+#[tokio::test]
+async fn cached_terminal_fill_is_deduplicated_on_a_fresh_connection() {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .build();
+    let app = Router::new()
+        .route(
+            "/v2/account",
+            get(|| async { Json(json!({"account_number":"001","currency":"USD","cash":"10000"})) }),
+        )
+        .route("/v2/positions", get(|| async { Json(json!([])) }))
+        .route("/v2/orders", get(|| async { Json(json!([])) }));
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+    let (exec_tx, mut events) = mpsc::unbounded_channel();
+    set_exec_event_sender(exec_tx);
+    let (data_tx, _data) = mpsc::unbounded_channel();
+    set_data_event_sender(data_tx);
+
+    let trader = TraderId::from("TEST-001");
+    let client_id = ClientId::from("ALPACA");
+    let account_id = config.account_id;
+    let instrument_id = InstrumentId::from("SPY.ALPACA");
+    let instrument = InstrumentAny::Equity(nautilus_model::instruments::Equity {
+        id: instrument_id,
+        ..equity_aapl()
+    });
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader)
+        .instrument_id(instrument_id)
+        .client_order_id(ClientOrderId::from("RESTORED-CLIENT"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from("RESTORED-VENUE"),
+        ))
+        .unwrap();
+    let digest = blake3::hash(b"RESTORED-VENUE:1").to_hex();
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from(&digest.as_str()[..32])),
+        None,
+        Some(Price::from("650.00")),
+        Some(Quantity::from(1)),
+        None,
+        Some(Money::zero(Currency::USD())),
+        None,
+        Some(account_id),
+    );
+    order.apply(fill).unwrap();
+    assert!(order.is_closed());
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+    cache
+        .borrow_mut()
+        .add_order(order, None, Some(client_id), false)
+        .unwrap();
+    let core = ExecutionClientCore::new(
+        trader,
+        client_id,
+        *ALPACA_VENUE,
+        OmsType::Netting,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache,
+    );
+    let mut client = AlpacaExecutionClient::new(core, &config).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (connected, mut socket) = tokio::join!(client.connect(), accept_private(&ws));
+        connected.unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(ExecutionEvent::Account(_))
+        ));
+        stream_update(&mut socket, "RESTORED-VENUE", true).await;
+        stream_update(&mut socket, "BARRIER", false).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ExecutionEvent::Report(ExecutionReport::Order(report)))
+            if report.venue_order_id.as_str() == "BARRIER"
+        ));
+        client.disconnect().await.unwrap();
+    })
+    .await
+    .expect("Expected the replay to be suppressed before the next stream update");
+    server.abort();
 }

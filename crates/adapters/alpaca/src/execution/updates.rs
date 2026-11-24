@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use ahash::AHashMap;
 use anyhow::{Context, ensure};
@@ -100,6 +100,21 @@ struct TrackedOrder {
 
 type ActiveOrders = HashMap<ClientOrderId, Option<VenueOrderId>>;
 
+#[derive(Debug)]
+struct TerminalOrder {
+    venue_id: Option<VenueOrderId>,
+    fills: HashSet<TradeId>,
+}
+
+fn can_compact(order: &OrderAny) -> bool {
+    // Groups and spreads still use the order definition to resolve legs and late updates
+    order.order_list_id().is_none()
+        && order.contingency_type().is_none()
+        && order.parent_order_id().is_none()
+        && order.linked_order_ids().is_none_or(<[_]>::is_empty)
+        && !option_spread::is_spread(order.instrument_id())
+}
+
 impl TrackedOrder {
     fn set_status(&mut self, status: OrderStatus, active: &mut ActiveOrders) {
         if status.is_closed() {
@@ -119,6 +134,7 @@ impl TrackedOrder {
 #[derive(Debug, Default)]
 pub(super) struct OrderState {
     tracked: AHashMap<ClientOrderId, TrackedOrder>,
+    terminal: AHashMap<ClientOrderId, TerminalOrder>,
     active: ActiveOrders,
     combos: HashSet<ClientOrderId>,
     venue_client_ids: AHashMap<VenueOrderId, ClientOrderId>,
@@ -130,28 +146,62 @@ pub(super) struct OrderState {
 }
 
 impl OrderState {
-    pub(super) fn register(&mut self, order: OrderAny) {
+    pub(super) fn restore(&mut self, order: &OrderAny) {
+        if !order.is_closed()
+            || can_compact(order)
+            || option_spread::is_spread(order.instrument_id())
+        {
+            self.register(order);
+        }
+    }
+
+    pub(super) fn register(&mut self, order: &OrderAny) {
         let client_id = order.client_order_id();
         self.broker_client_ids
             .insert(client_id.to_string(), client_id);
         for venue_id in order.venue_order_ids() {
             self.bind_venue_id(*venue_id, client_id);
         }
-        self.tracked.entry(client_id).or_insert_with(|| {
+        if let Entry::Vacant(entry) = self.tracked.entry(client_id)
+            && !self.terminal.contains_key(&client_id)
+        {
+            let venue_id = order.venue_order_id();
+            let fills = order.trade_ids().into_iter().copied().collect();
+            if order.is_closed() && can_compact(order) {
+                self.terminal
+                    .insert(client_id, TerminalOrder { venue_id, fills });
+                return;
+            }
             if !order.is_closed() {
-                self.active.insert(client_id, order.venue_order_id());
+                self.active.insert(client_id, venue_id);
             }
             if option_spread::is_spread(order.instrument_id()) {
                 self.combos.insert(client_id);
             }
-            TrackedOrder {
+            entry.insert(TrackedOrder {
                 status: order.status(),
-                active_venue_id: order.venue_order_id(),
+                active_venue_id: venue_id,
                 last_combo_update: order.ts_last(),
-                fills: order.trade_ids().into_iter().copied().collect(),
-                order,
-            }
-        });
+                fills,
+                order: order.clone(),
+            });
+        }
+    }
+
+    fn compact_terminal(&mut self, client_id: ClientOrderId) {
+        if let Entry::Occupied(entry) = self.tracked.entry(client_id)
+            && entry.get().status.is_closed()
+            && can_compact(&entry.get().order)
+        {
+            let order = entry.remove();
+            self.terminal.insert(
+                client_id,
+                TerminalOrder {
+                    venue_id: order.active_venue_id,
+                    fills: order.fills,
+                },
+            );
+        }
     }
 
     pub(super) fn bind_venue_id(&mut self, venue_id: VenueOrderId, client_id: ClientOrderId) {
@@ -204,6 +254,7 @@ impl OrderState {
         {
             tracked.set_status(OrderStatus::Rejected, &mut self.active);
             emitter.emit_order_rejected(&tracked.order, reason, ts_event, false);
+            self.compact_terminal(client_id);
         }
     }
 
@@ -243,6 +294,11 @@ impl OrderState {
         self.tracked
             .get(&client_id)
             .and_then(|tracked| tracked.active_venue_id)
+            .or_else(|| {
+                self.terminal
+                    .get(&client_id)
+                    .and_then(|order| order.venue_id)
+            })
     }
 
     pub(super) fn client_for(&self, venue_id: VenueOrderId) -> Option<ClientOrderId> {
@@ -476,16 +532,21 @@ impl OrderState {
                 tracked.set_venue_id(report.venue_order_id, &mut self.active);
                 tracked.last_combo_update = report.ts_last;
                 tracked.set_status(report.order_status, &mut self.active);
+                if report.order_status.is_closed() {
+                    self.compact_terminal(client_id);
+                }
             }
         }
         Ok(())
     }
 
     pub(super) fn remember_fill(&mut self, fill: &FillReport) {
-        if let Some(client_id) = fill.client_order_id
-            && let Some(tracked) = self.tracked.get_mut(&client_id)
-        {
-            tracked.fills.insert(fill.trade_id);
+        if let Some(client_id) = fill.client_order_id {
+            if let Some(tracked) = self.tracked.get_mut(&client_id) {
+                tracked.fills.insert(fill.trade_id);
+            } else if let Some(terminal) = self.terminal.get_mut(&client_id) {
+                terminal.fills.insert(fill.trade_id);
+            }
         }
     }
 
@@ -655,6 +716,18 @@ impl OrderState {
         let Some((client_id, tracked)) =
             client_id.and_then(|id| self.tracked.get_mut(&id).map(|tracked| (id, tracked)))
         else {
+            if let Some(id) = client_id
+                && let Some(terminal) = self.terminal.get_mut(&id)
+            {
+                self.venue_client_ids.insert(venue_id, id);
+                if update.is_fill() {
+                    let fill = update.fill(emitter, Some(id), ts_event)?;
+                    if terminal.fills.insert(fill.trade_id) {
+                        emitter.send_fill_report(fill);
+                    }
+                }
+                return Ok(());
+            }
             if matches!(
                 update.event.as_str(),
                 "pending_new" | "pending_cancel" | "pending_replace" | "replaced"
@@ -756,6 +829,7 @@ impl OrderState {
                     emitter,
                     ts_event,
                 );
+                return Ok(());
             }
             "order_cancel_rejected" => emitter.emit_order_cancel_rejected(
                 &tracked.order,
@@ -775,6 +849,9 @@ impl OrderState {
             | "replaced" | "canceled" | "done_for_day" | "held" | "stopped" | "suspended"
             | "calculated" => {}
             event => anyhow::bail!("Unsupported Alpaca trade update {event}"),
+        }
+        if tracked.status.is_closed() {
+            self.compact_terminal(client_id);
         }
         Ok(())
     }
@@ -828,7 +905,7 @@ mod tests {
             .quantity(Quantity::from(1))
             .price(Price::from("500.00"));
         let mut state = OrderState::default();
-        state.register(builder.build());
+        state.register(&builder.build());
         (state, emitter, rx)
     }
 
@@ -878,6 +955,7 @@ mod tests {
         state.handle(update("new", "new"), &emitter).unwrap();
         state.handle(update("fill", "filled"), &emitter).unwrap();
         assert!(state.active_orders().is_empty());
+        assert!(state.tracked.is_empty());
 
         assert!(
             matches!(rx.try_recv().unwrap(), ExecutionEvent::Order(OrderEventAny::Accepted(event))
@@ -911,7 +989,7 @@ mod tests {
 
     #[rstest]
     fn incomplete_or_conflicting_group_evidence_does_not_bind_members() {
-        let (mut state, _, _) = execution_rig();
+        let (mut state, emitter, _) = execution_rig();
         let list = OrderListId::from("GROUP");
         let root = ClientOrderId::from("ROOT");
         let child = ClientOrderId::from("STOP");
@@ -926,13 +1004,13 @@ mod tests {
             builder
         };
         state.register(
-            make(OrderType::Limit, root, OrderSide::Buy)
+            &make(OrderType::Limit, root, OrderSide::Buy)
                 .price(Price::from("500"))
                 .linked_order_ids(vec![child])
                 .build(),
         );
         state.register(
-            make(OrderType::StopMarket, child, OrderSide::Sell)
+            &make(OrderType::StopMarket, child, OrderSide::Sell)
                 .trigger_price(Price::from("495"))
                 .parent_order_id(root)
                 .build(),
@@ -959,6 +1037,12 @@ mod tests {
         assert_eq!(state.venue_for(root), Some("root-uuid".into()));
         assert_eq!(state.venue_for(child), Some("stop-uuid".into()));
         assert_eq!(state.pending_group_root(child), None);
+
+        let mut fill = update("fill", "filled", "root-uuid", root.as_str());
+        fill.order.order_class = Some("oto".into());
+        state.handle(fill, &emitter).unwrap();
+        assert_eq!(state.tracked[&root].status, OrderStatus::Filled);
+        assert!(!state.terminal.contains_key(&root));
     }
 
     #[rstest]
@@ -986,7 +1070,8 @@ mod tests {
             .unwrap();
         rest(&mut state);
         assert!(state.active_orders().is_empty());
-        assert_eq!(state.tracked[&id].status, OrderStatus::Rejected);
+        assert!(!state.tracked.contains_key(&id));
+        assert!(state.terminal.contains_key(&id));
         let ExecutionEvent::Order(OrderEventAny::Rejected(event)) = rx.try_recv().unwrap() else {
             panic!("Expected one rejection");
         };
@@ -1046,7 +1131,7 @@ mod tests {
         let parent = ClientOrderId::from("client-id");
         let child = ClientOrderId::from("child-id");
         state.register(
-            OrderTestBuilder::new(OrderType::Market)
+            &OrderTestBuilder::new(OrderType::Market)
                 .instrument_id(instrument_id("SPY").unwrap())
                 .client_order_id(child)
                 .quantity(Quantity::from(1))
@@ -1086,10 +1171,101 @@ mod tests {
         assert_eq!(report.order_status, expected);
         state.apply_snapshot(&row, &report).unwrap();
         assert!(state.active_orders().is_empty());
+        assert!(state.tracked.is_empty());
         assert_eq!(
             state.client_for(row.venue_id().unwrap()),
             Some(row.client_id().unwrap())
         );
+    }
+
+    #[rstest]
+    fn terminal_snapshot_remembers_rest_fill_before_stream_replays() {
+        let (mut state, emitter, mut rx) = execution_rig();
+        let update = update("fill", "filled", "venue-a", "client-id");
+        let id = update.order.client_id().unwrap();
+        let ts = update.ts_event().unwrap();
+        let report = update
+            .order
+            .to_report(emitter.account_id(), Some(id), ts)
+            .unwrap();
+        state.apply_snapshot(&update.order, &report).unwrap();
+        assert!(state.tracked.is_empty());
+        let fill = update.fill(&emitter, Some(id), ts).unwrap();
+        state.remember_fill(&fill);
+        state.handle(update, &emitter).unwrap();
+        assert_eq!(state.terminal[&id].fills, HashSet::from([fill.trade_id]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn restores_terminal_replacement_history_from_cached_order() {
+        let (mut state, emitter, mut rx) = execution_rig();
+        let id = ClientOrderId::from("client-id");
+        let initial = state.tracked[&id].order.clone();
+        let mut closed = initial.clone();
+        let mut apply_event = || {
+            let ExecutionEvent::Order(event) = rx.try_recv().unwrap() else {
+                panic!("Expected a native order event");
+            };
+            closed.apply(event).unwrap();
+        };
+
+        state
+            .handle(update("new", "new", "venue-a", id.as_str()), &emitter)
+            .unwrap();
+        apply_event();
+        state.register_alias("replace-alias".into(), id);
+        let mut replacement = update("new", "new", "venue-b", "replace-alias");
+        replacement.order.replaces = Some("venue-a".into());
+        state.handle(replacement, &emitter).unwrap();
+        apply_event();
+        state
+            .handle(
+                update("fill", "filled", "venue-b", "replace-alias"),
+                &emitter,
+            )
+            .unwrap();
+        apply_event();
+        assert!(closed.is_closed());
+
+        let mut restored = OrderState::default();
+        restored.restore(&closed);
+        restored.register(&initial);
+        assert!(restored.active_orders().is_empty());
+        assert!(restored.tracked.is_empty());
+        assert_eq!(restored.venue_for(id), Some("venue-b".into()));
+        assert_eq!(restored.client_for("venue-a".into()), Some(id));
+        assert_eq!(restored.client_for("venue-b".into()), Some(id));
+
+        restored
+            .handle(
+                update("fill", "filled", "venue-b", "replace-alias"),
+                &emitter,
+            )
+            .unwrap();
+        restored
+            .handle(
+                update("canceled", "canceled", "venue-a", "obsolete-alias"),
+                &emitter,
+            )
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        for _ in 0..2 {
+            restored
+                .handle(
+                    update("fill", "filled", "venue-a", "obsolete-alias"),
+                    &emitter,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Report(ExecutionReport::Fill(fill))
+            if fill.client_order_id == Some(id) && fill.venue_order_id == VenueOrderId::from("venue-a")
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(restored.venue_for(id), Some("venue-b".into()));
     }
 
     #[rstest]

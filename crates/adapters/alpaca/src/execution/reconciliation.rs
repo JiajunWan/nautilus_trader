@@ -350,7 +350,7 @@ mod tests {
                 .quantity(Quantity::from(1))
                 .price(Price::from("500.00"))
                 .build();
-            state.register(order);
+            state.register(&order);
         }
         let state = Mutex::new(state);
         let result = timeout(
