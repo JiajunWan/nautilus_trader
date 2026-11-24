@@ -37,7 +37,7 @@ use crate::provider::instrument_id;
 #[derive(Debug, Deserialize)]
 pub(super) struct OptionMessage<'a> {
     #[serde(rename = "T")]
-    kind: &'a str,
+    pub(super) kind: &'a str,
     #[serde(rename = "S")]
     symbol: Option<&'a str>,
     #[serde(rename = "t")]
@@ -58,19 +58,12 @@ pub(super) struct OptionMessage<'a> {
     exchange: Option<&'a str>,
     #[serde(rename = "c")]
     condition: Option<&'a str>,
-    msg: Option<&'a str>,
-    code: Option<u16>,
+    pub(super) msg: Option<&'a str>,
+    pub(super) code: Option<u16>,
 }
 
 impl OptionMessage<'_> {
     pub(super) fn data(self) -> anyhow::Result<Option<Data>> {
-        if self.kind == "error" {
-            anyhow::bail!(
-                "Option data subscription rejected by Alpaca (code {:?}): {}",
-                self.code,
-                self.msg.unwrap_or("unknown error"),
-            );
-        }
         if !matches!(self.kind, "q" | "t") {
             return Ok(None);
         }

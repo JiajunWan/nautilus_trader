@@ -35,7 +35,10 @@ use nautilus_network::{
 use option_wire::OptionMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    time::{Instant, sleep},
+};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -52,8 +55,18 @@ pub(crate) enum StockChannel {
     Bars,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StockSubscriptions([BTreeSet<Symbol>; 3]);
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct StockSubscriptions {
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    quotes: BTreeSet<Symbol>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    trades: BTreeSet<Symbol>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    bars: BTreeSet<Symbol>,
+}
 
 impl StockSubscriptions {
     pub(crate) fn change(
@@ -62,7 +75,11 @@ impl StockSubscriptions {
         symbols: impl IntoIterator<Item = Symbol>,
         subscribe: bool,
     ) -> bool {
-        let set = &mut self.0[channel as usize];
+        let set = match channel {
+            StockChannel::Quotes => &mut self.quotes,
+            StockChannel::Trades => &mut self.trades,
+            StockChannel::Bars => &mut self.bars,
+        };
         let mut changed = false;
         for symbol in symbols {
             changed |= if subscribe {
@@ -73,41 +90,156 @@ impl StockSubscriptions {
         }
         changed
     }
-}
 
-#[derive(Serialize)]
-struct SubscriptionRequest<'a> {
-    action: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    quotes: Vec<&'a str>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    trades: Vec<&'a str>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    bars: Vec<&'a str>,
-}
+    fn sets(&self) -> [&BTreeSet<Symbol>; 3] {
+        [&self.quotes, &self.trades, &self.bars]
+    }
 
-impl<'a> SubscriptionRequest<'a> {
-    fn delta(
-        action: &'static str,
-        before: &'a StockSubscriptions,
-        after: &'a StockSubscriptions,
-    ) -> Self {
-        let [quotes, trades, bars] = std::array::from_fn(|i| {
-            after.0[i]
-                .difference(&before.0[i])
-                .map(Symbol::as_str)
-                .collect()
-        });
-        Self {
-            action,
-            quotes,
-            trades,
-            bars,
-        }
+    fn sets_mut(&mut self) -> [&mut BTreeSet<Symbol>; 3] {
+        [&mut self.quotes, &mut self.trades, &mut self.bars]
     }
 
     fn is_empty(&self) -> bool {
-        self.quotes.is_empty() && self.trades.is_empty() && self.bars.is_empty()
+        self.sets().into_iter().all(BTreeSet::is_empty)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SubscriptionAction {
+    Subscribe,
+    Unsubscribe,
+}
+
+#[derive(Debug, Serialize)]
+struct SubscriptionRequest {
+    action: SubscriptionAction,
+    #[serde(flatten)]
+    symbols: StockSubscriptions,
+}
+
+#[derive(Default)]
+struct FeedSubscriptions {
+    desired: StockSubscriptions,
+    confirmed: StockSubscriptions,
+    rejected: StockSubscriptions,
+    restoring: Option<StockSubscriptions>,
+    pending: Option<SubscriptionRequest>,
+}
+
+impl FeedSubscriptions {
+    fn set_desired(&mut self, desired: StockSubscriptions) {
+        for (rejected, (old, new)) in self
+            .rejected
+            .sets_mut()
+            .into_iter()
+            .zip(self.desired.sets().into_iter().zip(desired.sets()))
+        {
+            rejected.retain(|symbol| old.contains(symbol) == new.contains(symbol));
+        }
+        self.desired = desired;
+    }
+
+    fn reconnect(&mut self, desired: StockSubscriptions) {
+        // Restore previously confirmed subscriptions before retrying uncertain or rejected ones,
+        // so an oversized batch cannot prevent healthy subscriptions from resuming.
+        let confirmed = std::mem::take(&mut self.confirmed);
+        self.restoring.get_or_insert(confirmed);
+        self.desired = desired;
+        self.rejected = StockSubscriptions::default();
+        self.pending = None;
+    }
+
+    fn next_request(&mut self) -> Option<SubscriptionRequest> {
+        use SubscriptionAction::{Subscribe, Unsubscribe};
+
+        let desired = self.desired.sets();
+        let confirmed = self.confirmed.sets();
+        let rejected = self.rejected.sets();
+        let mut symbols = StockSubscriptions::default();
+        if let Some(restoring) = &self.restoring {
+            for (i, set) in symbols.sets_mut().into_iter().enumerate() {
+                set.extend(restoring.sets()[i].intersection(desired[i]).copied());
+            }
+            if !symbols.is_empty() {
+                return Some(SubscriptionRequest {
+                    action: Subscribe,
+                    symbols,
+                });
+            }
+            self.restoring = None;
+        }
+
+        // Unsubscribe first so its acknowledgement can free capacity for new subscriptions
+        for (action, from, to) in [
+            (Unsubscribe, desired, confirmed),
+            (Subscribe, confirmed, desired),
+        ] {
+            for (i, set) in symbols.sets_mut().into_iter().enumerate() {
+                set.extend(
+                    to[i]
+                        .difference(from[i])
+                        .filter(|symbol| !rejected[i].contains(symbol))
+                        .copied(),
+                );
+            }
+            if !symbols.is_empty() {
+                return Some(SubscriptionRequest { action, symbols });
+            }
+        }
+        None
+    }
+
+    fn handle_response(&mut self, feed: &str, response: SubscriptionResponse<'_>) {
+        let pending = self.pending.take();
+        let acknowledged = matches!(response, SubscriptionResponse::Confirmed(_));
+        match response {
+            SubscriptionResponse::Confirmed(confirmed) => self.confirmed = confirmed,
+            SubscriptionResponse::Rejected { code, message } => {
+                log::warn!(
+                    "Alpaca {feed} subscription request {pending:?} rejected ({code}): {message}"
+                );
+            }
+        }
+        let Some(request) = pending else { return };
+        self.restoring = None;
+
+        let adding = request.action == SubscriptionAction::Subscribe;
+        let mut failed = request.symbols;
+        for (i, symbols) in failed.sets_mut().into_iter().enumerate() {
+            let confirmed = self.confirmed.sets()[i];
+            let desired = self.desired.sets()[i];
+            symbols.retain(|symbol| {
+                confirmed.contains(symbol) != adding && desired.contains(symbol) == adding
+            });
+        }
+        if !failed.is_empty() {
+            if acknowledged {
+                log::warn!(
+                    "Alpaca {feed} did not confirm {:?} for {failed:?}",
+                    request.action
+                );
+            }
+            for (rejected, failed) in self.rejected.sets_mut().into_iter().zip(failed.sets()) {
+                rejected.extend(failed);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SubscriptionResponse<'a> {
+    Confirmed(StockSubscriptions),
+    Rejected { code: u16, message: &'a str },
+}
+
+impl<'a> SubscriptionResponse<'a> {
+    fn from_error(code: Option<u16>, message: Option<&'a str>) -> anyhow::Result<Self> {
+        let message = message.unwrap_or("unknown error");
+        match code {
+            Some(code @ (400 | 405 | 409 | 410)) => Ok(Self::Rejected { code, message }),
+            _ => anyhow::bail!("Alpaca market data stream error (code {code:?}): {message}"),
+        }
     }
 }
 
@@ -298,32 +430,60 @@ impl StockStream {
         sender: &EventSender<DataEvent>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
-        let mut applied = StockSubscriptions::default();
-        let desired = subscriptions.borrow_and_update().clone();
-        self.synchronize(&mut applied, desired).await?;
+        let mut state = FeedSubscriptions {
+            desired: subscriptions.borrow_and_update().clone(),
+            ..FeedSubscriptions::default()
+        };
+        let mut synchronize = true;
+        let deadline = sleep(Duration::ZERO);
+        tokio::pin!(deadline);
         loop {
+            if synchronize {
+                synchronize = false;
+                self.synchronize(&mut state).await?;
+                if state.pending.is_some() {
+                    deadline
+                        .as_mut()
+                        .reset(Instant::now() + SUBSCRIPTION_TIMEOUT);
+                }
+            }
             tokio::select! {
                 () = cancel.cancelled() => return Ok(()),
                 changed = subscriptions.changed() => {
                     if changed.is_err() {
                         return Ok(());
                     }
-                    let desired = subscriptions.borrow_and_update().clone();
-                    self.synchronize(&mut applied, desired).await?;
+                    state.set_desired(subscriptions.borrow_and_update().clone());
+                    synchronize = state.pending.is_none();
+                }
+                () = &mut deadline, if state.pending.is_some() => {
+                    let pending = state.pending.take();
+                    log::warn!("Alpaca {} subscription acknowledgement timed out for {pending:?}", self.feed);
+                    if self.authenticated_epoch == self.socket.connection_epoch() {
+                        let _ = self.socket.request_reconnect();
+                    }
                 }
                 received = self.input.recv() => {
                     let Some((message_epoch, frame)) = received else { return Ok(()) };
                     let Some(payload) = payload(&frame) else { continue };
                     if payload == RECONNECTED.as_bytes() {
+                        if message_epoch != self.socket.connection_epoch() {
+                            continue;
+                        }
                         self.authenticate(message_epoch).await?;
                         self.authenticated_epoch = message_epoch;
-                        applied = StockSubscriptions::default();
-                        let desired = subscriptions.borrow_and_update().clone();
-                        self.synchronize(&mut applied, desired).await?;
+                        state.reconnect(subscriptions.borrow_and_update().clone());
+                        synchronize = true;
                     } else if message_epoch == self.authenticated_epoch {
-                        match self.format {
+                        let response = match self.format {
                             WireFormat::Json => dispatch(payload, sender)?,
                             WireFormat::MsgPack => dispatch_options(payload, sender)?,
+                        };
+                        if let Some(response) = response
+                            && message_epoch == self.socket.connection_epoch()
+                        {
+                            state.handle_response(self.feed, response);
+                            synchronize = true;
                         }
                     }
                 }
@@ -331,21 +491,19 @@ impl StockStream {
         }
     }
 
-    async fn synchronize(
-        &self,
-        applied: &mut StockSubscriptions,
-        desired: StockSubscriptions,
-    ) -> anyhow::Result<()> {
+    async fn synchronize(&self, state: &mut FeedSubscriptions) -> anyhow::Result<()> {
         let epoch = self.authenticated_epoch;
         if epoch != self.socket.connection_epoch() || !self.socket.is_active() {
             return Ok(());
         }
-        match update_subscriptions(&self.socket, self.format, epoch, applied, &desired).await {
-            Ok(()) => *applied = desired,
-            Err(error) if epoch != self.socket.connection_epoch() || !self.socket.is_active() => {
-                log::debug!("Alpaca {} subscription interrupted: {error}", self.feed);
+        if let Some(request) = state.next_request() {
+            match self.format.send(&self.socket, epoch, &request).await {
+                Ok(()) => state.pending = Some(request),
+                Err(e) if epoch != self.socket.connection_epoch() || !self.socket.is_active() => {
+                    log::debug!("Alpaca {} subscription interrupted: {e}", self.feed);
+                }
+                Err(e) => return Err(e),
             }
-            Err(error) => return Err(error),
         }
         Ok(())
     }
@@ -359,26 +517,11 @@ fn payload(message: &Message) -> Option<&[u8]> {
     }
 }
 
-async fn update_subscriptions(
-    socket: &WebSocketClient,
-    format: WireFormat,
-    epoch: u64,
-    applied: &StockSubscriptions,
-    desired: &StockSubscriptions,
-) -> anyhow::Result<()> {
-    for (action, before, after) in [
-        ("unsubscribe", desired, applied),
-        ("subscribe", applied, desired),
-    ] {
-        let request = SubscriptionRequest::delta(action, before, after);
-        if !request.is_empty() {
-            format.send(socket, epoch, &request).await?;
-        }
-    }
-    Ok(())
-}
-
-fn dispatch(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> {
+fn dispatch<'a>(
+    body: &'a [u8],
+    sender: &EventSender<DataEvent>,
+) -> anyhow::Result<Option<SubscriptionResponse<'a>>> {
+    let mut response = None;
     for message in serde_json::from_slice::<Vec<&RawValue>>(body)? {
         let raw = message.get();
 
@@ -395,11 +538,14 @@ fn dispatch(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> 
                 "q" => StockChannel::Quotes,
                 "t" => StockChannel::Trades,
                 "b" => StockChannel::Bars,
-                "error" => anyhow::bail!(
-                    "Market data subscription rejected by Alpaca (code {:?}): {}",
-                    header.code,
-                    header.msg.unwrap_or("unknown error"),
-                ),
+                "subscription" => {
+                    response = Some(SubscriptionResponse::Confirmed(serde_json::from_str(raw)?));
+                    continue;
+                }
+                "error" => {
+                    response = Some(SubscriptionResponse::from_error(header.code, header.msg)?);
+                    continue;
+                }
                 _ => continue,
             };
             let symbol = header
@@ -432,18 +578,32 @@ fn dispatch(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> 
             .send(DataEvent::Data(data))
             .context("Sending Alpaca market data")?;
     }
-    Ok(())
+    Ok(response)
 }
 
-fn dispatch_options(body: &[u8], sender: &EventSender<DataEvent>) -> anyhow::Result<()> {
+fn dispatch_options<'a>(
+    body: &'a [u8],
+    sender: &EventSender<DataEvent>,
+) -> anyhow::Result<Option<SubscriptionResponse<'a>>> {
     for message in rmp_serde::from_slice::<Vec<OptionMessage<'_>>>(body)? {
+        match message.kind {
+            "subscription" => {
+                // Alpaca sends subscription snapshots in single-message frames
+                let [confirmed] = rmp_serde::from_slice::<[StockSubscriptions; 1]>(body)?;
+                return Ok(Some(SubscriptionResponse::Confirmed(confirmed)));
+            }
+            "error" => {
+                return SubscriptionResponse::from_error(message.code, message.msg).map(Some);
+            }
+            _ => {}
+        }
         if let Some(data) = message.data()? {
             sender
                 .send(DataEvent::Data(data))
                 .context("Sending Alpaca option market data")?;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn validate_live_bar(bar_type: BarType) -> anyhow::Result<()> {
@@ -460,10 +620,15 @@ pub(crate) fn validate_live_bar(bar_type: BarType) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{SinkExt, StreamExt};
     use nautilus_core::datetime::iso8601_to_unix_nanos;
     use rstest::rstest;
+    use serde_json::{Value, json};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{WebSocketStream, accept_async};
 
     use super::*;
+    use crate::common::enums::AlpacaEnvironment;
 
     const MIXED: &str = include_str!("../test_data/stock_stream_mixed.json");
 
@@ -504,7 +669,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(r#"{"T":"error","code":405,"msg":"symbol limit"}"#, "symbol limit")]
+    #[case(r#"{"T":"error","code":500,"msg":"internal error"}"#, "internal error")]
     #[case(r#"{"T":"q","T":"error"}"#, "duplicate field `T`")]
     #[case(r#"{"T":"b","S":"AAA","S":"BBB"}"#, "duplicate field `S`")]
     #[case(r#"{"T":"t","code":"bad"}"#, "u16")]
@@ -522,7 +687,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
+    #[rstest]
     fn subscription_changes_preserve_both_wire_formats() {
         let mut before = StockSubscriptions::default();
         let qqq = Symbol::from("QQQ");
@@ -534,21 +699,192 @@ mod tests {
         let mut after = before.clone();
         assert!(after.change(StockChannel::Quotes, [qqq], false));
         assert!(after.change(StockChannel::Trades, [option], true));
-        for (request, expected) in [
+        let mut state = FeedSubscriptions {
+            confirmed: before,
+            desired: after.clone(),
+            ..FeedSubscriptions::default()
+        };
+        for (expected, confirmed) in [
             (
-                SubscriptionRequest::delta("unsubscribe", &after, &before),
-                serde_json::json!({"action": "unsubscribe", "quotes": ["QQQ"]}),
+                json!({"action": "unsubscribe", "quotes": ["QQQ"]}),
+                StockSubscriptions::default(),
             ),
             (
-                SubscriptionRequest::delta("subscribe", &before, &after),
-                serde_json::json!({"action": "subscribe", "trades": ["NVDA261120C00157500"]}),
+                json!({"action": "subscribe", "trades": ["NVDA261120C00157500"]}),
+                after,
             ),
         ] {
+            let request = state.next_request().unwrap();
             assert_eq!(serde_json::to_value(&request).unwrap(), expected);
             let msgpack = rmp_serde::to_vec_named(&request).unwrap();
             let decoded: serde_json::Value = rmp_serde::from_slice(&msgpack).unwrap();
             assert_eq!(decoded, expected);
+            state.pending = Some(request);
+            state.handle_response("test", SubscriptionResponse::Confirmed(confirmed));
         }
-        assert!(SubscriptionRequest::delta("subscribe", &after, &after).is_empty());
+        assert!(state.next_request().is_none());
+    }
+
+    #[rstest]
+    #[case(WireFormat::Json, ["SPY", "QQQ", "NVDA"])]
+    #[case(WireFormat::MsgPack, ["SPY270115C00650000", "QQQ270115C00600000", "NVDA270115C00170000"])]
+    #[tokio::test]
+    async fn preserves_confirmed_quotes_after_subscription_rejection(
+        #[case] format: WireFormat,
+        #[case] symbols: [&str; 3],
+    ) {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            exercise_subscription_rejection(format, symbols),
+        )
+        .await
+        .expect("Market stream did not finish the expected subscription changes");
+    }
+
+    async fn exercise_subscription_rejection(
+        format: WireFormat,
+        [first, rejected, next]: [&str; 3],
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let credential = AlpacaCredentials::resolve(
+            AlpacaEnvironment::Paper,
+            Some(&"fixture-key".into()),
+            Some(&"fixture-secret".into()),
+        )
+        .unwrap();
+        let (stream, socket) = tokio::join!(
+            StockStream::connect_with_format(url, "test", credential, None, format),
+            accept_market(&listener, format),
+        );
+        let mut socket = socket;
+        let (subscriptions, desired) = watch::channel(StockSubscriptions::default());
+        let (data_tx, mut events) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(stream.unwrap().run(desired, data_tx.into(), cancel.clone()));
+        let change = |symbol, add| {
+            subscriptions.send_modify(|desired| {
+                assert!(desired.change(StockChannel::Quotes, [Symbol::from(symbol)], add));
+            });
+        };
+        let subscribe = |quotes: &[&str]| json!({"action": "subscribe", "quotes": quotes});
+        let snapshot =
+            |quotes: &[&str]| json!([{"T": "subscription", "quotes": quotes, "trades": []}]);
+        let rejection = json!([{"T": "error", "code": 405, "msg": "symbol limit exceeded"}]);
+        let quote = json!([{
+            "T": "q", "S": first, "t": "2026-11-23T20:59:59.123456789Z",
+            "bp": 12.5, "ap": 12.75, "bs": 1, "as": 2
+        }]);
+
+        change(first, true);
+        assert_eq!(
+            receive_market(&mut socket, format).await,
+            subscribe(&[first])
+        );
+        send_market(&mut socket, format, snapshot(&[first])).await;
+        change(rejected, true);
+        assert_eq!(
+            receive_market(&mut socket, format).await,
+            subscribe(&[rejected])
+        );
+        send_market(&mut socket, format, rejection.clone()).await;
+        send_market(&mut socket, format, quote.clone()).await;
+        let Some(DataEvent::Data(Data::Quote(tick))) = events.recv().await else {
+            panic!("The original connection stopped publishing quotes");
+        };
+        assert_eq!(tick.instrument_id, instrument_id(first).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err(),
+            "Expected no resubmission or disconnection after the rejection",
+        );
+
+        change(next, true);
+        assert_eq!(
+            receive_market(&mut socket, format).await,
+            subscribe(&[next])
+        );
+        send_market(&mut socket, format, snapshot(&[first, next])).await;
+        send_market(&mut socket, format, quote.clone()).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(DataEvent::Data(Data::Quote(_)))
+        ));
+        drop(socket);
+
+        let mut socket = accept_market(&listener, format).await;
+        assert_eq!(
+            receive_market(&mut socket, format).await,
+            subscribe(&[next, first])
+        );
+        send_market(&mut socket, format, snapshot(&[first, next])).await;
+        assert_eq!(
+            receive_market(&mut socket, format).await,
+            subscribe(&[rejected])
+        );
+        send_market(&mut socket, format, rejection).await;
+        send_market(&mut socket, format, quote).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(DataEvent::Data(Data::Quote(_)))
+        ));
+
+        subscriptions.send_modify(|desired| {
+            desired.change(
+                StockChannel::Quotes,
+                [Symbol::from(rejected), Symbol::from(next)],
+                false,
+            );
+        });
+        assert_eq!(
+            receive_market(&mut socket, format).await,
+            json!({"action": "unsubscribe", "quotes": [next]})
+        );
+        send_market(&mut socket, format, snapshot(&[first])).await;
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    async fn accept_market(
+        listener: &TcpListener,
+        format: WireFormat,
+    ) -> WebSocketStream<TcpStream> {
+        let mut socket = accept_async(listener.accept().await.unwrap().0)
+            .await
+            .unwrap();
+        let auth = receive_market(&mut socket, format).await;
+        assert_eq!(auth["action"], "auth");
+        send_market(
+            &mut socket,
+            format,
+            json!([{"T": "success", "msg": "authenticated"}]),
+        )
+        .await;
+        socket
+    }
+
+    async fn receive_market(socket: &mut WebSocketStream<TcpStream>, format: WireFormat) -> Value {
+        let message = socket.next().await.unwrap().unwrap();
+        let bytes = payload(&message).expect("Expected a market control request");
+        match format {
+            WireFormat::Json => serde_json::from_slice(bytes).unwrap(),
+            WireFormat::MsgPack => rmp_serde::from_slice(bytes).unwrap(),
+        }
+    }
+
+    async fn send_market(
+        socket: &mut WebSocketStream<TcpStream>,
+        format: WireFormat,
+        message: Value,
+    ) {
+        let frame = match format {
+            WireFormat::Json => Message::Text(message.to_string().into()),
+            WireFormat::MsgPack => {
+                Message::Binary(rmp_serde::to_vec_named(&message).unwrap().into())
+            }
+        };
+        socket.send(frame).await.unwrap();
     }
 }
