@@ -16,16 +16,20 @@
 //! REST evidence for startup and private-stream recovery.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Mutex,
 };
 
 use futures_util::{StreamExt, TryStreamExt, stream};
+use nautilus_common::cache::Cache;
 use nautilus_core::UnixNanos;
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
+    enums::PositionSide,
     identifiers::{AccountId, VenueOrderId},
-    reports::{FillReport, OrderStatusReport},
+    instruments::InstrumentAny,
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    types::Quantity,
 };
 
 use super::{
@@ -33,9 +37,62 @@ use super::{
     reports::{self, BrokerOrder, FillActivity},
     updates::OrderState,
 };
-use crate::http::{AlpacaApiError, AlpacaHttpClient};
+use crate::{
+    common::ALPACA,
+    http::{AlpacaApiError, AlpacaHttpClient},
+    option_spread,
+};
 
 const MAX_ORDER_LOOKUPS: usize = 8;
+
+/// A successful account snapshot lists only open positions. Report covered absences
+/// explicitly so bounded-history reconciliation can apply their closing executions.
+pub(super) fn append_flat_positions(
+    cache: &Cache,
+    account_id: AccountId,
+    orders: &[OrderStatusReport],
+    fills: &[FillReport],
+    positions: &mut Vec<PositionStatusReport>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<()> {
+    let mut missing = BTreeSet::new();
+    for id in orders
+        .iter()
+        .map(|r| r.instrument_id)
+        .chain(fills.iter().map(|r| r.instrument_id))
+    {
+        if option_spread::is_spread(id) {
+            missing.extend(option_spread::legs(id)?.into_iter().map(|(leg, _)| leg));
+        } else {
+            missing.insert(id);
+        }
+    }
+    for position in cache.positions_open(Some(&ALPACA), None, None, Some(&account_id), None) {
+        if matches!(
+            cache.instrument(&position.instrument_id),
+            Some(InstrumentAny::Equity(_) | InstrumentAny::OptionContract(_))
+        ) {
+            missing.insert(position.instrument_id);
+        }
+    }
+    for report in positions.iter() {
+        missing.remove(&report.instrument_id);
+    }
+    positions.extend(missing.into_iter().map(|id| {
+        PositionStatusReport::new(
+            account_id,
+            id,
+            PositionSide::Flat,
+            Quantity::zero(0),
+            ts_init,
+            ts_init,
+            None,
+            None,
+            None,
+        )
+    }));
+    Ok(())
+}
 
 pub(super) struct Snapshot {
     pub(super) orders: BTreeMap<String, BrokerOrder>,

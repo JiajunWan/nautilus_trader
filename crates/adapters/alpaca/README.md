@@ -193,7 +193,10 @@ and [index options](https://docs.alpaca.markets/us/docs/index-options).
 Enable LiveNode startup reconciliation to restore Alpaca orders, executions,
 and positions. The historical lookback bounds activity collection. Startup
 also queries all working orders, including orders submitted before the lookback,
-and retrieves missing order records for fills inside the window.
+and retrieves missing order records for fills inside the window. After a successful
+account positions query, startup reports a flat position for each previously
+open or traded equity or option contract absent from the snapshot. This lets
+Nautilus recover offline closing fills and their realized PnL on restart.
 
 The execution client reauthenticates the private stream and catches up on order
 updates and fills after a reconnect. If a fill references an order not yet visible

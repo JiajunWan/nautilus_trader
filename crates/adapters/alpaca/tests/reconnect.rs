@@ -571,3 +571,6 @@ async fn exercise_recovery(fault: StatusCode, reconnect_again: bool) {
     client.disconnect().await.unwrap();
     server.abort();
 }
+
+#[path = "reconnect/startup.rs"]
+mod startup;

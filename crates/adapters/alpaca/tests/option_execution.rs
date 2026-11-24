@@ -47,6 +47,7 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let fixture_origin = origin.clone();
     let symbol = "SPY261120C00745000";
+    let later_symbol = "SPY261218C00745000";
     let venue_id = "c9df1f2a-30ab-43f9-bf83-814b2407eda9";
     let timestamp = "2026-11-18T15:30:00Z";
     let fixture = tokio::spawn(async move {
@@ -57,7 +58,7 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
             "status": "filled", "qty": "1", "filled_qty": "1", "filled_avg_price": "2.40",
             "limit_price": "2.41", "created_at": timestamp
         });
-        for _ in 0..4 {
+        for _ in 0..5 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut lines = BufReader::new(&mut socket).lines();
             let line = lines.next_line().await.unwrap().unwrap();
@@ -90,6 +91,9 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
                 "/v2/positions" => json!([{
                     "symbol": symbol, "asset_class": "us_option", "qty": "1",
                     "side": "long", "avg_entry_price": "2.40"
+                }, {
+                    "symbol": later_symbol, "asset_class": "us_option", "qty": "3",
+                    "side": "short", "avg_entry_price": "3.10"
                 }]),
                 path if path == format!("/v2/orders/{venue_id}") => order.clone(),
                 path => panic!("Unexpected fixture endpoint {path}"),
@@ -173,5 +177,26 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
     assert_eq!(positions[0].position_side, PositionSide::Long);
     assert_eq!(positions[0].quantity, Quantity::from(1));
     assert_eq!(positions[0].instrument_id, instrument);
+    let all = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            UUID4::new(),
+            ts_init,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let later = InstrumentId::from(format!("{later_symbol}.ALPACA").as_str());
+    assert_eq!(all.len(), 2);
+    assert!(
+        all.iter()
+            .any(|r| r.instrument_id == instrument && r.position_side == PositionSide::Long)
+    );
+    assert!(all.iter().any(|r| r.instrument_id == later
+        && r.position_side == PositionSide::Short
+        && r.quantity == Quantity::from(3)));
     fixture.await.unwrap();
 }

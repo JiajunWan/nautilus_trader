@@ -894,17 +894,26 @@ impl ExecutionClient for AlpacaExecutionClient {
         let mut status =
             ExecutionMassStatus::new(self.core.client_id, account_id, *ALPACA, ts_init, None);
         status.set_report_window(start, start.is_some() && snapshot.complete);
-        let mut state = self.order_state()?;
-        snapshot.bind_groups(&mut state, &self.emitter);
-        let (orders, fills) = snapshot.mass_reports(&mut state, account_id, start, ts_init)?;
+        let (orders, fills) = {
+            let mut state = self.order_state()?;
+            snapshot.bind_groups(&mut state, &self.emitter);
+            snapshot.mass_reports(&mut state, account_id, start, ts_init)?
+        };
+        let mut positions = positions
+            .into_iter()
+            .map(|position| position.to_report(account_id, ts_init))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        reconciliation::append_flat_positions(
+            &self.core.cache(),
+            account_id,
+            &orders,
+            &fills,
+            &mut positions,
+            ts_init,
+        )?;
         status.add_order_reports(orders);
         status.add_fill_reports(fills);
-        status.add_position_reports(
-            positions
-                .into_iter()
-                .map(|position| position.to_report(account_id, ts_init))
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        );
+        status.add_position_reports(positions);
         Ok(Some(status))
     }
 
