@@ -42,9 +42,13 @@ Released on TBD (UTC).
 - Removed `nautilus_cryptography::signing` and Python `nautilus_trader.cryptography`; use crypto libraries directly
 - Removed `nautilus-cryptography` features `python` and `extension-module`; drop them from dependent manifests
 - Removed blockchain cache `toggle_performance_settings` and `toggle_perf_sync_settings`; sync uses server settings
+- Removed Bybit `api_key` Python getters; use `api_key_masked` to correlate credentials
+- Removed OKX spot margin position reports derived from `spotInUseAmt`, a Portfolio margin hedging amount
+- Removed `OKXHttpClient::request_spot_margin_position_reports` and `parse_spot_margin_position_from_balance`
 - Renamed `CacheConfig.tick_capacity` to `data_capacity`; serialized configs must use the new key
 - Renamed `ParquetDataCatalog` `quote_ticks` and `trade_ticks` queries to `quotes` and `trades`
 - Renamed Python `ParquetDataCatalog` `*_quote_ticks` and `*_trade_ticks` methods to `*_quotes` and `*_trades`
+- Renamed Binance `instrument_refresh_interval_secs` to `update_instruments_interval_mins`. Convert seconds to minutes
 - Changed `Position` layout. Use `PositionReplayEvents` for `replay_events` via `.into()` (#5551), thanks @Milchstrassse
 - Changed `Position` literals to require `allows_negative_price`. Use `None` if unknown (#5535)
 - Changed `PortfolioSnapshot` literals to require `is_registration`. Use `true` only for account registration
@@ -115,8 +119,6 @@ Released on TBD (UTC).
 - Changed Lighter `fresh_k` to return `anyhow::Result<Scalar>`; propagate signing nonce errors
 - Changed Lighter `PrivateKey::sign` to return `Result<Signature, InvalidSigningNonce>` for callers to handle
 - Changed Lighter `AuthTokenError` to include `InvalidSigningNonce`, which exhaustive matches must handle
-- Removed OKX spot margin position reports derived from `spotInUseAmt`, a Portfolio margin hedging amount
-- Removed `OKXHttpClient::request_spot_margin_position_reports` and `parse_spot_margin_position_from_balance`
 - Changed OKX algo order models to require chase and spawned-ID fields in struct literals
 - Changed `OKXAlgoOrderMsg::advance_ord_type` to `Option<OKXAdvanceOrderType>`
 - Changed `OKXExecutionClientConfig` literals; add `use_spot_position_reports` and `spot_positions_quote_currency`
@@ -126,6 +128,7 @@ Released on TBD (UTC).
 
 - Fixed cross-origin HTTP redirects leaking venue API keys and other custom credential headers
 - Fixed failed blockchain pool snapshot writes leaving inconsistent snapshots that pool profiler restores could load
+- Fixed Bybit diagnostics exposing endpoint credentials, API keys, and authentication frames
 - Fixed Coinbase authentication errors exposing private key data from malformed PEM credentials
 - Hardened Lighter signing with uniform nonzero OS nonces; no specific NautilusTrader vulnerability was fixed
 - Hardened the Lighter signing API to reject zero and non-canonical caller-supplied Schnorr nonces
@@ -152,6 +155,9 @@ Released on TBD (UTC).
 - Fixed open-only order checks leaving closed venue orders unresolved after lost updates
 - Fixed trailing stops updating while markets are not open or from stale reopen prices
 - Fixed consecutive simulated maker fills leaking synthetic last prices into later matching
+- Fixed simulated L2 liquidity consumption for delayed trades and re-added levels (#5739), thanks @aaurix
+- Fixed older instrument responses overwriting newer cached definitions
+- Fixed stale instrument definitions in order and fill reports (#5722), thanks for reporting @vitakot
 - Fixed live startup connecting execution clients after a stop request during data connection
 - Fixed `LiveNode::start` skipping reconciliation for instruments sent during execution connect
 - Fixed `LiveNode::start` timing out when execution clients wait for account registration
@@ -234,6 +240,7 @@ Released on TBD (UTC).
 - Fixed Lighter raw WebSocket frames losing `subscribed/` types and unmodeled fields
 - Fixed Lighter recovery of unacknowledged order creates on reconnect (#5696), thanks @aaurix
 - Fixed Lighter IOC recovery after a lost acknowledgement (#5701), thanks for reporting @AlphaTraderK
+- Fixed Lighter recovery of unfilled bracket child cancellations when trade history is unavailable (#5683), thanks for reporting @YTsnipers
 - Fixed OKX balances not refreshing after a WebSocket reconnect
 - Fixed OKX denying `TRAILING_STOP_LIMIT` orders only after `OrderSubmitted`
 - Fixed OKX execution clients not subscribing to venue position updates
@@ -280,32 +287,35 @@ Released on TBD (UTC).
 - Optimized memory used by pending Polymarket subscription changes (#5657), thanks @imbolc
 - Upgraded Rust (MSRV) to 1.100.0
 - Upgraded `cargo-audit` tool to v0.23.0
-- Upgraded `cargo-binstall` tool to v1.27.0
-- Upgraded `cargo-deny` tool to v0.21.0
+- Upgraded `cargo-binstall` tool to v1.28.0
+- Upgraded `cargo-codspeed` tool to v6.1.0
+- Upgraded `cargo-deny` tool to v0.22.0
 - Upgraded `cargo-hack` tool to v0.6.46
 - Upgraded `cargo-hawk` tool to v0.1.18
+- Upgraded `cargo-llvm-cov` tool to v0.9.2
 - Upgraded `cargo-machete` tool to v0.10.1
 - Upgraded `cargo-nextest` tool to v0.9.152
 - Upgraded `flamegraph` tool to v0.6.15
 - Upgraded `OSV Scanner` tool to v2.7.1
 - Upgraded `prek` tool to v0.5.11
 - Upgraded `pypi-attestations` tool to v0.0.31
-- Upgraded `Socket CLI` tool to v1.15.0
-- Upgraded `uv` tool to v0.13.8
-- Upgraded `markdownlint-cli2` pre-commit hook to v0.24.1
+- Upgraded `Socket CLI` tool to v1.16.0
+- Upgraded `uv` tool to v0.13.9
+- Upgraded `markdownlint-cli2` pre-commit hook to v0.24.2
 - Upgraded `nbstripout` pre-commit hook to v0.9.2
 - Upgraded `typos` pre-commit hook to v1.52.2
-- Upgraded `uv` pre-commit hook to v0.13.8
+- Upgraded `uv` pre-commit hook to v0.13.9
 - Upgraded `zizmor` pre-commit hook to v1.32.0
 - Upgraded `alloy` crate to v2.6.1
 - Upgraded `arc-swap` crate to v1.9.5
-- Upgraded `arrow` and `parquet` crates to v59.3.3
+- Upgraded `arrow` and `parquet` crates to v60.2.0
 - Upgraded `bytes` crate to v1.12.2
-- Upgraded `clap` crate to v4.6.8
+- Upgraded `clap` crate to v4.6.9
 - Upgraded `databento` crate to v0.65.0
-- Upgraded `datafusion` crate to v55.3.0
+- Upgraded `datafusion` crate to v56.0.0
 - Upgraded `flate2` crate to v1.1.11
 - Upgraded `jiff` crate to v0.2.46
+- Upgraded `object_store` crate to v0.14.2
 - Upgraded `rand` crate to v0.10.4
 - Upgraded `redb` crate to v5.0.0
 - Upgraded `redis` crate to v1.8.2
@@ -314,7 +324,7 @@ Released on TBD (UTC).
 - Upgraded `sockudo-ws` crate to v3.1.1
 - Upgraded `syn` crate to v3.0.10
 - Upgraded `sysinfo` crate to v0.40.4
-- Upgraded `toml` crate to v1.2.1
+- Upgraded `toml` crate to v1.2.2
 - Upgraded `uuid` crate to v1.29.3
 - Upgraded `webpki-roots` crate to v1.0.12
 - Upgraded `zeroize` crate to v1.9.2
@@ -324,9 +334,9 @@ Released on TBD (UTC).
 - Upgraded `polars` package (dev) to v2.1.0
 - Upgraded `pyarrow` package (dev) to v26.0.1
 - Upgraded `pytest-asyncio` package (dev) to v1.5.0
-- Upgraded `ruff` package (dev) and pre-commit hook to v0.17.5
+- Upgraded `ruff` package (dev) and pre-commit hook to v0.17.6
 - Upgraded `simplejson` package to v4.3.0
-- Upgraded `ty` package (dev) to v0.0.104
+- Upgraded `ty` package (dev) to v0.0.105
 
 ### Documentation Updates
 
