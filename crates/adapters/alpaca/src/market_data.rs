@@ -32,7 +32,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::value::RawValue;
 
-use crate::{http::AlpacaHttpClient, provider::instrument_id};
+use crate::{
+    http::{AlpacaHttpClient, PageTokens},
+    provider::instrument_id,
+};
 
 const MAX_PAGE: usize = 10_000;
 
@@ -290,6 +293,7 @@ pub(crate) async fn historical<T: DeserializeOwned>(
     let path = format!("/v2/stocks/{symbol}/{}", kind.path());
     let mut data = Vec::new();
     let mut token: Option<String> = None;
+    let mut seen = PageTokens::default();
 
     loop {
         let limit = spec.limit.map_or(MAX_PAGE, |limit| {
@@ -311,6 +315,8 @@ pub(crate) async fn historical<T: DeserializeOwned>(
             query.push(("timeframe", timeframe));
         }
         if let Some(token) = &token {
+            seen.check(token, kind.path())
+                .with_context(|| format!("Fetching Alpaca history for {id} ({feed})"))?;
             query.push(("page_token", token));
         }
         let page: HistoricalPage<T> = http
@@ -319,10 +325,6 @@ pub(crate) async fn historical<T: DeserializeOwned>(
             .with_context(|| format!("Fetching Alpaca {} for {id} ({feed})", kind.path()))?;
         let (rows, next_token) = kind.rows(page);
         data.extend(rows);
-        ensure!(
-            next_token.is_none() || next_token != token,
-            "Alpaca returned a repeated pagination token for {id}",
-        );
         let Some(next_token) = next_token else {
             break;
         };

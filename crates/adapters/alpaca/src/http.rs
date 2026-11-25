@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use anyhow::Context;
 use jiff::Timestamp;
@@ -30,6 +30,20 @@ use crate::{
 };
 
 const RATE_LIMIT_RESET: &str = "x-ratelimit-reset";
+
+/// Tokens followed during one HTTP query. Token values are opaque and stay out of diagnostics.
+#[derive(Default)]
+pub(crate) struct PageTokens(HashSet<String>);
+
+impl PageTokens {
+    pub(crate) fn check(&mut self, token: &str, resource: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.0.insert(token.to_owned()),
+            "Alpaca {resource} pagination repeated a token"
+        );
+        Ok(())
+    }
+}
 
 /// Discovers active option contracts for an exact underlying, including unrecognized series.
 ///

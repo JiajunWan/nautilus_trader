@@ -15,7 +15,7 @@
 
 //! Alpaca option listings and conversion of verified listings to Nautilus instruments.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, ensure};
 use jiff::civil::Date;
@@ -31,7 +31,11 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::json;
 use ustr::Ustr;
 
-use crate::{common::ALPACA, http::AlpacaHttpClient, provider::instrument_id};
+use crate::{
+    common::ALPACA,
+    http::{AlpacaHttpClient, PageTokens},
+    provider::instrument_id,
+};
 
 const CONTRACTS_PATH: &str = "/v2/options/contracts";
 const STANDARD_MULTIPLIER: u64 = 100;
@@ -600,7 +604,7 @@ async fn load_listings(
     }
 
     let mut listings = Vec::new();
-    let mut seen_tokens = HashSet::new();
+    let mut seen = PageTokens::default();
     let mut page_token = None::<String>;
     loop {
         let mut page_query = query.clone();
@@ -623,10 +627,7 @@ async fn load_listings(
         let Some(token) = page.next_page_token else {
             return Ok(listings);
         };
-        ensure!(
-            seen_tokens.insert(token.clone()),
-            "Alpaca repeated the option contract pagination token"
-        );
+        seen.check(&token, "option contracts")?;
         page_token = Some(token);
     }
 }

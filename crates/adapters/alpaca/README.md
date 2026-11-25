@@ -225,6 +225,10 @@ account positions query, startup reports a flat position for each previously
 open or traded equity or option contract absent from the snapshot. This lets
 Nautilus recover offline closing fills and their realized PnL on restart.
 
+Order history uses the last broker order ID on each full page to continue, even
+when orders share a submission timestamp. Alpaca accepts time bounds on the first
+request. On subsequent pages the adapter stops at the original exclusive end time.
+
 Alpaca uses a weighted average for intraday equity positions and compressed FIFO
 for overnight holdings. Equity reports supply the broker average to establish a
 position from flat. Existing positions retain their fill-based entry average

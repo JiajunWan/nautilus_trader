@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use anyhow::{Context, ensure};
+use jiff::Timestamp;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{
@@ -30,7 +31,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::orders::{parse_order_status, parse_order_type, parse_time_in_force};
-use crate::{http::AlpacaHttpClient, option_provider::is_option_symbol, provider::instrument_id};
+use crate::{
+    http::{AlpacaHttpClient, PageTokens},
+    option_provider::is_option_symbol,
+    provider::instrument_id,
+};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct Account {
@@ -91,6 +96,14 @@ pub(super) struct BrokerOrder {
 impl BrokerOrder {
     pub(super) fn is_combo(&self) -> bool {
         self.order_class.as_deref() == Some("mleg") && self.symbol.is_empty()
+    }
+
+    fn submission_time(&self) -> anyhow::Result<Timestamp> {
+        self.submitted_at
+            .as_deref()
+            .context("Missing Alpaca order submission time")?
+            .parse()
+            .context("Invalid Alpaca order submission time")
     }
 
     pub(super) fn fill_timestamp(&self) -> anyhow::Result<UnixNanos> {
@@ -327,11 +340,19 @@ struct OrdersQuery<'a> {
     limit: u16,
     direction: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    after: Option<String>,
+    after: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    until: Option<String>,
+    until: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbols: Option<String>,
+}
+
+fn next_page_id<T>(page: &[T], limit: u16, id: impl FnOnce(&T) -> &str) -> Option<String> {
+    page.last()
+        .filter(|_| page.len() == usize::from(limit))
+        .map(|row| id(row).to_owned())
 }
 
 pub(super) async fn orders(
@@ -343,7 +364,7 @@ pub(super) async fn orders(
 ) -> anyhow::Result<Vec<BrokerOrder>> {
     let combo = instrument.is_some_and(crate::option_spread::is_spread);
     let option = combo || instrument.is_some_and(|id| is_option_symbol(id.symbol.as_str()));
-    let mut query = OrdersQuery {
+    let query = OrdersQuery {
         status: if open_only { "open" } else { "all" },
         asset_class: match (instrument, option) {
             (None, _) => "us_equity,us_option",
@@ -352,39 +373,56 @@ pub(super) async fn orders(
         },
         limit: 500,
         direction: "asc",
-        after: start.map(|ts| ts.to_datetime_utc().to_string()),
-        until: end.map(|ts| ts.to_datetime_utc().to_string()),
+        after: start.map(|ts| ts.to_datetime_utc()),
+        until: end.map(|ts| ts.to_datetime_utc()),
+        after_order_id: None,
         // The options endpoint may interpret symbols as underliers. Match the
         // complete contract symbol after pagination.
         symbols: instrument
             .filter(|_| !option)
             .map(|id| id.symbol.to_string()),
     };
+    fetch_orders(http, query, |order| {
+        if combo {
+            order.is_combo()
+        } else {
+            instrument.is_none_or(|id| order.symbol == id.symbol.as_str())
+        }
+    })
+    .await
+}
+
+async fn fetch_orders(
+    http: &AlpacaHttpClient,
+    mut query: OrdersQuery<'_>,
+    keep: impl Fn(&BrokerOrder) -> bool,
+) -> anyhow::Result<Vec<BrokerOrder>> {
     let mut result = Vec::new();
+    let mut seen = PageTokens::default();
+    let end = query.until;
     loop {
-        let mut page: Vec<BrokerOrder> = http.get("/v2/orders", &query).await?;
-        let full = page.len() == usize::from(query.limit);
-        if full {
-            let cursor = page
-                .last()
-                .and_then(|order| order.submitted_at.clone())
-                .context("Cannot advance the Alpaca order history cursor without submitted_at")?;
-            ensure!(
-                query.after.as_ref() != Some(&cursor),
-                "Alpaca order pagination did not advance"
-            );
-            query.after = Some(cursor);
-        }
-        result.extend(page.drain(..).filter(|order| {
-            if combo {
-                order.is_combo()
-            } else {
-                instrument.is_none_or(|id| order.symbol == id.symbol.as_str())
+        let page: Vec<BrokerOrder> = http.get("/v2/orders", &query).await?;
+        let next = next_page_id(&page, query.limit, |order| &order.id);
+        let local_end = end.filter(|_| query.after_order_id.is_some());
+        for order in page {
+            // Alpaca forbids time bounds alongside an order ID cursor. Later pages
+            // are ascending, so the first order at the exclusive end closes the window.
+            if let Some(end) = local_end
+                && order.submission_time()? >= end
+            {
+                return Ok(result);
             }
-        }));
-        if !full {
-            return Ok(result);
+            if keep(&order) {
+                result.push(order);
+            }
         }
+        let Some(cursor) = next else {
+            return Ok(result);
+        };
+        seen.check(&cursor, "orders")?;
+        query.after_order_id = Some(cursor);
+        query.after = None;
+        query.until = None;
     }
 }
 
@@ -405,6 +443,7 @@ pub(super) async fn fills(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<FillActivity>> {
+    let mut seen = PageTokens::default();
     let mut query = ActivitiesQuery {
         direction: "asc",
         page_size: 100,
@@ -414,24 +453,14 @@ pub(super) async fn fills(
     };
     let mut result = Vec::new();
     loop {
-        let mut page: Vec<FillActivity> = http.get("/v2/account/activities/FILL", &query).await?;
-        let full = page.len() == usize::from(query.page_size);
-        if full {
-            let cursor = page
-                .last()
-                .context("Missing Alpaca activity page")?
-                .id
-                .clone();
-            ensure!(
-                query.page_token.as_ref() != Some(&cursor),
-                "Alpaca activity pagination did not advance"
-            );
-            query.page_token = Some(cursor);
-        }
-        result.append(&mut page);
-        if !full {
+        let page: Vec<FillActivity> = http.get("/v2/account/activities/FILL", &query).await?;
+        let next = next_page_id(&page, query.page_size, |fill| &fill.id);
+        result.extend(page);
+        let Some(cursor) = next else {
             return Ok(result);
-        }
+        };
+        seen.check(&cursor, "FILL activities")?;
+        query.page_token = Some(cursor);
     }
 }
 
@@ -482,3 +511,6 @@ pub(super) async fn order(
     }
     Ok(Some(order))
 }
+
+#[cfg(test)]
+mod tests;
