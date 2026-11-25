@@ -29,12 +29,11 @@ use tokio::time::timeout;
 use super::{AlpacaExecutionClient, now, reports};
 use crate::{
     option_spread,
-    provider::{instrument_id, load_instrument},
+    provider::{MAX_INSTRUMENT_LOOKUPS, instrument_id, load_instrument, merge_definition},
 };
 
 const ACCOUNT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(6);
 const INSTRUMENT_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_INSTRUMENT_LOOKUPS: usize = 8;
 
 impl AlpacaExecutionClient {
     pub(super) async fn publish_account_instruments(&self) {
@@ -63,39 +62,33 @@ impl AlpacaExecutionClient {
             }
 
             let mut definitions = HashMap::new();
-            let mut missing = Vec::new();
-            for id in singles {
-                if let Some(instrument) = self.core.cache().instrument(&id).cloned() {
-                    definitions.insert(id, instrument);
-                } else {
-                    missing.push(id);
+            let publish = |id, mut definition: InstrumentAny| -> anyhow::Result<InstrumentAny> {
+                if merge_definition(self.core.cache().instrument(&id), &mut definition) {
+                    sender
+                        .send(DataEvent::Data(definition.clone().into()))
+                        .context("Publishing Alpaca account instrument")?;
                 }
-            }
+                Ok(definition)
+            };
 
-            let mut lookups = stream::iter(missing)
-                .map(|id| async move { (id, load_instrument(&self.http, id, ts_init).await) })
+            let mut lookups = stream::iter(singles)
+                .map(|id| async move { (id, load_instrument(&self.http, id, now()).await) })
                 .buffer_unordered(MAX_INSTRUMENT_LOOKUPS);
             while let Some((id, result)) = lookups.next().await {
                 match result {
                     Ok(instrument) => {
-                        sender
-                            .send(DataEvent::Data(instrument.clone().into()))
-                            .context("Publishing Alpaca account instrument")?;
-                        definitions.insert(id, instrument);
+                        definitions.insert(id, publish(id, instrument)?);
                     }
                     Err(e) => log::warn!("Cannot load Alpaca account instrument {id}: {e:#}"),
                 }
             }
 
             for (id, legs) in spreads {
-                if self.core.cache().instrument(&id).is_some() {
-                    continue;
-                }
                 let legs: Vec<_> = legs.iter().filter_map(|leg| definitions.get(leg)).collect();
                 match option_spread::definition(id, &legs, ts_init) {
-                    Ok(spread) => sender
-                        .send(DataEvent::Data(InstrumentAny::from(spread).into()))
-                        .context("Publishing Alpaca account spread")?,
+                    Ok(spread) => {
+                        publish(id, spread.into())?;
+                    }
                     Err(e) => log::warn!("Cannot build Alpaca account spread {id}: {e:#}"),
                 }
             }

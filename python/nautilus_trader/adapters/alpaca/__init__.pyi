@@ -40,6 +40,8 @@ class AlpacaDataClientConfig:
     @property
     def load_option_symbols(self) -> list[str]: ...
     @property
+    def update_instruments_interval_mins(self) -> int: ...
+    @property
     def base_url_http(self) -> str | None: ...
     @property
     def base_url_http_trading(self) -> str | None: ...
@@ -64,6 +66,7 @@ class AlpacaDataClientConfig:
         base_url_ws_public: str | None = None,
         proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
+        update_instruments_interval_mins: int | None = None,
     ) -> None: ...
 
 @typing.final

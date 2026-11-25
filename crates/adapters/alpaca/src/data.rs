@@ -15,9 +15,19 @@
 
 //! Native Alpaca equity and options data client.
 
-use std::{future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
+mod definitions;
+#[cfg(test)]
+mod tests;
+
+use std::{
+    future::Future,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, ensure};
+use definitions::{DefinitionRefresh, DefinitionStore, RefreshScope};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use jiff::Timestamp;
 use nautilus_common::{
@@ -29,8 +39,8 @@ use nautilus_common::{
             BarsResponse, DataRequestFailed, DataResponse, InstrumentResponse, InstrumentsResponse,
             QuotesResponse, RequestBars, RequestInstrument, RequestInstruments, RequestQuotes,
             RequestTrades, SubscribeBars, SubscribeInstrument, SubscribeInstruments,
-            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeQuotes,
-            UnsubscribeTrades,
+            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeInstrument, UnsubscribeInstruments, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -42,7 +52,7 @@ use nautilus_live::task::TaskGroup;
 use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
 use nautilus_network::websocket::WebSocketClient;
 use serde::de::DeserializeOwned;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::{
     common::ALPACA,
@@ -53,9 +63,9 @@ use crate::{
         timeframe,
     },
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
-    option_provider::{is_option_symbol, load_option_chain, load_option_contract},
+    option_provider::{is_option_symbol, load_option_chain},
     option_spread,
-    provider::{instrument_id, load_assets, load_instrument, load_selected_assets},
+    provider::{load_equities, load_instrument},
 };
 
 /// Native Alpaca quotes, trades, equity bars and instrument definitions.
@@ -67,6 +77,8 @@ pub struct AlpacaDataClient {
     market: AlpacaHttpClient,
     sender: EventSender<DataEvent>,
     tasks: TaskGroup,
+    definitions: Arc<Mutex<DefinitionStore>>,
+    configured: RefreshScope,
     sockets: Vec<Arc<WebSocketClient>>,
     subscriptions: watch::Sender<StockSubscriptions>,
     option_subscriptions: watch::Sender<StockSubscriptions>,
@@ -94,6 +106,8 @@ impl AlpacaDataClient {
             market,
             sender: get_data_event_sender(),
             tasks: TaskGroup::new(),
+            definitions: Arc::default(),
+            configured: RefreshScope::configured(config)?,
             sockets: Vec::new(),
             subscriptions: watch::channel(StockSubscriptions::default()).0,
             option_subscriptions: watch::channel(StockSubscriptions::default()).0,
@@ -139,13 +153,50 @@ impl AlpacaDataClient {
         Ok(())
     }
 
+    fn refresh(&self) -> DefinitionRefresh {
+        DefinitionRefresh {
+            book: self.definitions.clone(),
+            http: self.trading.clone(),
+            sender: self.sender.clone(),
+            cancel: self.tasks.cancellation_token(),
+        }
+    }
+
+    fn deliver_subscription(&self, scope: RefreshScope) -> anyhow::Result<()> {
+        let refresh = self.refresh();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                () = refresh.cancel.cancelled() => {},
+                result = refresh.fetch(scope, true) => {
+                    if let Err(e) = result { log::error!("Subscribing to Alpaca definitions: {e:#}"); }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
     fn spawn_request<F>(&self, request_id: UUID4, fut: F) -> anyhow::Result<()>
     where
         F: Future<Output = anyhow::Result<DataResponse>> + Send + 'static,
     {
         let sender = self.sender.clone();
+        let book = self.definitions.clone();
+        let cancel = self.tasks.cancellation_token();
         self.tasks.spawn(async move {
-            let event = match fut.await {
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                result = fut => result,
+            };
+            let mut book = book.lock().unwrap();
+            if cancel.is_cancelled() {
+                return;
+            }
+            let event = match result.and_then(|mut response| {
+                book.apply_response(&mut response, &sender)?;
+                Ok(response)
+            }) {
                 Ok(response) => DataEvent::Response(response),
                 Err(error) => DataEvent::RequestFailed(DataRequestFailed {
                     request_id,
@@ -210,12 +261,15 @@ impl DataClient for AlpacaDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        // Order cancellation with the final freshness check and event delivery.
+        let _book = self.definitions.lock().unwrap();
         self.tasks.begin_shutdown();
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.stop()?;
+        *self.definitions.lock().unwrap() = DefinitionStore::default();
         self.subscriptions
             .send_replace(StockSubscriptions::default());
         self.option_subscriptions
@@ -246,28 +300,14 @@ impl DataClient for AlpacaDataClient {
             self.tasks.start_generation()?;
         }
 
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let assets = load_selected_assets(&self.trading, &self.config.load_symbols)
-            .await
-            .inspect_err(|error| {
-                log::error!("Loading Alpaca equity definitions: {error:#}");
-            })?;
-        for asset in assets {
-            self.sender
-                .send(DataEvent::Data(asset.instrument(ts_init)?.into()))
-                .context("Publishing Alpaca equity definition")?;
-        }
-        for symbol in &self.config.load_option_symbols {
-            let id = instrument_id(symbol)?;
-            let instrument = if option_spread::is_spread(id) {
-                option_spread::load(&self.trading, id, ts_init).await?
-            } else {
-                load_option_contract(&self.trading, id, ts_init).await?
-            };
-            self.sender
-                .send(DataEvent::Data(instrument.into()))
-                .context("Publishing Alpaca option definition")?;
-        }
+        let refresh = self.refresh();
+        let market = [
+            self.subscriptions.subscribe(),
+            self.option_subscriptions.subscribe(),
+        ];
+        refresh
+            .fetch(refresh.scope(&self.configured, &market), false)
+            .await?;
 
         let market_credentials = self.config.market_credentials()?;
         let ws_origin = self.config.market_ws_origin().trim_end_matches('/');
@@ -327,6 +367,7 @@ impl DataClient for AlpacaDataClient {
             None
         };
 
+        let reconnect = Arc::new(Notify::new());
         for (stream, subscriptions) in [
             (Some(main), &self.subscriptions),
             (overnight, &self.subscriptions),
@@ -338,8 +379,16 @@ impl DataClient for AlpacaDataClient {
                 subscriptions.subscribe(),
                 self.sender.clone(),
                 self.tasks.cancellation_token(),
+                reconnect.clone(),
             ))?;
         }
+        let period = Duration::from_secs(
+            self.config
+                .update_instruments_interval_mins
+                .saturating_mul(60),
+        );
+        self.tasks
+            .spawn(refresh.run(self.configured.clone(), market, reconnect, period))?;
         Ok(())
     }
 
@@ -355,42 +404,45 @@ impl DataClient for AlpacaDataClient {
     }
 
     fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
-        let http = self.trading.clone();
-        let sender = self.sender.clone();
-        self.tasks.spawn(async move {
-            let result = async {
-                let ts_init = get_atomic_clock_realtime().get_time_ns();
-                for asset in load_assets(&http).await? {
-                    sender.send(DataEvent::Data(asset.instrument(ts_init)?.into()))?;
-                }
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = result {
-                log::error!("Subscribing to Alpaca stock definitions: {error:#}");
-            }
-        })?;
-        Ok(())
+        ensure!(self.tasks.is_open(), "Alpaca data client is stopped");
+        let mut book = self.definitions.lock().unwrap();
+        if std::mem::replace(&mut book.subscriptions.all_equities, true) {
+            return Ok(());
+        }
+        drop(book);
+        self.deliver_subscription(RefreshScope {
+            all_equities: true,
+            ..RefreshScope::default()
+        })
     }
 
     fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
         validate_instruments(&cmd.instrument_ids)?;
-        let http = self.trading.clone();
-        let sender = self.sender.clone();
-        self.tasks.spawn(async move {
-            let result = async {
-                let ts_init = get_atomic_clock_realtime().get_time_ns();
-                for id in cmd.instrument_ids {
-                    let instrument = load_instrument(&http, id, ts_init).await?;
-                    sender.send(DataEvent::Data(instrument.into()))?;
-                }
-                Ok::<(), anyhow::Error>(())
+        ensure!(self.tasks.is_open(), "Alpaca data client is stopped");
+        let mut scope = RefreshScope::default();
+        let mut book = self.definitions.lock().unwrap();
+        for id in cmd.instrument_ids {
+            if book.subscriptions.ids.insert(id) && !book.deliver_current(id, &self.sender)? {
+                scope.ids.insert(id);
             }
-            .await;
-            if let Err(error) = result {
-                log::error!("Subscribing to Alpaca instrument definition: {error:#}");
-            }
-        })?;
+        }
+        drop(book);
+        if !scope.ids.is_empty() {
+            self.deliver_subscription(scope)?;
+        }
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        let mut book = self.definitions.lock().unwrap();
+        for id in &cmd.instrument_ids {
+            book.subscriptions.ids.remove(id);
+        }
+        Ok(())
+    }
+
+    fn unsubscribe_instruments(&mut self, _cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
+        self.definitions.lock().unwrap().subscriptions.all_equities = false;
         Ok(())
     }
 
@@ -459,11 +511,7 @@ impl DataClient for AlpacaDataClient {
                     )
                     .await?
                 }
-                _ => load_assets(&http)
-                    .await?
-                    .iter()
-                    .map(|asset| asset.instrument(ts_init))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
+                _ => load_equities(&http, ts_init).await?,
             };
             Ok(DataResponse::Instruments(InstrumentsResponse::new(
                 request.request_id,

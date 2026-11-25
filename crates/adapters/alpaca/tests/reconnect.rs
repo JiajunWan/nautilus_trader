@@ -19,7 +19,10 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -64,7 +67,7 @@ const TS: &str = "2026-11-18T16:00:00Z";
 #[case::open_orders_and_positions(true)]
 #[case::unavailable_open_orders(false)]
 #[tokio::test]
-async fn publishes_uncached_account_instruments_during_connect(#[case] orders_available: bool) {
+async fn refreshes_account_instruments_during_connect(#[case] orders_available: bool) {
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = AlpacaExecutionClientConfig::builder()
@@ -74,6 +77,8 @@ async fn publishes_uncached_account_instruments_during_connect(#[case] orders_av
         .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
         .build();
     let (requests, mut requested) = mpsc::unbounded_channel();
+    let changed = Arc::new(AtomicBool::new(false));
+    let broker_changed = changed.clone();
     let app = Router::new()
         .route("/v2/account", get(|| async {
             Json(json!({"account_number":"TEST","currency":"USD","cash":"10000"}))
@@ -96,11 +101,12 @@ async fn publishes_uncached_account_instruments_during_connect(#[case] orders_av
         }))
         .route("/v2/assets/{symbol}", get(async move |axum::extract::Path(symbol): axum::extract::Path<String>| {
             requests.send(symbol.clone()).unwrap();
+            let exchange = if symbol == "SPY" && broker_changed.load(Ordering::Relaxed) { "ARCA" } else { "NYSE" };
             if symbol == "MISSING" {
                 return Err(StatusCode::NOT_FOUND);
             }
             Ok(Json(json!({
-                "symbol":symbol,"class":"us_equity","exchange":"NYSE",
+                "symbol":symbol,"class":"us_equity","exchange":exchange,
                 "status":"active","tradable":true,"fractionable":true
             })))
         }));
@@ -138,6 +144,7 @@ async fn publishes_uncached_account_instruments_during_connect(#[case] orders_av
     while let Ok(DataEvent::Data(Data::Instrument(instrument))) = data.try_recv() {
         assert!(cache.borrow().instrument(&instrument.id()).is_none());
         symbols.push(instrument.id().symbol.to_string());
+        cache.borrow_mut().add_instrument(*instrument).unwrap();
     }
     symbols.sort_unstable();
     if orders_available {
@@ -147,6 +154,23 @@ async fn publishes_uncached_account_instruments_during_connect(#[case] orders_av
         assert_eq!(lookups, ["MISSING", "SPY"]);
         assert_eq!(symbols, ["SPY"]);
     }
+    client.disconnect().await.unwrap();
+    changed.store(true, Ordering::Relaxed);
+    let (connected, _socket) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client.connect(), accept_private(&ws))
+    })
+    .await
+    .unwrap();
+    connected.unwrap();
+    let mut refreshed: Vec<_> = std::iter::from_fn(|| requested.try_recv().ok()).collect();
+    refreshed.sort_unstable();
+    assert_eq!(refreshed, lookups);
+    let Ok(DataEvent::Data(Data::Instrument(updated))) = data.try_recv() else {
+        panic!("missing updated SPY definition")
+    };
+    assert_eq!(updated.id(), InstrumentId::from("SPY.ALPACA"));
+    assert_eq!(updated.info().unwrap().get_str("exchange"), Some("ARCA"));
+    assert!(data.try_recv().is_err());
     client.disconnect().await.unwrap();
     server.abort();
 }

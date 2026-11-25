@@ -31,6 +31,7 @@ nautilus_core::impl_pyo3_config_getters!(AlpacaDataClientConfig {
     option_feed: Option<AlpacaOptionFeed>,
     load_symbols: Vec<String>,
     load_option_symbols: Vec<String>,
+    update_instruments_interval_mins: u64,
     base_url_http: Option<String>,
     base_url_http_trading: Option<String>,
     base_url_ws_public: Option<String>,
@@ -68,6 +69,7 @@ impl AlpacaDataClientConfig {
         base_url_ws_public = None,
         proxy_url = None,
         http_timeout_secs = None,
+        update_instruments_interval_mins = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -86,6 +88,7 @@ impl AlpacaDataClientConfig {
         base_url_ws_public: Option<String>,
         proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
+        update_instruments_interval_mins: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -99,6 +102,8 @@ impl AlpacaDataClientConfig {
             option_feed,
             load_symbols: load_symbols.unwrap_or(defaults.load_symbols),
             load_option_symbols: load_option_symbols.unwrap_or(defaults.load_option_symbols),
+            update_instruments_interval_mins: update_instruments_interval_mins
+                .unwrap_or(defaults.update_instruments_interval_mins),
             base_url_http,
             base_url_http_trading,
             base_url_ws_public,

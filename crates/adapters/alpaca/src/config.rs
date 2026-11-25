@@ -52,6 +52,9 @@ pub struct AlpacaDataClientConfig {
     /// Exact option contract symbols to load at startup.
     #[builder(default)]
     pub load_option_symbols: Vec<String>,
+    /// Minutes between instrument definition refreshes. Zero disables periodic polling.
+    #[builder(default = 60)]
+    pub update_instruments_interval_mins: u64,
     /// Daytime market data feed.
     #[builder(default)]
     pub stock_feed: AlpacaStockFeed,

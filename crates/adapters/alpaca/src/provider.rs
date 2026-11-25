@@ -19,7 +19,7 @@ use anyhow::{Context, ensure};
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     identifiers::{InstrumentId, Symbol},
-    instruments::{Equity, InstrumentAny},
+    instruments::{Equity, Instrument, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
 use serde::Deserialize;
@@ -31,6 +31,8 @@ use crate::{
     option_provider::{is_option_symbol, load_option_contract},
     option_spread,
 };
+
+pub(crate) const MAX_INSTRUMENT_LOOKUPS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AlpacaAsset {
@@ -78,6 +80,18 @@ pub(crate) fn instrument_id(symbol: &str) -> anyhow::Result<InstrumentId> {
     Ok(InstrumentId::new(Symbol::new_checked(symbol)?, *ALPACA))
 }
 
+/// Selects the current definition at application time and reports a material change.
+pub(crate) fn merge_definition(
+    previous: Option<&InstrumentAny>,
+    incoming: &mut InstrumentAny,
+) -> bool {
+    if let Some(newer) = previous.filter(|old| old.ts_init() > incoming.ts_init()) {
+        incoming.clone_from(newer);
+        return false;
+    }
+    previous.is_none_or(|old| !old.same_definition(incoming))
+}
+
 pub(crate) async fn load_instrument(
     http: &AlpacaHttpClient,
     id: InstrumentId,
@@ -115,24 +129,18 @@ pub(crate) async fn load_asset(
     Ok(asset)
 }
 
-pub(crate) async fn load_selected_assets(
+pub(crate) async fn load_equities(
     http: &AlpacaHttpClient,
-    symbols: &[String],
-) -> anyhow::Result<Vec<AlpacaAsset>> {
-    if symbols.is_empty() {
-        return load_assets(http).await;
-    }
-    let ids = symbols
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<InstrumentAny>> {
+    let assets: Vec<AlpacaAsset> = http
+        .get(
+            "/v2/assets",
+            &[("status", "active"), ("asset_class", "us_equity")],
+        )
+        .await?;
+    assets
         .iter()
-        .map(|symbol| instrument_id(symbol))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    futures_util::future::try_join_all(ids.into_iter().map(|id| load_asset(http, id))).await
-}
-
-pub(crate) async fn load_assets(http: &AlpacaHttpClient) -> anyhow::Result<Vec<AlpacaAsset>> {
-    http.get(
-        "/v2/assets",
-        &[("status", "active"), ("asset_class", "us_equity")],
-    )
-    .await
+        .map(|asset| asset.instrument(ts_init))
+        .collect()
 }

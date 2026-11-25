@@ -36,7 +36,7 @@ use option_wire::OptionMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     time::{Instant, sleep},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -93,6 +93,10 @@ impl StockSubscriptions {
 
     fn sets(&self) -> [&BTreeSet<Symbol>; 3] {
         [&self.quotes, &self.trades, &self.bars]
+    }
+
+    pub(crate) fn symbols(&self) -> impl Iterator<Item = &Symbol> {
+        self.sets().into_iter().flatten()
     }
 
     fn sets_mut(&mut self) -> [&mut BTreeSet<Symbol>; 3] {
@@ -416,8 +420,11 @@ impl StockStream {
         mut subscriptions: watch::Receiver<StockSubscriptions>,
         sender: EventSender<DataEvent>,
         cancel: CancellationToken,
+        refresh: Arc<Notify>,
     ) {
-        let result = self.run_session(&mut subscriptions, &sender, cancel).await;
+        let result = self
+            .run_session(&mut subscriptions, &sender, cancel, refresh)
+            .await;
         if let Err(error) = result {
             log::error!("Alpaca {} stream stopped: {error:#}", self.feed);
         }
@@ -429,6 +436,7 @@ impl StockStream {
         subscriptions: &mut watch::Receiver<StockSubscriptions>,
         sender: &EventSender<DataEvent>,
         cancel: CancellationToken,
+        refresh: Arc<Notify>,
     ) -> anyhow::Result<()> {
         let mut state = FeedSubscriptions {
             desired: subscriptions.borrow_and_update().clone(),
@@ -473,6 +481,7 @@ impl StockStream {
                         self.authenticate(message_epoch).await?;
                         self.authenticated_epoch = message_epoch;
                         state.reconnect(subscriptions.borrow_and_update().clone());
+                        refresh.notify_one();
                         synchronize = true;
                     } else if message_epoch == self.authenticated_epoch {
                         let response = match self.format {
@@ -761,7 +770,12 @@ mod tests {
         let (subscriptions, desired) = watch::channel(StockSubscriptions::default());
         let (data_tx, mut events) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(stream.unwrap().run(desired, data_tx.into(), cancel.clone()));
+        let task = tokio::spawn(stream.unwrap().run(
+            desired,
+            data_tx.into(),
+            cancel.clone(),
+            Arc::default(),
+        ));
         let change = |symbol, add| {
             subscriptions.send_modify(|desired| {
                 assert!(desired.change(StockChannel::Quotes, [Symbol::from(symbol)], add));

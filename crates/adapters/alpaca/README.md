@@ -24,12 +24,34 @@ requests can set `params["feed"]` to `"sip"`, `"iex"` or `"boats"`.
 External live bars use one-minute LAST aggregation. Historical bars retain the
 Alpaca opening timestamp as `ts_event` and use the bar-window close for
 `ts_init`. Historical quotes and trades use the event timestamp for both fields.
-`load_symbols` restricts startup instrument discovery to the given stocks.
 
 Market data credentials default to the trading environment's credentials.
 Set `market_data_api_key` and `market_data_api_secret` together when the
 data entitlement is held by a different Alpaca account. This leaves order
 routing and instrument discovery in the configured trading environment.
+
+### Instrument definition refresh
+
+The data client reads definitions from the Trading API at startup, after a
+market data connection reauthenticates, and every 60 minutes. Set
+`update_instruments_interval_mins` to change the interval. Zero disables
+the timer and leaves reconnect and explicit refreshes active.
+
+An empty `load_symbols` discovers all active US equities on each refresh.
+Otherwise the client fetches the configured stocks by ID, along with
+`load_option_symbols` and instruments with active definition, quote, trade
+or bar subscriptions. Removing the last subscription drops the ID from future
+refreshes unless configuration still includes it. An execution-only node reads
+definitions for its positions and open orders during startup reconciliation.
+
+For each instrument, the latest REST request start time wins. An unchanged
+definition advances that time without sending another update. A first definition
+subscription receives the current definition. An unbounded instrument request
+publishes changes before returning the current definitions to its caller.
+A request with a Nautilus `start` or `end` returns a separate snapshot.
+Option expiry filters select contracts for that query without adding the chain
+to periodic refreshes. A failed background lookup preserves the previous
+definition. Explicit lookup failures reach the caller through the request error channel.
 
 ### Option market data
 
