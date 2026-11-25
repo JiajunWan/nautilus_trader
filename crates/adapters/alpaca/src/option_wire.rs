@@ -58,7 +58,6 @@ pub(super) struct OptionMessage<'a> {
     exchange: Option<&'a str>,
     #[serde(rename = "c")]
     condition: Option<&'a str>,
-    pub(super) msg: Option<&'a str>,
     pub(super) code: Option<u16>,
 }
 

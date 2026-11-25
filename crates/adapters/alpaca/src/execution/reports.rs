@@ -34,7 +34,6 @@ use crate::{http::AlpacaHttpClient, option_provider::is_option_symbol, provider:
 
 #[derive(Debug, Deserialize)]
 pub(super) struct Account {
-    pub account_number: String,
     currency: String,
     cash: Decimal,
 }

@@ -164,3 +164,41 @@ impl AlpacaExecutionClientConfig {
         stringify!(AlpacaExecutionClientConfig)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pyo3::{prelude::*, types::PyDict};
+
+    use super::*;
+
+    #[test]
+    fn python_repr_omits_credentials_and_urls() {
+        Python::initialize();
+        Python::attach(|py| {
+            for (class, name, endpoint) in [
+                (
+                    py.get_type::<AlpacaDataClientConfig>(),
+                    "AlpacaDataClientConfig",
+                    "base_url_ws_public",
+                ),
+                (
+                    py.get_type::<AlpacaExecutionClientConfig>(),
+                    "AlpacaExecutionClientConfig",
+                    "base_url_ws_private",
+                ),
+            ] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("api_key", "fixture-key")?;
+                kwargs.set_item("api_secret", "fixture-secret")?;
+                kwargs.set_item(
+                    endpoint,
+                    "wss://fixture-user:fixture-password@fixture-host/token",
+                )?;
+                let config = class.call((), Some(&kwargs))?;
+                assert_eq!(config.repr()?.to_str()?, name);
+            }
+            Ok::<_, PyErr>(())
+        })
+        .unwrap();
+    }
+}

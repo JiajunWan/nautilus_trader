@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::fmt;
+
 use anyhow::Context;
 use jiff::Timestamp;
 use nautilus_core::string::secret::SecretString;
@@ -22,7 +24,7 @@ use nautilus_network::http::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    common::credential::AlpacaCredentials,
+    common::{credential::AlpacaCredentials, with_broker_code},
     config::AlpacaDataClientConfig,
     option_provider::{OptionCatalogEntry, load_option_catalog},
 };
@@ -67,13 +69,20 @@ pub(crate) struct AlpacaApiError {
 #[derive(Deserialize)]
 struct ErrorResponse {
     code: Option<u64>,
-    message: String,
+    message: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct AlpacaHttpClient {
     client: HttpClient,
     base_url: String,
+}
+
+impl fmt::Debug for AlpacaHttpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(AlpacaHttpClient))
+            .finish_non_exhaustive()
+    }
 }
 
 impl AlpacaHttpClient {
@@ -103,6 +112,7 @@ impl AlpacaHttpClient {
             ("Content-Type".to_string(), "application/json".to_string()),
         ]);
         let client = HttpClient::builder()
+            .redact_url(true)
             .headers(headers)
             .header_keys(vec![RATE_LIMIT_RESET.to_owned()])
             .timeout_secs(timeout_secs)
@@ -132,7 +142,7 @@ impl AlpacaHttpClient {
                 None,
             )
             .await?;
-        Self::decode(response)
+        Self::decode(response, &Method::GET)
     }
 
     pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
@@ -140,7 +150,7 @@ impl AlpacaHttpClient {
         path: &str,
         body: &B,
     ) -> anyhow::Result<T> {
-        self.send(Method::POST, path, body).await
+        self.send(&Method::POST, path, body).await
     }
 
     pub(crate) async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -148,7 +158,7 @@ impl AlpacaHttpClient {
         path: &str,
         body: &B,
     ) -> anyhow::Result<T> {
-        self.send(Method::PATCH, path, body).await
+        self.send(&Method::PATCH, path, body).await
     }
 
     pub(crate) async fn delete(&self, path: &str) -> anyhow::Result<()> {
@@ -156,29 +166,37 @@ impl AlpacaHttpClient {
             .client
             .delete(self.url(path), None, None, None, None)
             .await?;
-        Self::check_status(response)?;
+        Self::check_status(response, &Method::DELETE)?;
         Ok(())
     }
 
     async fn send<T: DeserializeOwned, B: Serialize>(
         &self,
-        method: Method,
+        method: &Method,
         path: &str,
         body: &B,
     ) -> anyhow::Result<T> {
         let body = serde_json::to_vec(body)?;
         let response = self
             .client
-            .request(method, self.url(path), None, None, Some(body), None, None)
+            .request(
+                method.clone(),
+                self.url(path),
+                None,
+                None,
+                Some(body),
+                None,
+                None,
+            )
             .await?;
-        Self::decode(response)
+        Self::decode(response, method)
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
 
-    fn check_status(response: HttpResponse) -> anyhow::Result<HttpResponse> {
+    fn check_status(response: HttpResponse, method: &Method) -> anyhow::Result<HttpResponse> {
         if response.status.is_success() {
             return Ok(response);
         }
@@ -193,20 +211,27 @@ impl AlpacaHttpClient {
         } else {
             None
         };
+        let code = details.as_ref().and_then(|error| error.code);
+        // Alpaca also uses 403 for order risk checks (e.g. buying power and available quantity).
+        let order_refusal = method != Method::GET && code == Some(40_310_000);
+        let message = match status {
+            401 | 407 => with_broker_code("authentication rejected", code),
+            403 if !order_refusal => with_broker_code("access forbidden", code),
+            _ => details
+                .and_then(|error| error.message)
+                .unwrap_or_else(|| with_broker_code(&format!("HTTP {status}"), code)),
+        };
         Err(AlpacaApiError {
             status,
+            code,
             rate_limit_reset,
-            code: details.as_ref().and_then(|error| error.code),
-            message: details.map_or_else(
-                || format!("HTTP {}", response.status.as_u16()),
-                |error| error.message,
-            ),
+            message,
         }
         .into())
     }
 
-    fn decode<T: DeserializeOwned>(response: HttpResponse) -> anyhow::Result<T> {
-        let response = Self::check_status(response)?;
+    fn decode<T: DeserializeOwned>(response: HttpResponse, method: &Method) -> anyhow::Result<T> {
+        let response = Self::check_status(response, method)?;
         serde_json::from_slice(&response.body).context("Invalid Alpaca response")
     }
 }
@@ -236,7 +261,7 @@ mod tests {
                 .collect(),
             body: r#"{"code":42910000,"message":"broker message"}"#.into(),
         };
-        let error = AlpacaHttpClient::check_status(response)
+        let error = AlpacaHttpClient::check_status(response, &Method::GET)
             .unwrap_err()
             .downcast::<AlpacaApiError>()
             .unwrap();
@@ -244,5 +269,81 @@ mod tests {
         assert_eq!(error.code, Some(42_910_000));
         assert_eq!(error.message, "broker message");
         assert_eq!(error.rate_limit_reset.map(|t| t.as_second()), expected);
+    }
+
+    #[rstest]
+    #[case(
+        401,
+        Method::POST,
+        Some(40_110_000),
+        "credential-canary",
+        "authentication rejected (code 40110000)"
+    )]
+    #[case(
+        403,
+        Method::GET,
+        Some(40_310_000),
+        "credential-canary",
+        "access forbidden (code 40310000)"
+    )]
+    #[case(403, Method::POST, None, "credential-canary", "access forbidden")]
+    #[case(407, Method::GET, None, "credential-canary", "authentication rejected")]
+    #[case(
+        403,
+        Method::POST,
+        Some(40_310_000),
+        "insufficient buying power",
+        "insufficient buying power"
+    )]
+    #[case(
+        422,
+        Method::PATCH,
+        Some(42_210_000),
+        "invalid limit price",
+        "invalid limit price"
+    )]
+    fn distinguishes_authentication_from_order_errors(
+        #[case] status: u16,
+        #[case] method: Method,
+        #[case] code: Option<u64>,
+        #[case] message: &str,
+        #[case] expected: &str,
+    ) {
+        let response = HttpResponse {
+            status: status.try_into().unwrap(),
+            headers: Default::default(),
+            body: serde_json::json!({"code":code, "message":message})
+                .to_string()
+                .into(),
+        };
+        let err = AlpacaHttpClient::check_status(response, &method).unwrap_err();
+        assert_eq!(err.to_string(), format!("Alpaca HTTP {status}: {expected}"));
+        assert!(!format!("{err:?}").contains("credential-canary"));
+    }
+
+    #[tokio::test]
+    async fn http_transport_and_debug_omit_endpoints_and_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let config = AlpacaDataClientConfig::builder()
+            .api_key("credential-canary-key".into())
+            .api_secret("credential-canary-secret".into())
+            .base_url_http_trading(format!("http://{address}/endpoint-canary"))
+            .build();
+        let http = AlpacaHttpClient::for_trading_data(&config).unwrap();
+        let result = http
+            .get::<serde_json::Value, _>("/probe", &[("token", "query-canary")])
+            .await
+            .unwrap_err();
+        let diagnostic = format!("{http:#?} {result:#} {result:?}");
+        for forbidden in [
+            "credential-canary",
+            "endpoint-canary",
+            "query-canary",
+            &address.to_string(),
+        ] {
+            assert!(!diagnostic.contains(forbidden), "{diagnostic}");
+        }
     }
 }

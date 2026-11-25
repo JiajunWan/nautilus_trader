@@ -43,7 +43,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::credential::AlpacaCredentials,
+    common::{connect_websocket, credential::AlpacaCredentials, with_broker_code},
     market_data::{StockBar, StockQuote, StockTrade},
     provider::instrument_id,
 };
@@ -194,15 +194,13 @@ impl FeedSubscriptions {
         None
     }
 
-    fn handle_response(&mut self, feed: &str, response: SubscriptionResponse<'_>) {
+    fn handle_response(&mut self, feed: &str, response: SubscriptionResponse) {
         let pending = self.pending.take();
         let acknowledged = matches!(response, SubscriptionResponse::Confirmed(_));
         match response {
             SubscriptionResponse::Confirmed(confirmed) => self.confirmed = confirmed,
-            SubscriptionResponse::Rejected { code, message } => {
-                log::warn!(
-                    "Alpaca {feed} subscription request {pending:?} rejected ({code}): {message}"
-                );
+            SubscriptionResponse::Rejected { code } => {
+                log::warn!("Alpaca {feed} subscription request {pending:?} rejected (code {code})");
             }
         }
         let Some(request) = pending else { return };
@@ -232,17 +230,16 @@ impl FeedSubscriptions {
 }
 
 #[derive(Debug)]
-enum SubscriptionResponse<'a> {
+enum SubscriptionResponse {
     Confirmed(StockSubscriptions),
-    Rejected { code: u16, message: &'a str },
+    Rejected { code: u16 },
 }
 
-impl<'a> SubscriptionResponse<'a> {
-    fn from_error(code: Option<u16>, message: Option<&'a str>) -> anyhow::Result<Self> {
-        let message = message.unwrap_or("unknown error");
+impl SubscriptionResponse {
+    fn from_error(code: Option<u16>) -> anyhow::Result<Self> {
         match code {
-            Some(code @ (400 | 405 | 409 | 410)) => Ok(Self::Rejected { code, message }),
-            _ => anyhow::bail!("Alpaca market data stream error (code {code:?}): {message}"),
+            Some(code @ (400 | 405 | 409 | 410)) => Ok(Self::Rejected { code }),
+            _ => anyhow::bail!(with_broker_code("Alpaca market data stream error", code)),
         }
     }
 }
@@ -336,16 +333,12 @@ impl StockStream {
                 vec![("Content-Type".to_owned(), "application/msgpack".to_owned())]
             }
         };
-        let socket = WebSocketClient::epoch_builder()
-            .config(
-                WebSocketConfig::builder()
-                    .url(url)
-                    .headers(headers)
-                    .maybe_proxy_url(proxy_url.map(str::to_owned))
-                    .build()?,
-            )
-            .epoch_handler(handler)
-            .connect()
+        let config = WebSocketConfig::builder()
+            .url(url)
+            .headers(headers)
+            .maybe_proxy_url(proxy_url.map(str::to_owned))
+            .build()?;
+        let socket = connect_websocket(config, handler)
             .await
             .with_context(|| format!("Connecting Alpaca {feed} stream"))?;
         let epoch = socket.connection_epoch();
@@ -379,7 +372,8 @@ impl StockStream {
                     secret: self.credential.secret(),
                 },
             )
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!("Sending Alpaca {} authentication failed", self.feed))?;
 
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some((message_epoch, frame)) = self.input.recv().await {
@@ -393,17 +387,17 @@ impl StockStream {
                     continue;
                 }
                 let headers: Vec<Header<'_>> = match self.format {
-                    WireFormat::Json => serde_json::from_slice(payload)?,
-                    WireFormat::MsgPack => rmp_serde::from_slice(payload)?,
-                };
+                    WireFormat::Json => serde_json::from_slice(payload).ok(),
+                    WireFormat::MsgPack => rmp_serde::from_slice(payload).ok(),
+                }
+                .with_context(|| format!("Invalid Alpaca {} authentication response", self.feed))?;
                 for header in headers {
                     match (header.kind, header.msg) {
                         ("success", Some("authenticated")) => return Ok(()),
                         ("error", _) => anyhow::bail!(
-                            "Alpaca {} stream authentication rejected (code {:?}): {}",
+                            "Alpaca {} stream {}",
                             self.feed,
-                            header.code,
-                            header.msg.unwrap_or("unknown error"),
+                            with_broker_code("authentication rejected", header.code)
                         ),
                         _ => {}
                     }
@@ -526,10 +520,10 @@ fn payload(message: &Message) -> Option<&[u8]> {
     }
 }
 
-fn dispatch<'a>(
-    body: &'a [u8],
+fn dispatch(
+    body: &[u8],
     sender: &EventSender<DataEvent>,
-) -> anyhow::Result<Option<SubscriptionResponse<'a>>> {
+) -> anyhow::Result<Option<SubscriptionResponse>> {
     let mut response = None;
     for message in serde_json::from_slice::<Vec<&RawValue>>(body)? {
         let raw = message.get();
@@ -552,7 +546,7 @@ fn dispatch<'a>(
                     continue;
                 }
                 "error" => {
-                    response = Some(SubscriptionResponse::from_error(header.code, header.msg)?);
+                    response = Some(SubscriptionResponse::from_error(header.code)?);
                     continue;
                 }
                 _ => continue,
@@ -590,10 +584,10 @@ fn dispatch<'a>(
     Ok(response)
 }
 
-fn dispatch_options<'a>(
-    body: &'a [u8],
+fn dispatch_options(
+    body: &[u8],
     sender: &EventSender<DataEvent>,
-) -> anyhow::Result<Option<SubscriptionResponse<'a>>> {
+) -> anyhow::Result<Option<SubscriptionResponse>> {
     for message in rmp_serde::from_slice::<Vec<OptionMessage<'_>>>(body)? {
         match message.kind {
             "subscription" => {
@@ -602,7 +596,7 @@ fn dispatch_options<'a>(
                 return Ok(Some(SubscriptionResponse::Confirmed(confirmed)));
             }
             "error" => {
-                return SubscriptionResponse::from_error(message.code, message.msg).map(Some);
+                return SubscriptionResponse::from_error(message.code).map(Some);
             }
             _ => {}
         }
@@ -678,7 +672,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(r#"{"T":"error","code":500,"msg":"internal error"}"#, "internal error")]
+    #[case(r#"{"T":"error","code":500,"msg":"internal error"}"#, "code 500")]
     #[case(r#"{"T":"q","T":"error"}"#, "duplicate field `T`")]
     #[case(r#"{"T":"b","S":"AAA","S":"BBB"}"#, "duplicate field `S`")]
     #[case(r#"{"T":"t","code":"bad"}"#, "u16")]
@@ -900,5 +894,57 @@ mod tests {
             }
         };
         socket.send(frame).await.unwrap();
+    }
+
+    #[rstest]
+    #[case(WireFormat::Json, "sip", false)]
+    #[case(WireFormat::MsgPack, "opra", false)]
+    #[case(WireFormat::Json, "sip", true)]
+    #[case(WireFormat::MsgPack, "opra", true)]
+    #[tokio::test]
+    async fn authentication_diagnostics_exclude_peer_text(
+        #[case] format: WireFormat,
+        #[case] feed: &'static str,
+        #[case] malformed: bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/endpoint-canary", listener.local_addr().unwrap());
+        let credentials = AlpacaCredentials::resolve(
+            AlpacaEnvironment::Paper,
+            Some(&"fixture-key".into()),
+            Some(&"fixture-secret".into()),
+        )
+        .unwrap();
+        let server = async {
+            let mut socket = accept_async(listener.accept().await.unwrap().0)
+                .await
+                .unwrap();
+            let auth = receive_market(&mut socket, format).await;
+            assert_eq!(auth["action"], "auth");
+            let code = if malformed {
+                json!("peer-canary")
+            } else {
+                json!(402)
+            };
+            send_market(
+                &mut socket,
+                format,
+                json!([{"T":"error","code":code,"msg":"peer-canary"}]),
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(
+            StockStream::connect_with_format(url, feed, credentials, None, format),
+            server
+        );
+        let error = result.unwrap_err();
+        let diagnostic = format!("{error:#} {error:?}");
+        assert!(diagnostic.contains(feed));
+        assert!(diagnostic.contains(if malformed {
+            "authentication response"
+        } else {
+            "code 402"
+        }));
+        assert!(!diagnostic.contains("canary"));
     }
 }

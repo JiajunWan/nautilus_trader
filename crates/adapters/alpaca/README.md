@@ -14,6 +14,11 @@ enum from `nautilus_trader.adapters.alpaca`. Python uses
 | Paper | `ALPACA_PAPER_API_KEY` | `ALPACA_PAPER_API_SECRET` |
 | Live | `ALPACA_LIVE_API_KEY` | `ALPACA_LIVE_API_SECRET` |
 
+Diagnostic output omits API credentials and custom HTTP, WebSocket and proxy URLs.
+Connection and authentication errors report the failing operation and the available
+status or broker code. Order rejections retain the broker's business reason, including
+invalid prices, insufficient quantity and buying power.
+
 ## Market data
 
 Choose `AlpacaStockFeed::Sip` (default) or `Iex`. SIP covers pre-market,

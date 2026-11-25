@@ -27,6 +27,7 @@ mod updates;
 
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -87,7 +88,7 @@ use self::{
     updates::{OrderState, TradeUpdate},
 };
 use crate::{
-    common::{ALPACA, credential::AlpacaCredentials},
+    common::{ALPACA, connect_websocket, credential::AlpacaCredentials},
     config::AlpacaExecutionClientConfig,
     http::{AlpacaApiError, AlpacaHttpClient},
     option_provider::is_option_symbol,
@@ -99,7 +100,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 type StreamReceiver = mpsc::UnboundedReceiver<(u64, Message)>;
 
 /// Native Alpaca execution client.
-#[derive(Debug)]
 pub struct AlpacaExecutionClient {
     core: ExecutionClientCore,
     credentials: AlpacaCredentials,
@@ -111,6 +111,14 @@ pub struct AlpacaExecutionClient {
     ready_epoch: Arc<AtomicU64>,
     orders: Arc<Mutex<OrderState>>,
     tasks: TaskGroup,
+}
+
+impl fmt::Debug for AlpacaExecutionClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(AlpacaExecutionClient))
+            .field("client_id", &self.core.client_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AlpacaExecutionClient {
@@ -431,13 +439,14 @@ impl ExecutionClient for AlpacaExecutionClient {
             .heartbeat_interval_secs(30)
             .build()?;
         let socket = Arc::new(
-            WebSocketClient::epoch_builder()
-                .config(config)
-                .epoch_handler(Arc::new(move |epoch, frame| {
+            connect_websocket(
+                config,
+                Arc::new(move |epoch, frame| {
                     let _ = tx.send((epoch, frame));
-                }))
-                .connect()
-                .await?,
+                }),
+            )
+            .await
+            .context("Connecting Alpaca private stream")?,
         );
         let epoch = socket.connection_epoch();
         if let Err(error) = authenticate(&socket, &mut rx, &self.credentials, epoch).await {
@@ -470,7 +479,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             socket.disconnect().await;
             return Err(error);
         }
-        log::info!("Connected Alpaca account {}", account.account_number);
+        log::info!("Connected Alpaca execution client {}", self.core.client_id);
         self.socket = Some(socket);
         self.core.set_connected();
         Ok(())
@@ -1020,7 +1029,8 @@ async fn authenticate(
         let auth = json!({"action":"auth","key":credentials.key(),"secret":credentials.secret()});
         socket
             .send_text_on_connection(auth.to_string(), None, epoch)
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!("Sending Alpaca private authentication failed"))?;
         match receive_handshake(rx, epoch).await? {
             PrivateMessage::Authorization { status } if status == "authorized" => {}
             _ => anyhow::bail!("Alpaca private WebSocket rejected authentication"),
@@ -1029,7 +1039,8 @@ async fn authenticate(
         let listen = json!({"action":"listen","data":{"streams":["trade_updates"]}});
         socket
             .send_text_on_connection(listen.to_string(), None, epoch)
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!("Sending Alpaca private listen request failed"))?;
         match receive_handshake(rx, epoch).await? {
             PrivateMessage::Listening { streams }
                 if streams.iter().any(|stream| stream == "trade_updates") =>
@@ -1055,7 +1066,8 @@ async fn receive_handshake(rx: &mut StreamReceiver, epoch: u64) -> anyhow::Resul
             frame_epoch == epoch,
             "Alpaca private WebSocket changed during handshake"
         );
-        return Ok(serde_json::from_slice(frame.as_bytes())?);
+        return serde_json::from_slice(frame.as_bytes())
+            .map_err(|_| anyhow::anyhow!("Invalid Alpaca private handshake response"));
     }
     anyhow::bail!("Alpaca private WebSocket closed during handshake")
 }
@@ -1180,10 +1192,13 @@ impl StreamTask {
                         log::error!("Invalid Alpaca trade update: {error:#}");
                     }
                 }
-                Ok(message) => {
-                    log::warn!("Unexpected Alpaca private WebSocket message: {message:?}");
+                Ok(_) => {
+                    log::warn!("Unexpected Alpaca private WebSocket control message");
                 }
-                Err(error) => log::error!("Invalid Alpaca private WebSocket frame: {error}"),
+                Err(error) => log::error!(
+                    "Invalid Alpaca private WebSocket frame: {:?}",
+                    error.classify()
+                ),
             }
         }
     }

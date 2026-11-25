@@ -17,9 +17,10 @@ pub(crate) mod credential;
 pub mod enums;
 pub(crate) mod urls;
 
-use std::sync::LazyLock;
+use std::{fmt::Display, sync::LazyLock};
 
 use nautilus_model::identifiers::{ClientId, Venue};
+use nautilus_network::websocket::{EpochMessageHandler, WebSocketClient, WebSocketConfig};
 
 /// Alpaca client and venue name.
 pub const ALPACA_NAME: &str = "ALPACA";
@@ -31,3 +32,42 @@ pub static ALPACA_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(ALPACA_NA
 pub static ALPACA_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::from(ALPACA_NAME));
 
 pub use ALPACA_VENUE as ALPACA;
+
+/// Discard the raw transport error before it can become part of a diagnostic chain.
+pub(crate) async fn connect_websocket(
+    config: WebSocketConfig,
+    handler: EpochMessageHandler,
+) -> anyhow::Result<WebSocketClient> {
+    WebSocketClient::epoch_builder()
+        .config(config)
+        .epoch_handler(handler)
+        .connect()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.redacted_message()))
+}
+
+/// Formats a local diagnostic with the broker's numeric code when available.
+pub(crate) fn with_broker_code(summary: &str, code: Option<impl Display>) -> String {
+    match code {
+        Some(code) => format!("{summary} (code {code})"),
+        None => summary.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initial_connection_error_keeps_only_the_transport_category() {
+        let config = WebSocketConfig::builder()
+            .url("invalid-scheme://canary-host/canary-path?canary-query".into())
+            .build()
+            .unwrap();
+        let error = connect_websocket(config, std::sync::Arc::new(|_, _| {}))
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#} {error:?}").contains("canary"));
+        assert_eq!(error.chain().count(), 1);
+    }
+}

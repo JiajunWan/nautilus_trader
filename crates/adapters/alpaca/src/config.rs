@@ -13,7 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::string::secret::SecretString;
+use std::fmt;
+
+use nautilus_core::string::secret::{SecretString, redact_option};
 use nautilus_model::{enums::AccountType, identifiers::AccountId};
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +26,7 @@ use crate::common::{
 };
 
 /// Configuration for Alpaca stock and options market data and instrument discovery.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -75,6 +77,32 @@ pub struct AlpacaDataClientConfig {
     pub http_timeout_secs: u64,
 }
 
+impl fmt::Debug for AlpacaDataClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(AlpacaDataClientConfig))
+            .field("environment", &self.environment)
+            .field("stock_feed", &self.stock_feed)
+            .field("overnight_feed", &self.overnight_feed)
+            .field("option_feed", &self.option_feed)
+            .field(
+                "update_instruments_interval_mins",
+                &self.update_instruments_interval_mins,
+            )
+            .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("base_url_http", &redact_option(self.base_url_http.as_ref()))
+            .field(
+                "base_url_http_trading",
+                &redact_option(self.base_url_http_trading.as_ref()),
+            )
+            .field(
+                "base_url_ws_public",
+                &redact_option(self.base_url_ws_public.as_ref()),
+            )
+            .field("proxy_url", &redact_option(self.proxy_url.as_ref()))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for AlpacaDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -123,7 +151,7 @@ impl AlpacaDataClientConfig {
 }
 
 /// Configuration for Alpaca stock order execution.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -156,6 +184,22 @@ pub struct AlpacaExecutionClientConfig {
     /// HTTP request timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
+}
+
+impl fmt::Debug for AlpacaExecutionClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(AlpacaExecutionClientConfig))
+            .field("environment", &self.environment)
+            .field("account_type", &self.account_type)
+            .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("base_url_http", &redact_option(self.base_url_http.as_ref()))
+            .field(
+                "base_url_ws_private",
+                &redact_option(self.base_url_ws_private.as_ref()),
+            )
+            .field("proxy_url", &redact_option(self.proxy_url.as_ref()))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AlpacaExecutionClientConfig {
@@ -228,6 +272,33 @@ mod tests {
         assert_eq!(config.environment, AlpacaEnvironment::Paper);
         assert_eq!(config.credentials().unwrap().key(), "fixture-key");
         assert!(!format!("{config:?}").contains("fixture-secret"));
+    }
+
+    #[rstest]
+    fn configuration_debug_hides_custom_endpoints_and_credentials() {
+        let url = "https://canary-user:canary-password@canary-host/path?canary-query";
+        let data = AlpacaDataClientConfig::builder()
+            .api_key("canary-key".into())
+            .api_secret("canary-secret".into())
+            .market_data_api_key("canary-market-key".into())
+            .market_data_api_secret("canary-market-secret".into())
+            .base_url_http(url.into())
+            .base_url_http_trading(url.into())
+            .base_url_ws_public(url.into())
+            .proxy_url(url.into())
+            .build();
+        let execution = AlpacaExecutionClientConfig::builder()
+            .api_key("canary-key".into())
+            .api_secret("canary-secret".into())
+            .base_url_http(url.into())
+            .base_url_ws_private(url.into())
+            .proxy_url(url.into())
+            .build();
+        for diagnostic in [format!("{data:#?}"), format!("{execution:#?}")] {
+            assert!(!diagnostic.contains("canary"));
+            assert!(diagnostic.contains("Paper"));
+            assert!(diagnostic.contains("<redacted>"));
+        }
     }
 
     #[rstest]
