@@ -134,6 +134,13 @@ impl TradingDay {
 }
 
 pub(super) async fn regular_session(client: &HttpClient) -> Result<Range<Timestamp>> {
+    regular_session_with_margin(client, 150).await
+}
+
+pub(super) async fn regular_session_with_margin(
+    client: &HttpClient,
+    margin_secs: i64,
+) -> Result<Range<Timestamp>> {
     #[derive(Deserialize)]
     struct Clock {
         is_open: bool,
@@ -147,8 +154,9 @@ pub(super) async fn regular_session(client: &HttpClient) -> Result<Range<Timesta
         clock.is_open
             && hours.contains(&clock.timestamp)
             && hours.end == clock.next_close
-            && hours.end.as_second() - Timestamp::now().as_second() > 150,
-        "Regular GTC requires an open Paper session with time to finish",
+            && hours.contains(&Timestamp::now())
+            && hours.end.as_second() - Timestamp::now().as_second() > margin_secs,
+        "Requires an open Paper session with at least {margin_secs}s remaining",
     );
     Ok(hours)
 }

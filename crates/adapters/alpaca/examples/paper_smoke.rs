@@ -35,6 +35,7 @@
 //! cancel it directly using `-- --cancel-carryover UUID`.
 //! Use `-- --advanced-checks` to submit and cancel one-share stop, stop-limit,
 //! trailing-stop, and bracket orders in sequence.
+//! Use `-- --advanced-order CASE` to observe advanced order execution during regular hours.
 //! Use `paper_auction_check.py open|close` to verify AAPL auction orders and reconcile
 //! the resulting Paper position.
 //! Use `-- --suite PRICE` for a regular limit, extended-hours round trip, and
@@ -77,6 +78,8 @@ use rust_decimal::{Decimal, RoundingStrategy};
 
 #[path = "paper_smoke/account.rs"]
 mod account;
+#[path = "paper_smoke/advanced.rs"]
+mod advanced;
 #[path = "paper_smoke/auction.rs"]
 mod auction;
 #[path = "paper_smoke/carryover.rs"]
@@ -874,6 +877,18 @@ async fn run_node(node: &mut LiveNode, timeout: Duration) -> Result<()> {
     result
 }
 
+fn paper_execution_config(
+    proxy_url: Option<SecretString>,
+    relay_port: Option<u16>,
+) -> AlpacaExecutionClientConfig {
+    AlpacaExecutionClientConfig::builder()
+        .environment(AlpacaEnvironment::Paper)
+        .maybe_proxy_url(proxy_url)
+        .maybe_base_url_ws_private(relay_port.map(|port| format!("ws://127.0.0.1:{port}/stream")))
+        .http_timeout_secs(30)
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let proxy_url = std::env::var("ALPACA_SMOKE_PROXY_URL")
@@ -908,6 +923,10 @@ async fn main() -> Result<()> {
     }
     let auction = match args.as_slice() {
         [mode, kind] if mode == "--auction-check" => Some(auction::Auction::parse(kind)?),
+        _ => None,
+    };
+    let advanced = match args.as_slice() {
+        [mode, case] if mode == "--advanced-order" => Some(advanced::Case::parse(case)?),
         _ => None,
     };
     let now = Timestamp::now();
@@ -947,6 +966,8 @@ async fn main() -> Result<()> {
             false,
             Symbol::from(auction::INSTRUMENT_SYMBOL),
         )
+    } else if advanced.is_some() {
+        (VecDeque::new(), false, Symbol::from("SPY"))
     } else {
         Mode::parse(args)?
     };
@@ -1015,10 +1036,19 @@ async fn main() -> Result<()> {
             AlpacaStockFeed::Sip
         })
         .maybe_overnight_feed(
-            (!iex_only && auction.is_none() && option.is_none() && !regular_gtc)
+            (!iex_only
+                && auction.is_none()
+                && advanced.is_none()
+                && option.is_none()
+                && !regular_gtc)
                 .then_some(AlpacaOvernightFeed::Boats),
         )
         .build();
+    if let Some(case) = advanced {
+        let rest = account::paper_client(proxy_url.as_ref())?;
+        let execution_config = paper_execution_config(proxy_url, relay_port);
+        return advanced::run(case, &rest, data_config, execution_config).await;
+    }
     let trader = if auction.is_some() {
         "PAPER-AUCTION-001"
     } else {
@@ -1031,21 +1061,14 @@ async fn main() -> Result<()> {
         .with_delay_post_stop_secs(5)
         .add_data_client(
             None,
-            Box::new(AlpacaDataClientFactory::default()),
+            Box::new(AlpacaDataClientFactory),
             Box::new(data_config),
         )?;
     if !history {
-        let execution_config = AlpacaExecutionClientConfig::builder()
-            .environment(AlpacaEnvironment::Paper)
-            .maybe_proxy_url(proxy_url)
-            .maybe_base_url_ws_private(
-                relay_port.map(|port| format!("ws://127.0.0.1:{port}/stream")),
-            )
-            .http_timeout_secs(30)
-            .build();
+        let execution_config = paper_execution_config(proxy_url, relay_port);
         builder = builder.add_exec_client(
             None,
-            Box::new(AlpacaExecutionClientFactory::default()),
+            Box::new(AlpacaExecutionClientFactory),
             Box::new(execution_config),
         )?;
     }

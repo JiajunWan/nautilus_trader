@@ -380,6 +380,33 @@ round trip and advanced checks over one connection. Set `ALPACA_SMOKE_PROXY_URL`
 when the connection requires an HTTP CONNECT proxy. The example uses the
 Paper trading endpoint for all order operations.
 
+### Advanced order execution checks
+
+Build the native example and select one Paper case during a regular US equity
+session with at least seven minutes remaining, or nine minutes for OCO.
+The runner requires a flat SPY position and zero open SPY orders at the start,
+checks the Paper clock and calendar, and uses fresh SIP market data. Each
+order uses one SPY share. The OCO case establishes one long share before
+submitting the two linked exits.
+
+```sh
+cargo build -p nautilus-alpaca --features examples --example alpaca-paper-smoke
+target/debug/examples/alpaca-paper-smoke --advanced-order stop-limit
+```
+
+Cases are `stop-market`, `stop-limit`, `trailing-stop`, `bracket`, `oto`,
+`oco`, `market-ioc`, `limit-ioc`, `market-fok`, and `limit-fok`. The runner
+reports native order events and Paper REST status by client order ID and
+broker UUID, including the broker child IDs for groups. A stop fill can
+establish triggered execution with an unknown trigger time. The one-share
+IOC cases cover full execution or immediate zero-fill cancellation.
+
+The runner observes natural results before cleanup. An order that does not
+reach its expected outcome before the deadline fails the check. Cleanup
+cancels attributable Paper UUIDs, verifies their terminal status, and closes
+an attributed remaining share with a native order. Each run prints its unique
+order ID prefix for reconciliation if the broker result is inconclusive.
+
 ### Paper auction checks
 
 Build the same example, then run the check for the corresponding auction during
