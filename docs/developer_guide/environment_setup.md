@@ -1,6 +1,7 @@
 # Environment Setup
 
 Use an editor with current Rust and Python language support, such as PyCharm or Visual Studio Code.
+For VS Code, see [Python editor settings](#python-editor-settings).
 
 [uv](https://docs.astral.sh/uv) is the preferred tool for handling all Python virtual environments and dependencies.
 
@@ -8,10 +9,6 @@ Use an editor with current Rust and Python language support, such as PyCharm or 
 
 Source builds and the Rust crates require [Rust](https://www.rust-lang.org)
 ([installation guide](https://www.rust-lang.org/tools/install)).
-
-[Cap'n Proto](https://capnproto.org) tooling is retained for HyperSync development. Its pinned version
-is specified in `.nautilus-engineering/tools.toml`. Ubuntu's default package is typically too old,
-so you may need to install from source (see below).
 
 :::info
 NautilusTrader *must* compile and run on **Linux, macOS, and Windows**. Please keep portability in
@@ -53,7 +50,6 @@ export PATH="$HOME/.local/bin:$PATH"
 
 cargo install cargo-binstall --version "$(bash scripts/cargo-tool-version.sh cargo-binstall)" --locked
 make install-tools
-./scripts/install-capnp.sh
 
 make sync
 source python/.venv/bin/activate
@@ -439,13 +435,12 @@ measurements.
 Use the command that updates the affected artifact. The build targets call their prerequisites, so
 `make build-debug` also syncs Python dependencies and regenerates Python type stubs.
 
-| Changed input                                       | Command                      | Updated artifact                                  |
-| --------------------------------------------------- | ---------------------------- | ------------------------------------------------- |
-| `python/pyproject.toml` or `python/uv.lock`         | `make sync`                  | Dependencies in `python/.venv`.                   |
-| Rust bindings, Python package code, or stub sources | `make build-debug`           | Debug Python package and generated type stubs.    |
-| CLI code, SQL initialization code, or `schema/sql`  | `make install-cli`           | Standalone `nautilus` binary in Cargo's bin path. |
-| Cargo, uv, `prek`, or OSV Scanner tool pins         | `make install-tools`         | Pinned development tools.                         |
-| Cap'n Proto version in the shared catalog           | `./scripts/install-capnp.sh` | Cap'n Proto compiler.                             |
+| Changed input                                       | Command              | Updated artifact                                  |
+| --------------------------------------------------- | -------------------- | ------------------------------------------------- |
+| `python/pyproject.toml` or `python/uv.lock`         | `make sync`          | Dependencies in `python/.venv`.                   |
+| Rust bindings, Python package code, or stub sources | `make build-debug`   | Debug Python package and generated type stubs.    |
+| CLI code, SQL initialization code, or `schema/sql`  | `make install-cli`   | Standalone `nautilus` binary in Cargo's bin path. |
+| Cargo, uv, `prek`, or OSV Scanner tool pins         | `make install-tools` | Pinned development tools.                         |
 
 The environment variables in [Configure environment variables](#4-configure-environment-variables)
 contain checkout-specific paths. After switching checkouts, changing the selected Python version,
@@ -463,10 +458,8 @@ In Fish, use `source python/.venv/bin/activate.fish` for activation. Activation 
 
 ## Cap'n Proto
 
-[Cap'n Proto](https://capnproto.org) tooling remains available for HyperSync development. The pinned
-HyperSync dependencies ship generated Rust bindings, so normal builds do not regenerate their schemas.
-NautilusTrader does not provide Cap'n Proto codecs.
-The required version is defined in `.nautilus-engineering/tools.toml`.
+The shared tool catalog pins an optional [Cap'n Proto](https://capnproto.org) compiler.
+HyperSync uses the JSON API. NautilusTrader builds do not require the compiler.
 
 Install the correct version for your platform:
 
@@ -714,6 +707,53 @@ for a disposable database or after confirming that the data can be deleted.
 :::
 
 Run `nautilus database --help` for the complete command syntax.
+
+## Python editor settings
+
+The repository does not ship shared editor settings; `.gitignore` excludes `.vscode/`, so each
+contributor keeps their own. For VS Code, install the
+[Ruff](https://marketplace.visualstudio.com/items?itemName=charliermarsh.ruff) and
+[Python](https://marketplace.visualstudio.com/items?itemName=ms-python.python) (with Pylance)
+extensions. [Even Better TOML](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml)
+is optional and formats TOML with taplo, like the pre-commit hook. For Rust, see
+[Rust analyzer settings](#rust-analyzer-settings).
+
+Add these settings to the workspace `.vscode/settings.json`:
+
+```json tab="VSCode"
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/python/.venv/bin/python",
+    "ruff.importStrategy": "fromEnvironment",
+    "ruff.configuration": "${workspaceFolder}/python/pyproject.toml",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/docs/tutorials"
+    ],
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true
+    }
+}
+```
+
+- `python.defaultInterpreterPath` points to the uv-managed environment at `python/.venv`. On Windows,
+  use `${workspaceFolder}/python/.venv/Scripts/python.exe`. VS Code reads this setting only until an
+  interpreter is selected for the workspace, so in an existing workspace run
+  **Python: Select Interpreter** once and choose `python/.venv`.
+- `ruff.importStrategy` makes the extension use the Ruff version pinned in `python/.venv` instead of
+  its bundled version, which may lint and format differently.
+- `ruff.configuration` points to the Ruff configuration in `python/pyproject.toml`. There is no Ruff
+  configuration at the repository root, so without this setting the extension falls back to Ruff
+  defaults and reports false import-sorting (`I001`) errors.
+- `python.analysis.extraPaths` lets Pylance resolve the tutorial strategy imports, such as
+  `ema_cross`, that examples load from `docs/tutorials` by changing `sys.path` at runtime. Add other
+  directories that examples insert into `sys.path` the same way.
+
+:::note
+Format-on-save is close to the project style but not identical. `make format` also runs
+`scripts/format-python.py --fix` and `cargo +nightly fmt`, and the pre-commit hooks run further
+Python formatters, so `make format` and `make pre-commit` remain the source of truth. VS Code skips
+format-on-save when `files.autoSave` is `afterDelay`.
+:::
 
 ## Rust analyzer settings
 

@@ -93,8 +93,8 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, ContingencyType, InstrumentClass, OmsType, OrderSide, PositionSide,
-        PriceType,
+        AggregationSource, ContingencyType, InstrumentClass, InstrumentCloseType, OmsType,
+        OrderSide, PositionSide, PriceType,
     },
     events::{AccountState, OrderEventAny, OrderFilled, PositionAdjusted},
     identifiers::{
@@ -2920,8 +2920,13 @@ impl Cache {
             )?;
         }
 
-        self.instrument_closes.insert(close.instrument_id, close);
+        self.cache_instrument_close(close);
         Ok(())
+    }
+
+    /// Stores the latest close in memory without writing it to the backing database.
+    pub fn cache_instrument_close(&mut self, close: InstrumentClose) {
+        self.instrument_closes.insert(close.instrument_id, close);
     }
 
     /// Adds the `quote` tick to the cache.
@@ -4597,6 +4602,43 @@ impl Cache {
         }
 
         Ok(snapshot)
+    }
+
+    /// Records runtime activation on the cached trailing stop and in backends that support it.
+    ///
+    /// Activation preserves lifecycle events. Ignores other order types and logs an error if the
+    /// order is missing.
+    pub fn store_trailing_stop_activation(
+        &mut self,
+        client_order_id: ClientOrderId,
+        activation_price: Price,
+    ) {
+        let Some(mut order) = self.order_mut(&client_order_id) else {
+            log::error!("Cannot store trailing stop activation: order {client_order_id} not found");
+            return;
+        };
+
+        let init_id = order.init_id();
+        let (price, is_activated) = match &mut *order {
+            OrderAny::TrailingStopMarket(order) => {
+                (&mut order.activation_price, &mut order.is_activated)
+            }
+            OrderAny::TrailingStopLimit(order) => {
+                (&mut order.activation_price, &mut order.is_activated)
+            }
+            _ => return,
+        };
+
+        *price = Some(activation_price);
+        *is_activated = true;
+        drop(order);
+
+        if let Some(database) = &self.database
+            && let Err(e) =
+                database.store_trailing_stop_activation(client_order_id, init_id, activation_price)
+        {
+            log::error!("Failed to persist trailing stop activation for {client_order_id}: {e:#}");
+        }
     }
 
     fn reindex_order_position_after_fill_void(&mut self, client_order_id: ClientOrderId) {
@@ -7874,6 +7916,16 @@ impl Cache {
         self.instrument_closes.get(instrument_id)
     }
 
+    /// Returns the cached contract expiry close for `instrument_id`, if present.
+    #[must_use]
+    pub fn instrument_expiry_close(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&InstrumentClose> {
+        self.instrument_close(instrument_id)
+            .filter(|close| close.close_type == InstrumentCloseType::ContractExpired)
+    }
+
     /// Returns references to all instrument IDs with a cached close.
     #[must_use]
     pub fn instrument_close_ids(&self) -> Vec<&InstrumentId> {
@@ -8501,10 +8553,16 @@ impl Cache {
     /// Returns owned copies of every account in the cache.
     #[must_use]
     pub fn accounts_all_owned(&self) -> Vec<AccountAny> {
+        self.accounts_all_refs()
+            .map(|account| account.cloned())
+            .collect()
+    }
+
+    /// Iterates over the cached accounts. Drop each borrow before mutating its account.
+    pub fn accounts_all_refs(&self) -> impl Iterator<Item = AccountRef<'_>> {
         self.accounts
             .values()
-            .map(|account_cell| account_cell.borrow().clone())
-            .collect()
+            .map(|account_cell| AccountRef::new(account_cell.borrow()))
     }
 
     /// Updates the own order book with an order.

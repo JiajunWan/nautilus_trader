@@ -8,6 +8,7 @@ Released on TBD (UTC).
 - Added `underlying_instrument_id` and `settlement_type` to `OptionContract` and `CryptoOption`
 - Added explicit underlying instrument resolution to `GreeksCalculator`
 - Added `ExerciseStyle` and optional `exercise_style` to `OptionContract` and `CryptoOption`
+- Added `OptionPremiumStyle` and futures-style option variation in backtests
 - Added complete balance snapshot support for `AccountState`, zeroing balances a full snapshot omits
 - Added mark price, last trade, and bar close fallbacks for unrealized PnL without quotes (#5535), thanks @viliamgonda
 - Added `ParquetDataCatalog::builder()` to open catalogs with named, optional settings
@@ -62,6 +63,7 @@ Released on TBD (UTC).
 - Changed option fee pricing. Set `underlying_instrument_id` for market prices or supply option Greeks
 - Changed capped linear option fees to require the declared underlying's quote currency to match the premium currency
 - Changed PostgreSQL option underlying, exercise, settlement, and spread tick columns; run `nautilus database init`
+- Changed PostgreSQL cache startup to require `instrument.premium_style`; run `nautilus database init`
 - Changed PostgreSQL OMS recovery to restore `UNSPECIFIED` for legacy positions whose OMS metadata has no trader ID
 - Changed PostgreSQL `Cache::add` to persist per trader and skip legacy shared user entries on restore
 - Changed Redis cache startup and PostgreSQL bulk position loads to fail on unreadable records
@@ -70,6 +72,7 @@ Released on TBD (UTC).
 - Changed `BinaryOption` Parquet writes to require registered tick schemes; register custom schemes before saving
 - Changed `TickSchemeError` with `TicksNotIncreasing`; update exhaustive matches
 - Changed `OptionValuationError` with `UnsupportedConvention`; update exhaustive matches
+- Changed `InstrumentCloseType` with `Settlement`; update exhaustive matches
 - Changed local Greeks and implied forwards to reject inverse and mixed-currency options
 - Changed `GreeksCalculator::cache_futures_spread` to reject call/put pairs at or after expiry
 - Changed local option valuation to require currency evidence for the underlying price
@@ -112,6 +115,7 @@ Released on TBD (UTC).
 - Changed `KrakenSpotHttpClient::modify_order` to return `Result<Option<VenueOrderId>>`. Handle `None` (#5661)
 - Changed `KrakenDataClientConfig` literals; add `book_snapshot_timeout_secs` or `..Default::default()` (#5300)
 - Changed Kraken Spot checksum recovery to retain the last book and keep validating checksums (#5300)
+- Changed `HypersyncLog` and `transform_hypersync_block` to use adapter types with Alloy primitives
 - Changed Lighter `From<LighterTradeType>` for `LighterTradeQueryType` to `TryFrom`; handle the error
 - Changed Lighter position and asset frame literals; add `transaction_time: None` and update exhaustive matches
 - Changed Lighter venue enums with fallback and settlement variants; update exhaustive matches
@@ -256,6 +260,7 @@ Released on TBD (UTC).
 - Fixed Polymarket book recovery stalling on older snapshots with matching book hashes (#5659), thanks @imbolc
 - Fixed Polymarket exhausting its fast recovery budget on books with no initial snapshot
 - Fixed Polymarket resolution fallbacks retrying every poll after a failure (#5660), thanks @imbolc
+- Fixed Sandbox trailing stops losing activation on Redis reload (#5695)
 
 ### Internal Improvements
 
@@ -277,6 +282,7 @@ Released on TBD (UTC).
 - Improved portfolio position-event benchmark coverage
 - Improved Kraken logging for subscription commands dropped without an active WebSocket client
 - Improved Polymarket price-change benchmark coverage for local book application
+- Replaced the Envio HyperSync SDK with its JSON API
 - Optimized socket client framing to search only unscanned bytes on each read
 - Optimized cache position queries, speeding up portfolio updates with many HEDGING positions
 - Optimized order fill processing for orders with many fills
