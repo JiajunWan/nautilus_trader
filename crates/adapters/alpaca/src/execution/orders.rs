@@ -23,6 +23,7 @@ use nautilus_model::{
         TriggerType,
     },
     events::OrderDeniedReason,
+    identifiers::OrderListId,
     orders::{Order, OrderAny},
 };
 use rust_decimal::Decimal;
@@ -130,14 +131,81 @@ pub(super) fn replacement_instructions(
     Ok(Some(serde_json::to_value(instructions)?))
 }
 
-pub(super) fn order_list_request(
-    orders: &[OrderAny],
+/// The immutable relationships identifying a native Alpaca group, including after fills or amendments.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OrderGroup<'a> {
+    pub root: &'a OrderAny,
+    pub list: OrderListId,
+    pub class: &'static str,
+}
+
+impl<'a> OrderGroup<'a> {
+    pub(super) fn from_orders(
+        orders: impl ExactSizeIterator<Item = &'a OrderAny> + Clone,
+    ) -> anyhow::Result<Self> {
+        let entry = orders.clone().find(|order| {
+            order.contingency_type() == Some(ContingencyType::Oto)
+                && order.parent_order_id().is_none()
+        });
+        let class = match (entry, orders.len()) {
+            (Some(_), 2) => "oto",
+            (Some(_), 3) => "bracket",
+            (None, 2) => "oco",
+            _ => bail!(
+                "Alpaca native groups require an OTO entry with one or two exits, or two OCO exits"
+            ),
+        };
+        let root = entry
+            .or_else(|| {
+                orders
+                    .clone()
+                    .find(|order| order.order_type() == OrderType::Limit)
+            })
+            .context("Alpaca OCO requires a limit take-profit order")?;
+        let list = root
+            .order_list_id()
+            .context("Missing Alpaca order list ID")?;
+        let links = root
+            .linked_order_ids()
+            .context("Missing Alpaca group links")?;
+        let root_id = root.client_order_id();
+        ensure!(
+            root.parent_order_id().is_none() && links.len() == orders.len() - 1,
+            "Alpaca root must link to every other order in the group",
+        );
+        let parent_id = entry.map(Order::client_order_id);
+        for order in orders.filter(|order| order.client_order_id() != root_id) {
+            ensure!(
+                order.order_list_id() == Some(list)
+                    && order.instrument_id() == root.instrument_id()
+                    && order.strategy_id() == root.strategy_id()
+                    && links.contains(&order.client_order_id())
+                    && order.parent_order_id() == parent_id
+                    && (order.order_side() != root.order_side()) == entry.is_some(),
+                "Alpaca grouped exits must link to the root and have compatible sides",
+            );
+            if entry.is_none() {
+                ensure!(
+                    matches!(
+                        root.contingency_type(),
+                        Some(ContingencyType::Oco | ContingencyType::Ouo)
+                    ) && order.contingency_type() == root.contingency_type()
+                        && order.linked_order_ids() == Some([root_id].as_slice()),
+                    "Alpaca OCO requires mutually linked OCO or OUO exits",
+                );
+            }
+        }
+        Ok(Self { root, list, class })
+    }
+}
+
+pub(super) fn order_list_request<'a>(
+    orders: &'a [OrderAny],
     params: Option<&Params>,
-) -> anyhow::Result<Value> {
-    ensure!(
-        (2..=3).contains(&orders.len()),
-        "Alpaca order groups require two or three orders",
-    );
+) -> anyhow::Result<(Value, OrderGroup<'a>)> {
+    let group = OrderGroup::from_orders(orders.iter())?;
+    let root = group.root;
+    let has_entry = group.class != "oco";
     ensure!(
         !extended_hours(params)?,
         "Alpaca order groups do not support extended hours",
@@ -146,23 +214,6 @@ pub(super) fn order_list_request(
         AdvancedInstructions::from_params(params)?.is_none(),
         "Alpaca advanced instructions require a simple equity order",
     );
-
-    let entry = orders.iter().find(|order| {
-        order.contingency_type() == Some(ContingencyType::Oto) && order.parent_order_id().is_none()
-    });
-    let root = entry
-        .or_else(|| {
-            orders
-                .iter()
-                .find(|order| order.order_type() == OrderType::Limit)
-        })
-        .context("Alpaca OCO requires a limit take-profit order")?;
-    let order_class = match (entry, orders.len()) {
-        (Some(_), 2) => "oto",
-        (Some(_), 3) => "bracket",
-        (None, 2) => "oco",
-        _ => bail!("An Alpaca bracket requires an OTO entry order"),
-    };
     ensure!(
         matches!(root.order_type(), OrderType::Market | OrderType::Limit),
         OrderDeniedReason::UnsupportedOrderType {
@@ -173,47 +224,23 @@ pub(super) fn order_list_request(
         matches!(root.time_in_force(), TimeInForce::Day | TimeInForce::Gtc),
         "Alpaca order groups require DAY or GTC time in force",
     );
-    let group_id = root
-        .order_list_id()
-        .context("Alpaca order group requires an order list ID")?;
-    let root_id = root.client_order_id();
-    let root_links = root
-        .linked_order_ids()
-        .context("Alpaca order group requires linked orders")?;
-    ensure!(
-        root_links.len() == orders.len() - 1,
-        "Alpaca root must link to every other order in the group",
-    );
-
     let mut request = equity_request(root, false)?;
-    request["order_class"] = json!(order_class);
-    if entry.is_none() {
+    request["order_class"] = json!(group.class);
+    if !has_entry {
         request
             .as_object_mut()
             .expect("Equity requests are JSON objects")
             .remove("limit_price");
     }
-    let parent_id = entry.map(Order::client_order_id);
     for order in orders {
         ensure!(
-            order.instrument_id() == root.instrument_id()
-                && order.order_list_id() == Some(group_id)
-                && order.quantity() == root.quantity()
-                && order.time_in_force() == root.time_in_force(),
-            "Alpaca grouped orders must share an instrument, list ID, quantity and time in force",
+            order.quantity() == root.quantity() && order.time_in_force() == root.time_in_force(),
+            "Alpaca grouped orders must share a quantity and time in force",
         );
-        let is_root = order.client_order_id() == root_id;
-        if is_root && entry.is_some() {
+        if has_entry && order.client_order_id() == root.client_order_id() {
             continue;
         }
         validate_equity_order(order)?;
-        ensure!(
-            order.parent_order_id() == parent_id
-                && (order.order_side() != root.order_side()) == entry.is_some()
-                && (is_root || root_links.contains(&order.client_order_id())),
-            "Alpaca grouped exits must link to the root and have compatible sides",
-        );
-
         match order.order_type() {
             OrderType::Limit if request.get("take_profit").is_none() => {
                 request["take_profit"] = json!({ "limit_price": limit_price(order)? });
@@ -231,22 +258,7 @@ pub(super) fn order_list_request(
             order_type => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
         }
     }
-    if entry.is_none() {
-        let stop_loss = orders
-            .iter()
-            .find(|order| order.client_order_id() != root_id);
-        ensure!(
-            matches!(
-                root.contingency_type(),
-                Some(ContingencyType::Oco | ContingencyType::Ouo)
-            ) && stop_loss.is_some_and(|order| {
-                order.contingency_type() == root.contingency_type()
-                    && order.linked_order_ids() == Some([root_id].as_slice())
-            }),
-            "Alpaca OCO requires mutually linked OCO or OUO exits",
-        );
-    }
-    Ok(request)
+    Ok((request, group))
 }
 
 pub(super) fn extended_hours(params: Option<&Params>) -> anyhow::Result<bool> {
@@ -743,7 +755,7 @@ mod tests {
                 .linked_order_ids(vec![root_id]);
         }
 
-        let body = order_list_request(&[root, stop.build()], None).unwrap();
+        let (body, _) = order_list_request(&[root, stop.build()], None).unwrap();
         assert_eq!(body["order_class"], expected);
         assert_eq!(body["stop_loss"]["stop_price"], "420");
         assert_eq!(body.get("take_profit").is_some(), !has_entry);
@@ -779,7 +791,7 @@ mod tests {
             .contingency_type(ContingencyType::Ouo)
             .build();
 
-        let body = order_list_request(&[entry, take_profit, stop_loss], None).unwrap();
+        let (body, _) = order_list_request(&[entry, take_profit, stop_loss], None).unwrap();
         assert_eq!(body["client_order_id"], "ENTRY");
         assert_eq!(body["order_class"], "bracket");
         assert_eq!(body["take_profit"]["limit_price"], "422");

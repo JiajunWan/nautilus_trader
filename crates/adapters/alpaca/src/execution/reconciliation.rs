@@ -16,7 +16,7 @@
 //! REST evidence for startup and private-stream recovery.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Mutex,
 };
 
@@ -26,7 +26,7 @@ use nautilus_core::UnixNanos;
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     enums::PositionSide,
-    identifiers::{AccountId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, VenueOrderId},
     instruments::InstrumentAny,
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::Quantity,
@@ -96,6 +96,7 @@ pub(super) fn append_flat_positions(
 
 pub(super) struct Snapshot {
     pub(super) orders: BTreeMap<String, BrokerOrder>,
+    probed_orders: HashMap<ClientOrderId, String>,
     activities: Vec<FillActivity>,
     pub(super) complete: bool,
 }
@@ -130,7 +131,7 @@ pub(super) async fn snapshot(
             .into_iter()
             .filter_map(|(client, venue)| {
                 if let Some(root) = state.pending_group_root(client) {
-                    Some((root, None))
+                    Some((root, state.venue_for(root)))
                 } else {
                     venue
                         .is_none_or(|id| {
@@ -144,14 +145,19 @@ pub(super) async fn snapshot(
             .collect()
     };
     let active: Vec<_> = stream::iter(active)
-        .map(|(client_id, venue_id)| reports::order(http, Some(client_id), venue_id))
+        .map(|(client_id, venue_id)| async move {
+            let order = reports::order(http, Some(client_id), venue_id).await?;
+            anyhow::Ok(order.map(|order| (client_id, order)))
+        })
         .buffer_unordered(MAX_ORDER_LOOKUPS)
         .try_collect()
         .await?;
-    for order in active.into_iter().flatten() {
+    let mut probed_orders = HashMap::new();
+    for (client_id, order) in active.into_iter().flatten() {
+        probed_orders.insert(client_id, order.id.clone());
         if !order.is_combo() {
             for leg in order.legs.iter().flatten() {
-                orders.entry(leg.id.clone()).or_insert_with(|| leg.clone());
+                orders.insert(leg.id.clone(), leg.clone());
             }
         }
         orders.insert(order.id.clone(), order);
@@ -191,22 +197,46 @@ pub(super) async fn snapshot(
     }
     Ok(Snapshot {
         orders,
+        probed_orders,
         activities,
         complete,
     })
 }
 
 impl Snapshot {
-    pub(super) fn bind_groups(&self, state: &mut OrderState, emitter: &ExecutionEventEmitter) {
-        for order in self.orders.values() {
-            if let Ok(id) = order.client_id()
-                && state.pending_group_root(id) == Some(id)
-                && let Err(e) = state.bind_group(id, order)
-            {
-                log::warn!("Cannot resolve Alpaca group {id}: {e:#}");
+    pub(super) fn resolve_groups(
+        &mut self,
+        state: &mut OrderState,
+        emitter: &ExecutionEventEmitter,
+    ) -> anyhow::Result<()> {
+        for (root, known_venue) in state.pending_group_roots(None) {
+            let Some(venue) = self.probed_orders.get(&root) else {
+                // A missing parent with a cached broker ID cannot establish its children's absence.
+                self.complete &= known_venue.is_none();
+                continue;
+            };
+            if let Err(e) = state.bind_group(root, &self.orders[venue]) {
+                self.complete = false;
+                log::warn!("Cannot resolve Alpaca group {root}: {e:#}");
             }
         }
         state.replay_group_updates(emitter);
+
+        // Fills are joined to these rows by venue ID, so removing an unbound
+        // row also withholds its executions from this snapshot.
+        if state.has_pending_groups() {
+            let mut unbound = Vec::new();
+            for (id, order) in &self.orders {
+                if state.unresolved_group_child(order)? {
+                    unbound.push(id.clone());
+                }
+            }
+            self.complete &= unbound.is_empty();
+            for id in unbound {
+                self.orders.remove(&id);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn simple_fills(&self) -> impl Iterator<Item = (&FillActivity, &BrokerOrder)> {
@@ -244,9 +274,6 @@ impl Snapshot {
             }
         }
         for (activity, order) in self.simple_fills() {
-            if state.unresolved_group_child(order)? {
-                continue;
-            }
             let id = state
                 .broker_order_client_id(order)?
                 .or(Some(order.client_id()?));

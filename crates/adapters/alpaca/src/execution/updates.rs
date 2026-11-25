@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use super::{
     combos,
-    orders::parse_order_status,
+    orders::{OrderGroup, parse_order_status},
     reports::{BrokerOrder, order_side, quantity, timestamp, trade_id},
 };
 use crate::{option_spread, provider::instrument_id};
@@ -141,36 +141,73 @@ pub(super) struct OrderState {
     broker_client_ids: HashMap<String, ClientOrderId>,
     advanced_instructions: HashMap<VenueOrderId, Value>,
     pending_advanced_instructions: HashMap<String, Value>,
-    pending_groups: HashMap<OrderListId, (ClientOrderId, String)>,
+    pending_groups: HashMap<OrderListId, (ClientOrderId, &'static str)>,
     deferred_group_updates: Vec<TradeUpdate>,
 }
 
 impl OrderState {
-    pub(super) fn restore(&mut self, order: &OrderAny) {
-        if !order.is_closed()
-            || can_compact(order)
-            || option_spread::is_spread(order.instrument_id())
-        {
-            self.register(order);
+    pub(super) fn restore<'a>(&mut self, orders: impl Iterator<Item = &'a OrderAny>) {
+        let mut groups = HashMap::<OrderListId, Vec<&OrderAny>>::new();
+        for order in orders {
+            if let Some(list) = order.order_list_id() {
+                groups.entry(list).or_default().push(order);
+            }
+            if !order.is_closed()
+                || can_compact(order)
+                || option_spread::is_spread(order.instrument_id())
+            {
+                self.register(order);
+            }
+        }
+        for members in groups.values() {
+            let pending = OrderGroup::from_orders(members.iter().copied())
+                .ok()
+                .filter(|group| {
+                    members.iter().any(|order| {
+                        order.client_order_id() != group.root.client_order_id()
+                            && self.active.get(&order.client_order_id()) == Some(&None)
+                    })
+                });
+            for order in members.iter().copied().filter(|order| order.is_closed()) {
+                // Only an unresolved group needs the full definitions of its closed members.
+                if pending.is_some() || order.venue_order_id().is_some() {
+                    self.register_cached(order, pending.is_none());
+                }
+            }
+            if let Some(group) = pending {
+                self.begin_group(group.list, group.root.client_order_id(), group.class);
+            }
         }
     }
 
     pub(super) fn register(&mut self, order: &OrderAny) {
+        self.register_cached(order, can_compact(order));
+    }
+
+    fn register_cached(&mut self, order: &OrderAny, compact_closed: bool) {
         let client_id = order.client_order_id();
         self.broker_client_ids
             .insert(client_id.to_string(), client_id);
         for venue_id in order.venue_order_ids() {
             self.bind_venue_id(*venue_id, client_id);
         }
-        if let Entry::Vacant(entry) = self.tracked.entry(client_id)
-            && !self.terminal.contains_key(&client_id)
-        {
+        if let Entry::Vacant(entry) = self.tracked.entry(client_id) {
             let venue_id = order.venue_order_id();
-            let fills = order.trade_ids().into_iter().copied().collect();
-            if order.is_closed() && can_compact(order) {
+            if order.is_closed() && compact_closed {
                 self.terminal
-                    .insert(client_id, TerminalOrder { venue_id, fills });
+                    .entry(client_id)
+                    .or_insert_with(|| TerminalOrder {
+                        venue_id,
+                        fills: order.trade_ids().into_iter().copied().collect(),
+                    });
                 return;
+            }
+            if !order.is_closed() && self.terminal.contains_key(&client_id) {
+                return;
+            }
+            let mut fills: HashSet<_> = order.trade_ids().into_iter().copied().collect();
+            if let Some(terminal) = self.terminal.remove(&client_id) {
+                fills.extend(terminal.fills);
             }
             if !order.is_closed() {
                 self.active.insert(client_id, venue_id);
@@ -400,6 +437,15 @@ impl OrderState {
             .collect()
     }
 
+    pub(super) fn ensure_group_resolved(&self, order: &BrokerOrder) -> anyhow::Result<()> {
+        ensure!(
+            !self.unresolved_group_child(order)?,
+            "Cannot identify the local Alpaca group member for venue order {}",
+            order.id,
+        );
+        Ok(())
+    }
+
     pub(super) fn order_report(
         &self,
         order: &BrokerOrder,
@@ -407,9 +453,7 @@ impl OrderState {
         client_id: Option<ClientOrderId>,
         ts_init: UnixNanos,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        if self.unresolved_group_child(order)? {
-            return Ok(None);
-        }
+        self.ensure_group_resolved(order)?;
         let combo = self.combo_order(order)?;
         if !order.supported() && combo.is_none() {
             return Ok(None);
@@ -550,8 +594,32 @@ impl OrderState {
         }
     }
 
-    pub(super) fn begin_group(&mut self, list: OrderListId, root: ClientOrderId, class: String) {
+    pub(super) fn begin_group(
+        &mut self,
+        list: OrderListId,
+        root: ClientOrderId,
+        class: &'static str,
+    ) {
         self.pending_groups.insert(list, (root, class));
+    }
+
+    pub(super) fn has_pending_groups(&self) -> bool {
+        !self.pending_groups.is_empty()
+    }
+
+    pub(super) fn pending_group_roots(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> Vec<(ClientOrderId, Option<VenueOrderId>)> {
+        self.pending_groups
+            .values()
+            .filter_map(|(root, _)| {
+                let tracked = &self.tracked[root];
+                instrument_id
+                    .is_none_or(|id| id == tracked.order.instrument_id())
+                    .then_some((*root, tracked.active_venue_id))
+            })
+            .collect()
     }
 
     pub(super) fn pending_group_root(&self, id: ClientOrderId) -> Option<ClientOrderId> {
@@ -571,7 +639,7 @@ impl OrderState {
 
     fn possible_group_child(&self, order: &BrokerOrder) -> bool {
         self.pending_groups.values().any(|(root, class)| {
-            order.order_class.as_ref() == Some(class)
+            order.order_class.as_deref() == Some(*class)
                 && order.symbol == self.tracked[root].order.instrument_id().symbol.as_str()
         })
     }
@@ -606,8 +674,8 @@ impl OrderState {
         };
         ensure!(
             *expected_root == root_id
-                && root.client_id()? == root_id
-                && root.order_class.as_ref() == Some(class),
+                && self.broker_order_client_id(root)? == Some(root_id)
+                && root.order_class.as_deref() == Some(*class),
             "Unexpected Alpaca order-list root",
         );
         let links = local_root
@@ -644,9 +712,9 @@ impl OrderState {
                     && super::orders::parse_order_type(&broker.order_type)?
                         == tracked.order.order_type()
                     && !broker.client_order_id.is_empty()
-                    && tracked
-                        .active_venue_id
-                        .is_none_or(|active| active == *venue)
+                    && tracked.active_venue_id.is_none_or(|active| {
+                        active == *venue || broker.replaces.as_deref() == Some(active.as_str())
+                    })
                     && self
                         .broker_order_client_id(broker)?
                         .is_none_or(|active| active == *id)
@@ -861,10 +929,10 @@ impl OrderState {
 mod tests {
     use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
     use nautilus_model::{
-        enums::{AccountType, OrderSide, OrderType},
+        enums::{AccountType, ContingencyType, OrderSide, OrderType},
         events::OrderEventAny,
         identifiers::{AccountId, TraderId},
-        orders::OrderTestBuilder,
+        orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         types::Quantity,
     };
     use rstest::rstest;
@@ -1015,7 +1083,7 @@ mod tests {
                 .parent_order_id(root)
                 .build(),
         );
-        state.begin_group(list, root, "oto".into());
+        state.begin_group(list, root, "oto");
         let mut row = update("new", "new", "root-uuid", root.as_str()).order;
         row.order_class = Some("oto".into());
         assert!(state.bind_group(root, &row).is_err());
@@ -1043,6 +1111,104 @@ mod tests {
         state.handle(fill, &emitter).unwrap();
         assert_eq!(state.tracked[&root].status, OrderStatus::Filled);
         assert!(!state.terminal.contains_key(&root));
+    }
+
+    fn cached_oco_orders() -> (OrderAny, OrderAny) {
+        let account = AccountId::from("ALPACA-001");
+        let list = OrderListId::from("OCO");
+        let profit_id = ClientOrderId::from("PROFIT");
+        let stop_id = ClientOrderId::from("STOP");
+        let make = |kind, id, sibling| {
+            let mut builder = OrderTestBuilder::new(kind);
+            builder
+                .instrument_id(instrument_id("SPY").unwrap())
+                .client_order_id(id)
+                .side(OrderSide::Sell)
+                .quantity(Quantity::from(1))
+                .order_list_id(list)
+                .linked_order_ids(vec![sibling])
+                .contingency_type(ContingencyType::Oco);
+            builder
+        };
+        let mut profit = make(OrderType::Limit, profit_id, stop_id)
+            .price(Price::from("510"))
+            .build();
+        let mut stop = make(OrderType::StopMarket, stop_id, profit_id)
+            .trigger_price(Price::from("495"))
+            .build();
+        let prior = VenueOrderId::from("original-profit");
+        profit
+            .apply(TestOrderEventStubs::submitted(&profit, account))
+            .unwrap();
+        profit
+            .apply(TestOrderEventStubs::accepted(&profit, account, prior))
+            .unwrap();
+        stop.apply(TestOrderEventStubs::submitted(&stop, account))
+            .unwrap();
+
+        (profit, stop)
+    }
+
+    #[rstest]
+    fn restores_unbound_oco_exit_through_a_replaced_take_profit() {
+        let (profit, stop) = cached_oco_orders();
+        let profit_id = profit.client_order_id();
+        let stop_id = stop.client_order_id();
+        let prior = profit.venue_order_id().unwrap();
+
+        let mut state = OrderState::default();
+        state.restore(std::iter::once(&stop));
+        assert!(!state.has_pending_groups());
+        state.restore([&stop, &profit].into_iter());
+        assert_eq!(state.pending_group_roots(None), [(profit_id, Some(prior))]);
+
+        let mut row = update("new", "new", "new-profit", "replace-alias").order;
+        row.order_class = Some("oco".into());
+        row.side = "sell".into();
+        let mut child = update("held", "held", "venue-stop", "broker-stop").order;
+        child.order_type = "stop".into();
+        child.side = "sell".into();
+        row.legs = Some(vec![child]);
+        assert!(state.bind_group(profit_id, &row).is_err());
+        row.replaces = Some(prior.to_string());
+        state.bind_group(profit_id, &row).unwrap();
+        assert_eq!(state.venue_for(profit_id), Some("new-profit".into()));
+        assert_eq!(state.venue_for(stop_id), Some("venue-stop".into()));
+
+        state.restore([&stop, &profit].into_iter());
+        assert!(!state.has_pending_groups());
+    }
+
+    #[rstest]
+    fn restores_closed_group_child_identity_without_rebinding() {
+        let (profit, mut stop) = cached_oco_orders();
+        let account = AccountId::from("ALPACA-001");
+        let venue = VenueOrderId::from("venue-stop");
+        let local = stop.client_order_id();
+        stop.apply(TestOrderEventStubs::accepted(&stop, account, venue))
+            .unwrap();
+        stop.apply(TestOrderEventStubs::canceled(&stop, account, Some(venue)))
+            .unwrap();
+
+        let (mut state, emitter, mut events) = execution_rig();
+        state.restore([&profit, &stop].into_iter());
+        assert!(!state.has_pending_groups());
+        assert!(!state.tracked.contains_key(&local));
+        assert_eq!(state.venue_for(local), Some(venue));
+        assert_eq!(state.client_for(venue), Some(local));
+
+        for _ in 0..2 {
+            let mut fill = update("fill", "filled", venue.as_str(), "broker-stop");
+            fill.order.order_class = Some("oco".into());
+            fill.order.order_type = "stop".into();
+            fill.order.side = "sell".into();
+            state.handle(fill, &emitter).unwrap();
+        }
+        assert!(
+            matches!(events.try_recv().unwrap(), ExecutionEvent::Report(ExecutionReport::Fill(fill))
+                if fill.client_order_id == Some(local) && fill.venue_order_id == venue)
+        );
+        assert!(events.try_recv().is_err());
     }
 
     #[rstest]
@@ -1229,7 +1395,7 @@ mod tests {
         assert!(closed.is_closed());
 
         let mut restored = OrderState::default();
-        restored.restore(&closed);
+        restored.restore(std::iter::once(&closed));
         restored.register(&initial);
         assert!(restored.active_orders().is_empty());
         assert!(restored.tracked.is_empty());

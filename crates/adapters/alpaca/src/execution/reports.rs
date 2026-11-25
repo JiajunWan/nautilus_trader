@@ -449,7 +449,7 @@ pub(super) async fn order(
     client_order_id: Option<ClientOrderId>,
     venue_id: Option<VenueOrderId>,
 ) -> anyhow::Result<Option<BrokerOrder>> {
-    let mut response: anyhow::Result<BrokerOrder> = if let Some(venue_id) = venue_id {
+    let response = if let Some(venue_id) = venue_id {
         exact_order(http, venue_id).await
     } else if let Some(client_order_id) = client_order_id {
         http.get(
@@ -463,27 +463,23 @@ pub(super) async fn order(
     } else {
         anyhow::bail!("Alpaca order query requires a venue order ID or client order ID");
     };
-    loop {
-        match response {
-            Ok(order) => {
-                if let Some(replacement) = &order.replaced_by {
-                    ensure!(
-                        replacement != &order.id,
-                        "Alpaca order replacement points to itself"
-                    );
-                    response = http.get(&format!("/v2/orders/{replacement}"), &()).await;
-                } else {
-                    return Ok(Some(order));
-                }
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<crate::http::AlpacaApiError>()
-                    .is_some_and(|e| e.status == 404) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
+    let mut order = match response {
+        Ok(order) => order,
+        Err(error)
+            if error
+                .downcast_ref::<crate::http::AlpacaApiError>()
+                .is_some_and(|e| e.status == 404) =>
+        {
+            return Ok(None);
         }
+        Err(error) => return Err(error),
+    };
+    while let Some(replacement) = &order.replaced_by {
+        ensure!(
+            replacement != &order.id,
+            "Alpaca order replacement points to itself"
+        );
+        order = exact_order(http, VenueOrderId::new_checked(replacement)?).await?;
     }
+    Ok(Some(order))
 }

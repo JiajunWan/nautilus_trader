@@ -47,7 +47,7 @@ use nautilus_model::{
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, TraderId},
     instruments::Instrument,
-    orders::{Order, OrderList, OrderTestBuilder},
+    orders::{Order, OrderAny, OrderList, OrderTestBuilder},
     types::{Price, Quantity},
 };
 use rstest::rstest;
@@ -160,6 +160,49 @@ fn order(id: &str, filled: bool) -> Value {
     })
 }
 
+fn bracket_row(venue: &str, client: &str, kind: &str, side: &str, filled: bool) -> Value {
+    let mut row = order(venue, filled);
+    row["client_order_id"] = json!(client);
+    row["order_class"] = json!("bracket");
+    row["type"] = json!(kind);
+    row["side"] = json!(side);
+    row
+}
+
+fn bracket_orders(trader: TraderId, instrument: InstrumentId) -> [OrderAny; 3] {
+    let list_id = OrderListId::from("GROUP-1");
+    let root_id = ClientOrderId::from("ROOT");
+    let profit_id = ClientOrderId::from("PROFIT");
+    let stop_id = ClientOrderId::from("STOP");
+    let make = |kind, id, side| {
+        let mut builder = OrderTestBuilder::new(kind);
+        builder
+            .trader_id(trader)
+            .instrument_id(instrument)
+            .client_order_id(id)
+            .side(side)
+            .order_list_id(list_id)
+            .time_in_force(TimeInForce::Day)
+            .quantity(Quantity::from(1));
+        builder
+    };
+    [
+        make(OrderType::Limit, root_id, OrderSide::Buy)
+            .price(Price::from("100"))
+            .linked_order_ids(vec![profit_id, stop_id])
+            .contingency_type(ContingencyType::Oto)
+            .build(),
+        make(OrderType::Limit, profit_id, OrderSide::Sell)
+            .price(Price::from("120"))
+            .parent_order_id(root_id)
+            .build(),
+        make(OrderType::StopMarket, stop_id, OrderSide::Sell)
+            .trigger_price(Price::from("95"))
+            .parent_order_id(root_id)
+            .build(),
+    ]
+}
+
 #[tokio::test]
 async fn recovers_group_by_parent_after_submit_and_first_query_fail() {
     tokio::time::timeout(Duration::from_secs(10), exercise_group_recovery())
@@ -177,17 +220,9 @@ async fn exercise_group_recovery() {
         .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
         .build();
 
-    let broker = |venue, client, kind, side, filled| {
-        let mut row = order(venue, filled);
-        row["client_order_id"] = json!(client);
-        row["order_class"] = json!("bracket");
-        row["type"] = json!(kind);
-        row["side"] = json!(side);
-        row
-    };
-    let profit = broker("PROFIT-UUID", "BROKER-PROFIT", "limit", "sell", true);
-    let stop = broker("STOP-UUID", "BROKER-STOP", "stop", "sell", false);
-    let mut root = broker("ROOT-UUID", "ROOT", "limit", "buy", false);
+    let profit = bracket_row("PROFIT-UUID", "BROKER-PROFIT", "limit", "sell", true);
+    let stop = bracket_row("STOP-UUID", "BROKER-STOP", "stop", "sell", false);
+    let mut root = bracket_row("ROOT-UUID", "ROOT", "limit", "buy", false);
     root["legs"] = json!([stop, profit]);
     let (submissions, mut submitted) = mpsc::unbounded_channel();
     let (lookups, mut queried) = mpsc::unbounded_channel();
@@ -228,7 +263,6 @@ async fn exercise_group_recovery() {
     let trader = TraderId::from("TEST-001");
     let client_id = ClientId::from("ALPACA");
     let instrument = InstrumentId::from("SPY.ALPACA");
-    let list_id = OrderListId::from("GROUP-1");
     let core = ExecutionClientCore::new(
         trader,
         client_id,
@@ -247,36 +281,8 @@ async fn exercise_group_recovery() {
         Some(ExecutionEvent::Account(_))
     ));
 
-    let root_id = ClientOrderId::from("ROOT");
-    let profit_id = ClientOrderId::from("PROFIT");
-    let stop_id = ClientOrderId::from("STOP");
-    let make = |kind, id, side| {
-        let mut builder = OrderTestBuilder::new(kind);
-        builder
-            .trader_id(trader)
-            .instrument_id(instrument)
-            .client_order_id(id)
-            .side(side)
-            .order_list_id(list_id)
-            .time_in_force(TimeInForce::Day)
-            .quantity(Quantity::from(1));
-        builder
-    };
-    let orders = [
-        make(OrderType::Limit, root_id, OrderSide::Buy)
-            .price(Price::from("100"))
-            .linked_order_ids(vec![profit_id, stop_id])
-            .contingency_type(ContingencyType::Oto)
-            .build(),
-        make(OrderType::Limit, profit_id, OrderSide::Sell)
-            .price(Price::from("120"))
-            .parent_order_id(root_id)
-            .build(),
-        make(OrderType::StopMarket, stop_id, OrderSide::Sell)
-            .trigger_price(Price::from("95"))
-            .parent_order_id(root_id)
-            .build(),
-    ];
+    let orders = bracket_orders(trader, instrument);
+    let [root_id, profit_id, stop_id] = orders.each_ref().map(|order| order.client_order_id());
     let strategy = orders[0].strategy_id();
     let list = SubmitOrderList::new(
         trader,
@@ -571,6 +577,9 @@ async fn exercise_recovery(fault: StatusCode, reconnect_again: bool) {
     client.disconnect().await.unwrap();
     server.abort();
 }
+
+#[path = "reconnect/groups.rs"]
+mod groups;
 
 #[path = "reconnect/startup.rs"]
 mod startup;

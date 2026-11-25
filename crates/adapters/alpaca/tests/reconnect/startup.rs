@@ -13,11 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Replay an offline equity close through two native LiveNode startups.
+//! Tests recovery of cached orders and positions through native Alpaca connections.
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
-use axum::{Json, Router, extract::Query, routing::get};
+use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+use futures_util::SinkExt;
 use nautilus_alpaca::{
     common::ALPACA_VENUE, config::AlpacaExecutionClientConfig, execution::AlpacaExecutionClient,
     factories::AlpacaExecutionClientFactory,
@@ -34,10 +35,12 @@ use nautilus_live::{
     ExecutionClientCore, builder::LiveNodeBuilder, config::LiveNodeConfig, node::LiveNodeHandle,
 };
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType},
+    enums::{
+        AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+    },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
-        TraderId, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
+        TradeId, TraderId, VenueOrderId,
     },
     instruments::{InstrumentAny, stubs::equity_aapl},
     orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
@@ -46,7 +49,11 @@ use nautilus_model::{
 };
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
 use serde_json::json;
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{accept_private, stream_update};
 
@@ -103,7 +110,7 @@ fn accepted_order(
     id: &str,
     side: OrderSide,
 ) -> OrderAny {
-    let mut order = OrderTestBuilder::new(OrderType::Market)
+    let order = OrderTestBuilder::new(OrderType::Market)
         .trader_id(trader)
         .strategy_id(strategy)
         .instrument_id(instrument)
@@ -111,6 +118,10 @@ fn accepted_order(
         .side(side)
         .quantity(Quantity::from(2))
         .build();
+    accept_order(order, account, id)
+}
+
+fn accept_order(mut order: OrderAny, account: AccountId, venue_id: &str) -> OrderAny {
     order
         .apply(TestOrderEventStubs::submitted(&order, account))
         .unwrap();
@@ -118,7 +129,7 @@ fn accepted_order(
         .apply(TestOrderEventStubs::accepted(
             &order,
             account,
-            VenueOrderId::from(id),
+            VenueOrderId::from(venue_id),
         ))
         .unwrap();
     order
@@ -386,5 +397,196 @@ async fn cached_terminal_fill_is_deduplicated_on_a_fresh_connection() {
     })
     .await
     .expect("Expected the replay to be suppressed before the next stream update");
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_books_a_partial_child_fill_once_across_rest_and_stream() {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .build();
+    let now = || get_atomic_clock_realtime().get_time_ns().to_rfc3339();
+    let partial = json!({
+        "id":"EXIT-VENUE","client_order_id":"BROKER-EXIT","order_class":"oto","symbol":"AAPL",
+        "asset_class":"us_equity","type":"limit","side":"sell","time_in_force":"day",
+        "qty":"2","limit_price":"105","status":"partially_filled","filled_qty":"1",
+        "filled_avg_price":"105","created_at":now()
+    });
+    let child_row = partial.clone();
+    let (fill_requests, mut attempts) = mpsc::unbounded_channel();
+    let app = Router::new()
+        .route("/v2/account", get(|| async {
+            Json(json!({"account_number":"001","currency":"USD","cash":"10000"}))
+        }))
+        .route("/v2/positions", get(|| async { Json(json!([{
+            "symbol":"AAPL","asset_class":"us_equity","qty":"2","side":"long","avg_entry_price":"100"
+        }])) }))
+        .route("/v2/orders", get(|| async { Json(json!([])) }))
+        .route("/v2/orders/EXIT-VENUE", get(move || {
+            let row = child_row.clone();
+            async move { Json(row) }
+        }))
+        .route("/v2/account/activities/FILL", get(async move || {
+            let (reply, received) = oneshot::channel();
+            fill_requests.send(reply).unwrap();
+            received.await.unwrap()
+        }));
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+
+    let client_id = ClientId::from("ALPACA");
+    let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+        delay_post_stop: Duration::ZERO,
+        ..Default::default()
+    })
+    .unwrap()
+    .with_reconciliation(false)
+    .add_exec_client(
+        Some(client_id.to_string()),
+        Box::new(AlpacaExecutionClientFactory),
+        Box::new(config.clone()),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let cache = node.kernel().cache();
+    let trader = node.kernel().trader_id();
+    let account = config.account_id;
+    let strategy = StrategyId::from("RECOVERY-001");
+    let id = InstrumentId::from("AAPL.ALPACA");
+    let instrument = InstrumentAny::Equity(nautilus_model::instruments::Equity {
+        id,
+        ..equity_aapl()
+    });
+    let position_id = PositionId::new(format!("{id}-{strategy}"));
+    let entry = ClientOrderId::from("ENTRY");
+    let exit = ClientOrderId::from("LOCAL-EXIT");
+    let builder = |kind, side, client_order_id| {
+        let mut b = OrderTestBuilder::new(kind);
+        b.trader_id(trader)
+            .strategy_id(strategy)
+            .instrument_id(id)
+            .client_order_id(client_order_id)
+            .side(side)
+            .order_list_id(OrderListId::from("OTO-1"))
+            .time_in_force(TimeInForce::Day)
+            .quantity(Quantity::from(2));
+        b
+    };
+    let mut parent = accept_order(
+        builder(OrderType::Market, OrderSide::Buy, entry)
+            .linked_order_ids(vec![exit])
+            .contingency_type(ContingencyType::Oto)
+            .build(),
+        account,
+        "ENTRY-VENUE",
+    );
+    let child = accept_order(
+        builder(OrderType::Limit, OrderSide::Sell, exit)
+            .parent_order_id(entry)
+            .price(Price::from("105"))
+            .build(),
+        account,
+        "EXIT-VENUE",
+    );
+    let fill = TestOrderEventStubs::filled(
+        &parent,
+        &instrument,
+        Some(TradeId::from("opening")),
+        Some(position_id),
+        Some(Price::from("100")),
+        Some(Quantity::from(2)),
+        None,
+        Some(Money::zero(Currency::USD())),
+        None,
+        Some(account),
+    );
+    parent.apply(fill.clone()).unwrap();
+    let position = Position::new(&instrument, fill.into());
+    {
+        let mut cache = cache.borrow_mut();
+        cache.add_instrument(instrument).unwrap();
+        cache
+            .add_order(parent, Some(position_id), Some(client_id), false)
+            .unwrap();
+        cache
+            .add_order(child, Some(position_id), Some(client_id), false)
+            .unwrap();
+        cache.add_position(&position, OmsType::Netting).unwrap();
+    }
+
+    let handle = node.handle();
+    let broker = async {
+        let original = accept_private(&ws).await;
+        while !handle.is_running() {
+            tokio::task::yield_now().await;
+        }
+        drop(original);
+        let mut replacement = accept_private(&ws).await;
+        attempts
+            .recv()
+            .await
+            .unwrap()
+            .send(Err(StatusCode::SERVICE_UNAVAILABLE))
+            .unwrap();
+        let retry = attempts.recv().await.unwrap();
+        assert_eq!(
+            cache.borrow().order(&exit).unwrap().status(),
+            OrderStatus::Accepted
+        );
+        let ts = now();
+        retry
+            .send(Ok(Json(
+                json!([{"id":"a","order_id":"EXIT-VENUE","symbol":"AAPL","side":"sell",
+            "qty":"1","cum_qty":"1","price":"105","transaction_time":ts}]),
+            )))
+            .unwrap();
+
+        while cache.borrow().order(&exit).unwrap().status() != OrderStatus::PartiallyFilled {
+            tokio::task::yield_now().await;
+        }
+        let replay = json!({"stream":"trade_updates","data":{
+            "event":"partial_fill","timestamp":ts,"qty":"1","price":"105","order":partial
+        }});
+        replacement
+            .send(Message::text(replay.to_string()))
+            .await
+            .unwrap();
+        let mut canceled = partial;
+        canceled["status"] = json!("canceled");
+        let cancel = json!({"stream":"trade_updates","data":{
+            "event":"canceled","timestamp":now(),"order":canceled
+        }});
+        replacement
+            .send(Message::text(cancel.to_string()))
+            .await
+            .unwrap();
+        while cache.borrow().order(&exit).unwrap().status() != OrderStatus::Canceled {
+            tokio::task::yield_now().await;
+        }
+        handle.stop();
+        replacement
+    };
+    let (result, _socket) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(node.run(), broker)
+    })
+    .await
+    .expect("Partial child fill was not recovered and canceled");
+    result.unwrap();
+    {
+        let cache = cache.borrow();
+        let order = cache.order(&exit).unwrap();
+        let position = cache.position(&position_id).unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(1));
+        assert_eq!(order.trade_ids().len(), 1);
+        assert_eq!(position.quantity, Quantity::from(1));
+        assert_eq!(position.trade_ids.len(), 2);
+        assert_eq!(position.realized_pnl, Some(Money::from("5 USD")));
+    }
+    node.dispose();
     server.abort();
 }

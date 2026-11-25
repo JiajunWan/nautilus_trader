@@ -212,6 +212,15 @@ and modifications once reconciliation completes on the current connection.
 WebSocket and REST fills share a trade
 identifier derived from the broker order ID and cumulative filled quantity.
 
+After a restart, the adapter uses the cached Bracket, OTO, or OCO order list to
+identify active children that still lack a broker order ID. It requests the
+parent once per group with `nested=true` and binds its legs to the original
+strategy order IDs, including when the parent has already filled. Closed children
+retain their cached broker IDs for late fills. An individual status query can
+confirm a bound child's zero-fill cancellation using the order record alone.
+If a known group's child cannot be identified, the child query returns an error.
+The account snapshot returns confirmed orders and fills and marks its coverage incomplete.
+
 An order placed outside Nautilus is imported by the execution engine as an
 external order. To claim external orders at startup, configure
 `StrategyConfig.external_order_instrument_ids`. Native Rust strategies return

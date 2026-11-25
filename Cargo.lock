@@ -5921,7 +5921,7 @@ dependencies = [
  "blake3",
  "bon",
  "futures-util",
- "jiff",
+ "jiff 0.2.46",
  "log",
  "nautilus-common",
  "nautilus-core",
