@@ -341,30 +341,41 @@ The example prints aggregate amounts and counts.
 
 ### Incremental fee synchronization
 
-Run the same example with `--sync` to keep a local checkpoint and upsert
-posted fees by activity ID. The start time is the beginning of fee history to
-collect. Reuse the directory and start time to resume after a restart.
+Use `--sync START [INTERVAL_SECONDS]` to receive posted fees as they arrive.
+The example writes one JSON object to stdout per completed poll, including the
+Paper or Live environment, broker account ID, query upper bound (`through`),
+and new or revised fee rows (`fees`).
 
 ```sh
 cargo run --locked -p nautilus-alpaca --example alpaca-fee-report -- \
-    paper --sync ./alpaca-paper-fees 2026-11-20T00:00:00Z
+    paper --sync 2026-11-20T00:00:00Z
 ```
 
 The example runs once by default. Append an interval in seconds (for example,
-`900`) to keep polling after startup. The execution client can also run the
-worker when connected. Set `fee_sync` on the native Rust
-`AlpacaExecutionClientConfig`. Its `AlpacaFeeSyncSettings` supplies
-`directory`, `start`, and `interval`. The job is opt-in and runs independently
-of order handling. The execution client stops it on disconnect. Successful
-polls commit the rows and checkpoint together. Each poll revisits the last
-three days of fee creation times and queries fills starting seven days before
-that fee window. Posted credits are retained with their original sign.
+`900`) to keep polling. To use the native Rust execution client, set
+`AlpacaExecutionClientConfig.fee_sync` to `AlpacaFeeSyncSettings { start, interval }`.
+Subscribe to `data.AlpacaFeeSyncUpdate` before connecting to receive the
+initial batch. The client publishes each subsequent successful poll, including
+empty batches, and stops the worker on disconnect.
 
-Use a separate directory for each broker account and environment. The sync
-reads broker-posted amounts using the Trading API and records the original
-currency and cash-flow sign. Use the stored activity IDs to identify entries
-across synchronization runs. Paper can exercise the read-only sync path.
-Use Live activities to verify actual billed fees.
+The first poll reads fees from `start`. Subsequent polls overlap by three days
+of broker creation time. The worker reuses verified order and execution IDs.
+It groups missing matches by order and looks up their fills by broker UUID.
+A larger group of new orders shares a paginated fill scan starting seven days
+before the fee window. Each poll reads all fee pages for its interval and
+requests up to eight fill pages. An unresolved fee can arrive first as
+`Unmatched` and later with its verified fill.
+Account-level fees carry the original signed amount and require no fill lookup.
+
+The worker keeps its checkpoint and matching state in memory. On restart it
+replays from the configured start. When upgrading, remove the directory from
+the configuration or command line. Existing journal files are no longer used.
+The node's cache database does not automatically store these custom fee rows.
+A subscriber that retains them should upsert by environment, broker account
+ID, and fee activity ID and commit its checkpoint with the rows. When resuming
+from a saved checkpoint, include the overlap and any older unresolved fees
+in the replay range.
+Use the windowed report above for a complete summary of a specified interval.
 
 ## Paper smoke test
 

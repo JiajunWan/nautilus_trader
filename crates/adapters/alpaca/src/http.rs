@@ -32,7 +32,7 @@ use crate::{
 const RATE_LIMIT_RESET: &str = "x-ratelimit-reset";
 
 /// Tokens followed during one HTTP query. Token values are opaque and stay out of diagnostics.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct PageTokens(HashSet<String>);
 
 impl PageTokens {

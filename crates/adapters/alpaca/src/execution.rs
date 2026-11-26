@@ -43,10 +43,13 @@ use jiff::Timestamp;
 use nautilus_common::{
     clients::ExecutionClient,
     live::runner::{get_exec_event_sender, try_get_exec_event_sender},
-    messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    messages::{
+        ExecutionEvent,
+        execution::{
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        },
     },
 };
 use nautilus_core::{
@@ -58,6 +61,7 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::AccountAny,
+    data::{CustomData, ensure_custom_data_json_registered},
     enums::{AssetClass, OmsType},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
@@ -81,7 +85,7 @@ use tokio::{
 };
 
 use self::{
-    fees::{AlpacaFeeSync, AlpacaFeeSyncSettings},
+    fees::{AlpacaFeeSync, AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate},
     orders::{
         OrderGroup, extended_hours, option_order_request, order_list_request, order_request,
         replacement_instructions,
@@ -137,6 +141,7 @@ impl AlpacaExecutionClient {
     ) -> anyhow::Result<Self> {
         if let Some(settings) = &config.fee_sync {
             settings.validate()?;
+            ensure_custom_data_json_registered::<AlpacaFeeSyncUpdate>()?;
         }
         let credentials = config.credentials()?;
         let http = AlpacaHttpClient::new(
@@ -491,13 +496,22 @@ impl ExecutionClient for AlpacaExecutionClient {
         log::info!("Connected Alpaca execution client {}", self.core.client_id);
         self.socket = Some(socket);
         self.core.set_connected();
-        if let Some(settings) = self.fee_sync.clone()
-            && let Err(error) = self.spawn(
-                "fee_sync",
-                AlpacaFeeSync::run_from_http(self.http.clone(), self.environment, settings),
-            )
-        {
-            log::warn!("Could not start Alpaca fee synchronization: {error}");
+        if let Some(settings) = self.fee_sync.clone() {
+            let sender = get_exec_event_sender();
+            let worker = AlpacaFeeSync::run_from_http(
+                self.http.clone(),
+                self.environment,
+                settings,
+                move |update| {
+                    let data = CustomData::from_arc(Arc::new(update));
+                    sender
+                        .send(ExecutionEvent::Data(data))
+                        .context("Publishing Alpaca fee sync update")
+                },
+            );
+            if let Err(error) = self.spawn("fee_sync", worker) {
+                log::warn!("Could not start Alpaca fee synchronization: {error}");
+            }
         }
         Ok(())
     }

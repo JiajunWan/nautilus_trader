@@ -15,7 +15,11 @@
 
 //! Reports posted Alpaca fees without opening an execution session.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    io::{self, Write},
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow, bail};
 use nautilus_alpaca::{
@@ -45,8 +49,8 @@ async fn main() -> Result<()> {
         .build();
 
     if action.first().is_some_and(|arg| arg == "--sync") {
-        let [_, directory, start, interval @ ..] = action else {
-            bail!("Expected --sync DIRECTORY START [INTERVAL_SECONDS]");
+        let [_, start, interval @ ..] = action else {
+            bail!("Expected --sync START [INTERVAL_SECONDS]");
         };
         anyhow::ensure!(interval.len() <= 1, "Expected at most one polling interval");
         let interval = interval
@@ -54,19 +58,17 @@ async fn main() -> Result<()> {
             .map(|secs| secs.parse::<u64>())
             .transpose()?;
         let settings = AlpacaFeeSyncSettings {
-            directory: directory.into(),
             start: parse_time(start)?,
             interval: Duration::from_secs(interval.unwrap_or(900)),
         };
         let mut sync = AlpacaFeeSync::open(&config, settings).await?;
         if interval.is_some() {
-            sync.run(print_update).await;
+            sync.run(|update| print_update(&update)).await?;
         } else {
-            print_update(
-                sync.sync_through(get_atomic_clock_realtime().get_time_ns())
-                    .await?,
-            );
-            print_report(sync.report()?);
+            let update = sync
+                .sync_through(get_atomic_clock_realtime().get_time_ns())
+                .await?;
+            print_update(&update)?;
         }
     } else {
         let [start, end, fill_start] = action else {
@@ -93,11 +95,11 @@ fn parse_time(value: &str) -> Result<UnixNanos> {
         .map_err(|_| anyhow!("Timestamp is outside the supported range"))
 }
 
-fn print_update(update: AlpacaFeeSyncUpdate) {
-    println!(
-        "Synced through {}: {} new, {} updated",
-        update.through, update.inserted, update.updated,
-    );
+fn print_update(update: &AlpacaFeeSyncUpdate) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, update)?;
+    writeln!(stdout)?;
+    Ok(())
 }
 
 fn print_report(report: AlpacaFeeReport) {

@@ -15,19 +15,28 @@
 
 //! Read-only reconciliation of broker-booked USD and other currency fees.
 
+mod lookup;
 mod sync;
+mod update;
 
-use std::collections::{BTreeMap, HashMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    time::Duration,
+};
 
 use anyhow::{Context, ensure};
 use nautilus_core::{UnixNanos, string::secret::SecretString};
-use nautilus_model::identifiers::{TradeId, VenueOrderId};
+use nautilus_model::identifiers::TradeId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 pub use sync::{AlpacaFeeSync, AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate};
 
+use self::lookup::{FillEvidence, match_fills, requested_executions};
 use super::reports;
-use crate::{config::AlpacaExecutionClientConfig, http::AlpacaHttpClient};
+use crate::{
+    config::AlpacaExecutionClientConfig,
+    http::{AlpacaApiError, AlpacaHttpClient},
+};
 
 /// A snapshot of posted fees, with signed amounts in the original currencies.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -143,54 +152,65 @@ async fn fetch_fee_report(
         fill_start <= start && start < end,
         "Invalid Alpaca fee report bounds"
     );
-    let fees = reports::activities(http, "FEE", Some(start), Some(end), |fee: &FeeActivity| {
-        &fee.id
-    })
-    .await?;
-    let fees = unique_activities(fees, |fee| &fee.id, "fee")?;
-    let fees: Vec<_> = fees
-        .into_values()
-        .filter(|fee| {
-            fee.status
-                .as_deref()
-                .is_none_or(|status| status == "executed")
-        })
-        .collect();
-
-    let fills = if fees.iter().any(|fee| match_key(fee).is_some()) {
+    let mut rows = fetch_fee_rows(http, start, end).await?;
+    let wanted = requested_executions(&rows);
+    if !wanted.is_empty() {
+        let mut evidence = FillEvidence::default();
         let fills = reports::fills(http, Some(fill_start), Some(end)).await?;
-        unique_activities(fills, |fill| &fill.id, "fill")?
-    } else {
-        BTreeMap::new()
-    };
+        evidence.observe(
+            unique_activities(fills, |fill| &fill.id, "fill")?.into_values(),
+            &wanted,
+        )?;
+        evidence.apply(&mut rows, &mut BTreeMap::new())?;
+    }
+    summarize(rows)
+}
 
-    let mut fill_index = HashMap::new();
-    for fill in fills.values() {
-        // Live Trading API returns a paginable FILL ID ending in ::<execution_id>.
-        if let Some((prefix, execution_id)) = fill.id.rsplit_once("::")
-            && !prefix.is_empty()
-            && !execution_id.is_empty()
+async fn fetch_fee_rows(
+    http: &AlpacaHttpClient,
+    start: UnixNanos,
+    end: UnixNanos,
+) -> anyhow::Result<Vec<AlpacaReconciledFee>> {
+    let mut query = reports::ActivitiesQuery::new(Some(start), Some(end), None);
+    let mut fees = Vec::new();
+    let mut retries = 0;
+    loop {
+        match query
+            .next_page(http, "FEE", |fee: &FeeActivity| &fee.id)
+            .await
         {
-            fill_index
-                .entry((fill.order_id.as_str(), execution_id))
-                .and_modify(|matched| *matched = None)
-                .or_insert(Some(fill));
+            Ok((page, more)) => {
+                fees.extend(page);
+                if !more {
+                    break;
+                }
+                retries = 0;
+            }
+            Err(error)
+                if retries < 3
+                    && error
+                        .downcast_ref::<AlpacaApiError>()
+                        .is_some_and(|e| e.status == 429) =>
+            {
+                // Retain the completed prefix and retry this exact page. A long initial
+                // backfill can otherwise repeatedly exhaust the quota at the same cursor.
+                let backoff = Duration::from_secs(1 << retries);
+                tokio::time::sleep(sync::retry_delay(backoff, &error)).await;
+                retries += 1;
+            }
+            Err(error) => return Err(error),
         }
     }
-
-    let mut rows = Vec::with_capacity(fees.len());
-    for fee in fees {
-        let attribution = if let Some(fill) =
-            match_key(&fee).and_then(|key| fill_index.get(&key).copied().flatten())
+    let mut rows = Vec::new();
+    for fee in unique_activities(fees, |fee| &fee.id, "fee")?.into_values() {
+        if fee
+            .status
+            .as_deref()
+            .is_some_and(|status| status != "executed")
         {
-            AlpacaFeeAttribution::Fill {
-                fill_activity_id: fill.id.clone(),
-                trade_id: reports::trade_id(
-                    VenueOrderId::new_checked(&fill.order_id)?,
-                    fill.cum_qty,
-                )?,
-            }
-        } else if link(&fee.order_id).is_none() && link(&fee.execution_id).is_none() {
+            continue;
+        }
+        let attribution = if link(&fee.order_id).is_none() && link(&fee.execution_id).is_none() {
             AlpacaFeeAttribution::Account
         } else {
             AlpacaFeeAttribution::Unmatched
@@ -214,7 +234,7 @@ async fn fetch_fee_report(
             attribution,
         });
     }
-    summarize(rows)
+    Ok(rows)
 }
 
 fn summarize(fees: Vec<AlpacaReconciledFee>) -> anyhow::Result<AlpacaFeeReport> {
@@ -241,7 +261,7 @@ fn link(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.trim().is_empty())
 }
 
-fn match_key(fee: &FeeActivity) -> Option<(&str, &str)> {
+fn match_key(fee: &AlpacaReconciledFee) -> Option<(&str, &str)> {
     Some((link(&fee.order_id)?, link(&fee.execution_id)?))
 }
 

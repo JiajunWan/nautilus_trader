@@ -268,7 +268,7 @@ impl Position {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(super) struct FillActivity {
     pub id: String,
     pub order_id: String,
@@ -426,16 +426,58 @@ async fn fetch_orders(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ActivitiesQuery<'a> {
-    direction: &'a str,
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct ActivitiesQuery {
+    direction: &'static str,
     page_size: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     page_token: Option<String>,
+    #[serde(skip)]
+    seen: PageTokens,
+}
+
+impl ActivitiesQuery {
+    pub(super) fn new(
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        order_id: Option<String>,
+    ) -> Self {
+        Self {
+            direction: "asc",
+            page_size: 100,
+            after: start.map(|ts| ts.to_datetime_utc().to_string()),
+            until: end.map(|ts| ts.to_datetime_utc().to_string()),
+            order_id,
+            page_token: None,
+            seen: PageTokens::default(),
+        }
+    }
+
+    /// Returns one page and whether another page is required. Time bounds and filters
+    /// stay fixed while following the venue's opaque cursor, including across polls.
+    pub(super) async fn next_page<T: DeserializeOwned>(
+        &mut self,
+        http: &AlpacaHttpClient,
+        activity_type: &str,
+        id: impl FnOnce(&T) -> &str,
+    ) -> anyhow::Result<(Vec<T>, bool)> {
+        let path = format!("/v2/account/activities/{activity_type}");
+        let page: Vec<T> = http.get(&path, self).await?;
+        let next = next_page_id(&page, self.page_size, id);
+        if let Some(cursor) = &next {
+            self.seen
+                .check(cursor, &format!("{activity_type} activities"))?;
+        }
+        let more = next.is_some();
+        self.page_token = next;
+        Ok((page, more))
+    }
 }
 
 pub(super) async fn fills(
@@ -453,26 +495,14 @@ pub(super) async fn activities<T: DeserializeOwned>(
     end: Option<UnixNanos>,
     id: impl Fn(&T) -> &str,
 ) -> anyhow::Result<Vec<T>> {
-    let mut seen = PageTokens::default();
-    let mut query = ActivitiesQuery {
-        direction: "asc",
-        page_size: 100,
-        after: start.map(|ts| ts.to_datetime_utc().to_string()),
-        until: end.map(|ts| ts.to_datetime_utc().to_string()),
-        page_token: None,
-    };
-    let path = format!("/v2/account/activities/{activity_type}");
-    let resource = format!("{activity_type} activities");
+    let mut query = ActivitiesQuery::new(start, end, None);
     let mut result = Vec::new();
     loop {
-        let page: Vec<T> = http.get(&path, &query).await?;
-        let next = next_page_id(&page, query.page_size, &id);
+        let (page, more) = query.next_page(http, activity_type, &id).await?;
         result.extend(page);
-        let Some(cursor) = next else {
+        if !more {
             return Ok(result);
-        };
-        seen.check(&cursor, &resource)?;
-        query.page_token = Some(cursor);
+        }
     }
 }
 

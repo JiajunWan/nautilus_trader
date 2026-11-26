@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use axum::{Json, Router, extract::Query, routing::get};
+use nautilus_model::identifiers::VenueOrderId;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -267,4 +268,186 @@ async fn fee_report_rejects_conflicting_copies_of_one_fee() {
             .contains("Conflicting Alpaca fee activity"),
         "{error:#}",
     );
+}
+
+#[tokio::test]
+async fn fee_fill_budget_resumes_bulk_before_matching_then_targets_old_misses() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let orders: Vec<_> = (0..5)
+        .map(|i| format!("10000000-0000-4000-8000-{i:012}"))
+        .collect();
+    let bulk = Arc::new(AtomicUsize::new(0));
+    let targeted = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v2/account/activities/FEE",
+            get({
+                let mut fees: Vec<_> = orders
+                    .iter()
+                    .enumerate()
+                    .map(|(i, order)| linked_fee(i, "ICF", "-1.00", order, EXECUTION))
+                    .collect();
+                fees.push(linked_fee(5, "ICF", "-1.00", &orders[0], OTHER_EXECUTION));
+                move || {
+                    let fees = fees.clone();
+                    async move { Json(fees) }
+                }
+            }),
+        )
+        .route(
+            "/v2/account/activities/FILL",
+            get({
+                let orders = orders.clone();
+                let bulk = Arc::clone(&bulk);
+                let targeted = Arc::clone(&targeted);
+                move |Query(query): Query<HashMap<String, String>>| {
+                    let result = if let Some(order) = query.get("order_id") {
+                        targeted.fetch_add(1, Ordering::SeqCst);
+                        assert!(!query.contains_key("after"));
+                        if order == &orders[0] {
+                            vec![
+                                fill(order, "ambiguous-a", EXECUTION, "1"),
+                                // Scoped response omits the second fill seen by the bulk query.
+                                fill(order, "matched-later", OTHER_EXECUTION, "3"),
+                            ]
+                        } else {
+                            assert_eq!(order, &orders[4]);
+                            vec![fill(order, "older-than-bulk", EXECUTION, "1")]
+                        }
+                    } else {
+                        let page = bulk.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(ns(&query["until"]), ns(EARLY_END));
+                        assert_eq!(ns(&query["after"]), ns(FILL_START));
+                        if page > 0 {
+                            assert_eq!(
+                                query["page_token"],
+                                format!("cursor-{}::{OTHER_EXECUTION}", page - 1)
+                            );
+                        }
+                        if page == 8 {
+                            let mut rows = vec![fill(&orders[0], "ambiguous-b", EXECUTION, "2")];
+                            for (i, order) in orders[1..4].iter().enumerate() {
+                                rows.push(fill(order, &format!("matched-{i}"), EXECUTION, "1"));
+                            }
+                            rows
+                        } else {
+                            let irrelevant = fill(OTHER_ORDER, "skip", OTHER_EXECUTION, "1");
+                            let mut rows = vec![irrelevant; 99];
+                            if page == 0 {
+                                rows[0] = fill(&orders[0], "ambiguous-a", EXECUTION, "1");
+                            }
+                            rows.push(fill(
+                                OTHER_ORDER,
+                                &format!("cursor-{page}"),
+                                OTHER_EXECUTION,
+                                "1",
+                            ));
+                            rows
+                        }
+                    };
+                    async move { Json(result) }
+                }
+            }),
+        );
+    let http = client(app).await;
+    let mut rows = fetch_fee_rows(&http, ns(START), ns(EARLY_END))
+        .await
+        .unwrap();
+    let mut lookup = lookup::FillLookup::default();
+    match_fills(
+        &http,
+        &mut rows,
+        &BTreeMap::new(),
+        &mut lookup,
+        ns(FILL_START),
+        ns(EARLY_END),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bulk.load(Ordering::SeqCst), 8);
+    assert_eq!(targeted.load(Ordering::SeqCst), 0);
+    assert!(
+        rows.iter()
+            .all(|row| row.attribution == AlpacaFeeAttribution::Unmatched)
+    );
+    let known = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.clone()))
+        .collect();
+    match_fills(&http, &mut rows, &known, &mut lookup, ns(START), ns(END))
+        .await
+        .unwrap();
+    assert_eq!(bulk.load(Ordering::SeqCst), 9);
+    assert_eq!(targeted.load(Ordering::SeqCst), 2);
+    assert_eq!(rows[0].attribution, AlpacaFeeAttribution::Unmatched);
+    assert!(
+        rows[1..]
+            .iter()
+            .all(|row| matches!(row.attribution, AlpacaFeeAttribution::Fill { .. }))
+    );
+
+    // The same conflicting reference remains unverified on a later poll, even
+    // when another fee requires a fresh query on its order.
+    let known = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.clone()))
+        .collect();
+    let mut pending = rows[0].clone();
+    pending.id = fee_id(6);
+    pending.execution_id = Some("missing".to_owned());
+    rows.push(pending);
+    match_fills(&http, &mut rows, &known, &mut lookup, ns(START), ns(END))
+        .await
+        .unwrap();
+    assert_eq!(targeted.load(Ordering::SeqCst), 3);
+    assert_eq!(rows[0].attribution, AlpacaFeeAttribution::Unmatched);
+}
+
+#[tokio::test]
+async fn fee_pagination_retries_throttled_page_without_restarting_backfill() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{http::StatusCode, response::IntoResponse};
+
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v2/account/activities/FEE",
+        get({
+            let first = Arc::clone(&first);
+            let second = Arc::clone(&second);
+            move |Query(query): Query<HashMap<String, String>>| {
+                let status_and_rows = if let Some(cursor) = query.get("page_token") {
+                    assert_eq!(cursor, &fee_id(99));
+                    if second.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            json!({"code":42_910_000,"message":"rate limited"}),
+                        )
+                    } else {
+                        (StatusCode::OK, json!([fee(100, "REG", "-1.00")]))
+                    }
+                } else {
+                    first.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        json!((0..100).map(|i| fee(i, "REG", "-1.00")).collect::<Vec<_>>()),
+                    )
+                };
+                async move { (status_and_rows.0, Json(status_and_rows.1)).into_response() }
+            }
+        }),
+    );
+    let http = client(app).await;
+    let rows = fetch_fee_rows(&http, ns(START), ns(END)).await.unwrap();
+    assert_eq!(rows.len(), 101);
+    assert_eq!(first.load(Ordering::SeqCst), 1);
+    assert_eq!(second.load(Ordering::SeqCst), 2);
 }

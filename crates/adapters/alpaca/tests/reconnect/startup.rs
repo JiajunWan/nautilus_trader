@@ -20,7 +20,12 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
 use futures_util::SinkExt;
 use nautilus_alpaca::{
-    common::ALPACA_VENUE, config::AlpacaExecutionClientConfig, execution::AlpacaExecutionClient,
+    common::{ALPACA_VENUE, enums::AlpacaEnvironment},
+    config::AlpacaExecutionClientConfig,
+    execution::{
+        AlpacaExecutionClient,
+        fees::{AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate},
+    },
     factories::AlpacaExecutionClientFactory,
 };
 use nautilus_common::{
@@ -29,12 +34,14 @@ use nautilus_common::{
     clients::ExecutionClient,
     live::runner::{set_data_event_sender, set_exec_event_sender},
     messages::{ExecutionEvent, ExecutionReport},
+    msgbus::{self, ShareableMessageHandler},
 };
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{
     ExecutionClientCore, builder::LiveNodeBuilder, config::LiveNodeConfig, node::LiveNodeHandle,
 };
 use nautilus_model::{
+    data::{CustomData, Data},
     enums::{
         AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
     },
@@ -589,4 +596,90 @@ async fn reconnect_books_a_partial_child_fill_once_across_rest_and_stream() {
     }
     node.dispose();
     server.abort();
+}
+
+#[tokio::test]
+async fn configured_fee_sync_publishes_upserts_and_empty_polls_on_the_node_bus() {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let start = get_atomic_clock_realtime().get_time_ns();
+    let app = Router::new()
+        .route("/v2/account", get(|| async {
+            Json(json!({"id":"broker-account","currency":"USD","cash":"10000"}))
+        }))
+        .route("/v2/positions", get(|| async { Json(json!([])) }))
+        .route("/v2/orders", get(|| async { Json(json!([])) }))
+        .route("/v2/account/activities/FILL", get(|| async { Json(json!([])) }))
+        .route("/v2/account/activities/FEE", get(move || async move {
+            Json(json!([{"id":"fee-1","net_amount":"-0.17","currency":"USD","created_at": start.to_rfc3339()}]))
+        }));
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .fee_sync(AlpacaFeeSyncSettings {
+            start: UnixNanos::from(start.as_u64() - 1_000_000_000),
+            interval: Duration::from_millis(50),
+        })
+        .build();
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+    let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+        delay_post_stop: Duration::ZERO,
+        ..Default::default()
+    })
+    .unwrap()
+    .add_exec_client(
+        Some("ALPACA".into()),
+        Box::new(AlpacaExecutionClientFactory),
+        Box::new(config),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+
+    let updates = Rc::new(RefCell::new(Vec::new()));
+    let received = Rc::clone(&updates);
+    let handle = node.handle();
+    let handler = ShareableMessageHandler::from_typed(move |custom: &CustomData| {
+        let update = custom
+            .data
+            .as_any()
+            .downcast_ref::<AlpacaFeeSyncUpdate>()
+            .unwrap();
+        // Subscribers can also decode the registered type from its serialized envelope.
+        let bytes = serde_json::to_vec(&Data::Custom(custom.clone())).unwrap();
+        let decoded: Data = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, Data::Custom(custom.clone()));
+        let mut received = received.borrow_mut();
+        received.push(update.clone());
+        if received.len() >= 2 && handle.is_running() {
+            handle.stop();
+        }
+    });
+    let topic = "data.AlpacaFeeSyncUpdate".into();
+    msgbus::subscribe_any(topic, handler.clone(), None);
+    let (result, _socket) = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::join!(node.run(), accept_private(&ws))
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    msgbus::unsubscribe_any(topic, &handler);
+    node.dispose();
+    server.abort();
+
+    let updates = updates.borrow();
+    let first = &updates[0];
+    assert_eq!(first.environment, AlpacaEnvironment::Paper);
+    assert_eq!(first.broker_account_id, "broker-account");
+    assert_eq!(first.fees.len(), 1);
+    assert_eq!(first.fees[0].id, "fee-1");
+    assert_eq!(first.fees[0].net_amount.to_string(), "-0.17");
+    assert!(updates[1..].iter().all(|update| update.fees.is_empty()));
+    assert!(
+        updates
+            .windows(2)
+            .all(|pair| pair[0].through < pair[1].through)
+    );
 }

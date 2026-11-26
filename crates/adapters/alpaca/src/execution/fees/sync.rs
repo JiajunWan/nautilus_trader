@@ -13,50 +13,44 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Incremental, read-only sync of broker fee activities.
+//! Incremental, read-only sync of posted Alpaca fees.
 
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    fs::{self, File, OpenOptions},
-    io::ErrorKind,
-    path::{Path, PathBuf},
+    collections::{BTreeMap, HashSet},
     time::Duration,
 };
 
-use anyhow::{Context, ensure};
+use anyhow::ensure;
+use jiff::Timestamp;
 use nautilus_core::{DurationNanos, UnixNanos};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
 use super::{
-    AlpacaFeeAttribution, AlpacaFeeReport, AlpacaReconciledFee, fee_http_client, fetch_fee_report,
-    summarize,
+    AlpacaFeeAttribution, AlpacaReconciledFee, fee_http_client, fetch_fee_rows,
+    lookup::{FillLookup, lookup_key},
+    match_fills,
 };
 use crate::{
-    common::enums::AlpacaEnvironment, config::AlpacaExecutionClientConfig, http::AlpacaHttpClient,
+    common::enums::AlpacaEnvironment,
+    config::AlpacaExecutionClientConfig,
+    http::{AlpacaApiError, AlpacaHttpClient},
 };
 
-const STATE_VERSION: u8 = 1;
 const FEE_OVERLAP: DurationNanos = DurationNanos::new(3 * 86_400_000_000_000);
 const FILL_LOOKBACK: DurationNanos = DurationNanos::new(7 * 86_400_000_000_000);
 
-/// Settings for an opt-in Alpaca fee activity sync.
+/// Settings for an in-memory, read-only fee sync.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlpacaFeeSyncSettings {
-    /// Private state directory, dedicated to a single broker account and environment.
-    pub directory: PathBuf,
-    /// Earliest fee creation time to query on the first run.
+    /// Earliest fee creation time to replay on each new connection.
     pub start: UnixNanos,
-    /// Delay between polling attempts for the managed background worker.
+    /// Delay between polling attempts.
     pub interval: Duration,
 }
 
 impl AlpacaFeeSyncSettings {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            !self.directory.as_os_str().is_empty(),
-            "Alpaca fee sync requires a state directory"
-        );
         ensure!(
             !self.interval.is_zero(),
             "Alpaca fee sync requires a positive interval"
@@ -65,40 +59,38 @@ impl AlpacaFeeSyncSettings {
     }
 }
 
-/// Changes committed by one completed fee sync.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Posted fee changes returned by one successful poll.
+///
+/// Consumers can upsert each row by environment, broker account ID and fee
+/// activity ID. A replay may deliver a row again. A later change to its
+/// amount or attribution replaces the previous row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlpacaFeeSyncUpdate {
-    /// Number of newly booked activity IDs.
-    pub inserted: usize,
-    /// Number of known activities whose details or attribution changed.
-    pub updated: usize,
-    /// Exclusive upper bound of the completed activity query.
+    /// Broker environment that produced these activities.
+    pub environment: AlpacaEnvironment,
+    /// Broker account UUID returned by the authenticated Trading API.
+    pub broker_account_id: String,
+    /// Exclusive upper bound of the completed fee query.
     pub through: UnixNanos,
+    /// New or revised posted fee activities, including changes in attribution.
+    pub fees: Vec<AlpacaReconciledFee>,
 }
 
-/// Single-writer fee journal and polling checkpoint for one Alpaca broker account.
+/// Polls Alpaca fee activities for one broker account without a private journal.
 ///
-/// Journal rows and the checkpoint are committed together. Each polling cycle
-/// overlaps the last three days by creation time. Attribution queries extend
-/// seven days before the start of that cycle. Broker activity IDs remain unique
-/// for the life of the journal.
+/// The first poll replays from the configured start. Later polls overlap three
+/// days of fee creation times. The working set holds recent rows and unresolved
+/// order/execution references that can still be matched to a broker fill.
+/// To rebuild historical totals, replay the period or query a fee report.
 #[derive(Debug)]
 pub struct AlpacaFeeSync {
     http: AlpacaHttpClient,
-    interval: Duration,
-    path: PathBuf,
-    state: FeeSyncState,
-    _lock: File,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct FeeSyncState {
-    version: u8,
-    broker_account_id: String,
+    settings: AlpacaFeeSyncSettings,
     environment: AlpacaEnvironment,
-    start: UnixNanos,
+    broker_account_id: String,
     through: UnixNanos,
     fees: BTreeMap<String, AlpacaReconciledFee>,
+    lookup: FillLookup,
 }
 
 #[derive(Deserialize)]
@@ -107,12 +99,12 @@ struct BrokerAccount {
 }
 
 impl AlpacaFeeSync {
-    /// Verifies the authenticated account and opens its local fee journal.
+    /// Opens an in-memory sync for the authenticated broker account.
     ///
     /// # Errors
     ///
-    /// Returns an error on invalid settings, failed broker authentication,
-    /// unreadable state, mismatched account or environment, or an existing writer.
+    /// Returns an error if the settings or broker account response are invalid,
+    /// or the Trading API cannot be reached.
     pub async fn open(
         config: &AlpacaExecutionClientConfig,
         settings: AlpacaFeeSyncSettings,
@@ -126,159 +118,124 @@ impl AlpacaFeeSync {
         settings: AlpacaFeeSyncSettings,
     ) -> anyhow::Result<Self> {
         settings.validate()?;
-        let account = Self::broker_account(&http).await?;
-        Self::restore(http, environment, settings, account)
-    }
-
-    async fn broker_account(http: &AlpacaHttpClient) -> anyhow::Result<BrokerAccount> {
         let account: BrokerAccount = http.get("/v2/account", &()).await?;
         ensure!(
             !account.id.trim().is_empty(),
             "Alpaca fee sync requires a broker account ID"
         );
-        Ok(account)
-    }
-
-    fn restore(
-        http: AlpacaHttpClient,
-        environment: AlpacaEnvironment,
-        settings: AlpacaFeeSyncSettings,
-        account: BrokerAccount,
-    ) -> anyhow::Result<Self> {
-        fs::create_dir_all(&settings.directory).context("Creating Alpaca fee sync directory")?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(settings.directory.join("fees.lock"))
-            .context("Opening Alpaca fee sync lock")?;
-        lock.try_lock()
-            .context("Acquiring Alpaca fee sync writer lock")?;
-
-        let mut path = settings.directory;
-        path.push("fees.json");
-        let state = match File::open(&path) {
-            Ok(file) => {
-                let state: FeeSyncState = serde_json::from_reader(std::io::BufReader::new(file))
-                    .context("Reading Alpaca fee sync state")?;
-                ensure!(
-                    state.version == STATE_VERSION
-                        && state.broker_account_id == account.id
-                        && state.environment == environment
-                        && state.start == settings.start
-                        && state.through >= state.start,
-                    "Alpaca fee sync state does not match the account, environment, start, or schema version"
-                );
-                state
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => FeeSyncState {
-                version: STATE_VERSION,
-                broker_account_id: account.id,
-                environment,
-                start: settings.start,
-                through: settings.start,
-                fees: BTreeMap::new(),
-            },
-            Err(error) => return Err(error).context("Opening Alpaca fee sync state"),
-        };
         Ok(Self {
             http,
-            interval: settings.interval,
-            path,
-            state,
-            _lock: lock,
+            environment,
+            broker_account_id: account.id,
+            through: settings.start,
+            settings,
+            fees: BTreeMap::new(),
+            lookup: FillLookup::default(),
         })
     }
 
-    /// Returns the current journal with exact signed totals per currency.
+    /// Returns new or revised rows through the exclusive fee creation bound.
+    ///
+    /// An empty update advances the fee watermark. An unresolved reference is
+    /// returned as unmatched, then returned again when fill evidence is found.
+    /// A fresh sync replays the configured range, including outstanding fees.
     ///
     /// # Errors
     ///
-    /// Returns an error if the aggregate cannot be represented.
-    pub fn report(&self) -> anyhow::Result<AlpacaFeeReport> {
-        summarize(self.state.fees.values().cloned().collect())
-    }
-
-    /// Fetches and commits posted fees up to the specified upper bound.
-    ///
-    /// A successful empty scan also advances the checkpoint. A scan at the
-    /// same upper bound can pick up results that were unavailable previously.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the upper bound precedes the checkpoint, broker
-    /// data cannot be read, or the journal cannot be committed.
+    /// Returns an error if the end precedes the watermark or the broker data
+    /// cannot be read or validated. A failed poll does not advance the watermark.
     pub async fn sync_through(&mut self, end: UnixNanos) -> anyhow::Result<AlpacaFeeSyncUpdate> {
         ensure!(
-            end >= self.state.through,
-            "Alpaca fee sync upper bound precedes its checkpoint"
+            end >= self.through,
+            "Alpaca fee sync end precedes its watermark"
         );
         let mut update = AlpacaFeeSyncUpdate {
-            inserted: 0,
-            updated: 0,
+            environment: self.environment,
+            broker_account_id: self.broker_account_id.clone(),
             through: end,
+            fees: Vec::new(),
         };
-        if end == self.state.start {
+        if end == self.settings.start {
             return Ok(update);
         }
         let start = self
-            .state
             .through
             .saturating_sub(FEE_OVERLAP)
-            .max(self.state.start);
-        let report =
-            fetch_fee_report(&self.http, start, end, start.saturating_sub(FILL_LOOKBACK)).await?;
+            .max(self.settings.start);
+        let mut rows = fetch_fee_rows(&self.http, start, end).await?;
+        let fetched: HashSet<_> = rows.iter().map(|fee| fee.id.clone()).collect();
+        rows.extend(
+            self.fees
+                .values()
+                .filter(|fee| retryable(fee) && !fetched.contains(&fee.id))
+                .cloned(),
+        );
+        match_fills(
+            &self.http,
+            &mut rows,
+            &self.fees,
+            &mut self.lookup,
+            start.saturating_sub(FILL_LOOKBACK),
+            end,
+        )
+        .await?;
 
-        let mut next = self.state.clone();
-        for mut fee in report.fees {
-            match next.fees.entry(fee.id.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(fee);
-                    update.inserted += 1;
-                }
-                Entry::Occupied(mut entry) => {
-                    let current = entry.get();
-                    // A shorter fill window cannot disprove previously observed linkage.
-                    if matches!(current.attribution, AlpacaFeeAttribution::Fill { .. })
-                        && fee.attribution == AlpacaFeeAttribution::Unmatched
-                        && current.order_id == fee.order_id
-                        && current.execution_id == fee.execution_id
-                    {
-                        fee.attribution = current.attribution.clone();
-                    }
-                    if current != &fee {
-                        entry.insert(fee);
-                        update.updated += 1;
-                    }
-                }
+        update.fees = rows
+            .into_iter()
+            .filter(|fee| self.fees.get(&fee.id) != Some(fee))
+            .collect();
+        let next_start = end.saturating_sub(FEE_OVERLAP);
+        let retain = |fee: &AlpacaReconciledFee| {
+            retryable(fee)
+                || fee
+                    .created_at
+                    .as_deref()
+                    .and_then(|ts| ts.parse::<UnixNanos>().ok())
+                    .map_or_else(
+                        || fetched.contains(&fee.id),
+                        |created| created >= next_start,
+                    )
+        };
+        self.fees.retain(|_, fee| retain(fee));
+        for fee in &update.fees {
+            if retain(fee) {
+                self.fees.insert(fee.id.clone(), fee.clone());
+            } else {
+                self.fees.remove(&fee.id);
             }
         }
-        if update.inserted > 0
-            || update.updated > 0
-            || !self.path.exists()
-            || end != self.state.through
-        {
-            next.through = end;
-            save_state(&self.path, &next)?;
-            self.state = next;
-        }
+        self.through = end;
         Ok(update)
     }
 
-    /// Polls immediately and then at the configured interval until cancelled.
+    /// Polls immediately and delivers each successful update until cancelled.
     ///
-    /// Failed attempts leave the checkpoint in place and retry on the next
-    /// interval. The callback receives each successful committed update.
-    pub async fn run(&mut self, mut on_update: impl FnMut(AlpacaFeeSyncUpdate)) {
+    /// # Errors
+    ///
+    /// Stops on a consumer error and resets the working set for replay from the
+    /// configured start. A durable consumer can save its own rows and watermark
+    /// together and include unresolved fee references when selecting a restart range.
+    pub async fn run(
+        &mut self,
+        mut on_update: impl FnMut(AlpacaFeeSyncUpdate) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         loop {
+            let mut delay = self.settings.interval;
             match self.sync_through(super::super::now()).await {
-                Ok(update) => on_update(update),
+                Ok(update) => {
+                    if let Err(error) = on_update(update) {
+                        self.through = self.settings.start;
+                        self.fees.clear();
+                        self.lookup = FillLookup::default();
+                        return Err(error.context("Delivering Alpaca fee sync update"));
+                    }
+                }
                 Err(error) => {
-                    log::warn!("Alpaca fee poll failed; retrying at the next interval: {error:#}");
+                    delay = retry_delay(delay, &error);
+                    log::warn!("Alpaca fee poll failed, retrying in {delay:?}: {error:#}");
                 }
             }
-            tokio::time::sleep(self.interval).await;
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -286,47 +243,36 @@ impl AlpacaFeeSync {
         http: AlpacaHttpClient,
         environment: AlpacaEnvironment,
         settings: AlpacaFeeSyncSettings,
+        on_update: impl FnMut(AlpacaFeeSyncUpdate) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         settings.validate()?;
-        let account = loop {
-            match Self::broker_account(&http).await {
-                Ok(account) => break account,
-                Err(error) => log::warn!(
-                    "Alpaca fee account lookup failed; retrying at the next interval: {error:#}"
-                ),
+        let mut sync = loop {
+            match Self::open_from_http(http.clone(), environment, settings.clone()).await {
+                Ok(sync) => break sync,
+                Err(error) => {
+                    let delay = retry_delay(settings.interval, &error);
+                    log::warn!(
+                        "Alpaca fee account lookup failed, retrying in {delay:?}: {error:#}"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
             }
-            tokio::time::sleep(settings.interval).await;
         };
-        let mut sync = Self::restore(http, environment, settings, account)?;
-        sync.run(|update| {
-            log::debug!(
-                "Alpaca fee sync through {}: {} new, {} updated",
-                update.through,
-                update.inserted,
-                update.updated,
-            );
-        })
-        .await;
-        Ok(())
+        sync.run(on_update).await
     }
 }
 
-fn save_state(path: &Path, state: &FeeSyncState) -> anyhow::Result<()> {
-    let directory = path
-        .parent()
-        .context("Alpaca fee journal path is missing its directory")?;
-    let mut file =
-        NamedTempFile::new_in(directory).context("Preparing Alpaca fee sync checkpoint")?;
-    let mut writer = std::io::BufWriter::new(file.as_file_mut());
-    serde_json::to_writer(&mut writer, state).context("Writing Alpaca fee sync checkpoint")?;
-    std::io::Write::flush(&mut writer).context("Flushing Alpaca fee sync checkpoint")?;
-    drop(writer);
-    file.as_file()
-        .sync_all()
-        .context("Syncing Alpaca fee sync checkpoint")?;
-    file.persist(path)
-        .context("Replacing Alpaca fee sync checkpoint")?;
-    Ok(())
+fn retryable(fee: &AlpacaReconciledFee) -> bool {
+    fee.attribution == AlpacaFeeAttribution::Unmatched && lookup_key(fee).is_some()
+}
+
+pub(super) fn retry_delay(interval: Duration, error: &anyhow::Error) -> Duration {
+    error
+        .downcast_ref::<AlpacaApiError>()
+        .filter(|error| error.status == 429)
+        .and_then(|error| error.rate_limit_reset)
+        .and_then(|reset| Duration::try_from(reset.duration_since(Timestamp::now())).ok())
+        .map_or(interval, |remaining| interval.max(remaining))
 }
 
 #[cfg(test)]
