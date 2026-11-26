@@ -27,7 +27,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use super::orders::{parse_order_status, parse_order_type, parse_time_in_force};
@@ -268,14 +268,14 @@ impl Position {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 pub(super) struct FillActivity {
     pub id: String,
     pub order_id: String,
     pub symbol: String,
     side: String,
     qty: Decimal,
-    cum_qty: Decimal,
+    pub(super) cum_qty: Decimal,
     price: Decimal,
     transaction_time: String,
 }
@@ -443,6 +443,16 @@ pub(super) async fn fills(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<FillActivity>> {
+    activities(http, "FILL", start, end, |fill: &FillActivity| &fill.id).await
+}
+
+pub(super) async fn activities<T: DeserializeOwned>(
+    http: &AlpacaHttpClient,
+    activity_type: &str,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    id: impl Fn(&T) -> &str,
+) -> anyhow::Result<Vec<T>> {
     let mut seen = PageTokens::default();
     let mut query = ActivitiesQuery {
         direction: "asc",
@@ -451,15 +461,17 @@ pub(super) async fn fills(
         until: end.map(|ts| ts.to_datetime_utc().to_string()),
         page_token: None,
     };
+    let path = format!("/v2/account/activities/{activity_type}");
+    let resource = format!("{activity_type} activities");
     let mut result = Vec::new();
     loop {
-        let page: Vec<FillActivity> = http.get("/v2/account/activities/FILL", &query).await?;
-        let next = next_page_id(&page, query.page_size, |fill| &fill.id);
+        let page: Vec<T> = http.get(&path, &query).await?;
+        let next = next_page_id(&page, query.page_size, &id);
         result.extend(page);
         let Some(cursor) = next else {
             return Ok(result);
         };
-        seen.check(&cursor, "FILL activities")?;
+        seen.check(&cursor, &resource)?;
         query.page_token = Some(cursor);
     }
 }

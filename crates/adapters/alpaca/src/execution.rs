@@ -20,6 +20,7 @@ mod advanced;
 #[cfg(test)]
 mod combo_tests;
 mod combos;
+pub mod fees;
 mod orders;
 mod reconciliation;
 mod reports;

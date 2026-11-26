@@ -310,9 +310,34 @@ An explicit VWAP or TWAP replacement must match the recorded original
 algorithm. For restored orders, that record can be recovered from the
 instruction object in the broker response when available.
 
-The adapter reports zero commission on fills. Use broker-recorded fees
-when calculating net P&L for Elite live trades. See
-[Alpaca account activities](https://docs.alpaca.markets/us/docs/account-activities).
+## Fee reconciliation
+
+Use the Rust `execution::fees::request_fee_report` helper to read posted
+Trading API `FEE` activities. The report returns one row per broker fee
+activity ID and signed totals per currency. Fees with verified order and execution
+IDs link to the corresponding broker fill activity, including option leg
+fills. The report derives the Nautilus trade ID from each REST fill. A combo
+leg can emit one aggregate event for several broker executions. Attribute
+fees to the broker fills and roll them up once when reporting the combo.
+Fees without either ID stay at the account level. A fee with a reference
+that cannot be verified still contributes to the overall per-currency total.
+
+Supply the fee creation-time window and a fill start time early enough to
+include executions whose fees posted later. Use the activity ID to deduplicate
+overlapping reports when persisting results. Apply these fees to gross P&L
+reconstructed from fills. Broker account balances already include posted fees.
+The execution client continues to report zero commission on live and recovered fills.
+See [Alpaca account activities](https://docs.alpaca.markets/us/docs/account-activities).
+
+To print a read-only summary with the standard Paper credentials, run:
+
+```sh
+cargo run --locked -p nautilus-alpaca --example alpaca-fee-report -- \
+    paper 2026-11-20T00:00:00Z 2026-11-26T00:00:00Z 2026-11-17T00:00:00Z
+```
+
+Use `live` to read the production account with the standard Live credentials.
+The example prints aggregate amounts and counts.
 
 ## Paper smoke test
 
