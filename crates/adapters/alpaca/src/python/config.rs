@@ -157,6 +157,7 @@ impl AlpacaExecutionClientConfig {
             base_url_ws_private,
             proxy_url: proxy_url.map(SecretString::from),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            fee_sync: defaults.fee_sync,
         }
     }
 

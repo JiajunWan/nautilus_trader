@@ -15,6 +15,8 @@
 
 //! Read-only reconciliation of broker-booked USD and other currency fees.
 
+mod sync;
+
 use std::collections::{BTreeMap, HashMap, btree_map::Entry};
 
 use anyhow::{Context, ensure};
@@ -22,6 +24,7 @@ use nautilus_core::{UnixNanos, string::secret::SecretString};
 use nautilus_model::identifiers::{TradeId, VenueOrderId};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+pub use sync::{AlpacaFeeSync, AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate};
 
 use super::reports;
 use crate::{config::AlpacaExecutionClientConfig, http::AlpacaHttpClient};
@@ -49,7 +52,7 @@ pub struct AlpacaFeeTotals {
 }
 
 /// A booked fee activity and the evidence for its attribution.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlpacaReconciledFee {
     /// Broker fee activity identifier.
     pub id: String,
@@ -72,7 +75,7 @@ pub struct AlpacaReconciledFee {
 }
 
 /// Attribution derived from the fee and fill activities.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlpacaFeeAttribution {
     /// Exactly one fill activity matches the broker order and execution IDs.
     Fill {
@@ -117,13 +120,17 @@ pub async fn request_fee_report(
     end: UnixNanos,
     fill_start: UnixNanos,
 ) -> anyhow::Result<AlpacaFeeReport> {
-    let http = AlpacaHttpClient::new(
+    let http = fee_http_client(config)?;
+    fetch_fee_report(&http, start, end, fill_start).await
+}
+
+fn fee_http_client(config: &AlpacaExecutionClientConfig) -> anyhow::Result<AlpacaHttpClient> {
+    AlpacaHttpClient::new(
         config.trading_http_url(),
         &config.credentials()?,
         config.http_timeout_secs,
         config.proxy_url.as_ref().map(SecretString::expose_secret),
-    )?;
-    fetch_fee_report(&http, start, end, fill_start).await
+    )
 }
 
 async fn fetch_fee_report(
@@ -171,10 +178,7 @@ async fn fetch_fee_report(
         }
     }
 
-    let mut report = AlpacaFeeReport {
-        fees: Vec::with_capacity(fees.len()),
-        totals: BTreeMap::new(),
-    };
+    let mut rows = Vec::with_capacity(fees.len());
     for fee in fees {
         let attribution = if let Some(fill) =
             match_key(&fee).and_then(|key| fill_index.get(&key).copied().flatten())
@@ -198,20 +202,7 @@ async fn fetch_fee_report(
             !currency.trim().is_empty(),
             "Alpaca fee has an empty currency"
         );
-        let totals = report.totals.entry(currency.clone()).or_default();
-        let subtotal = match &attribution {
-            AlpacaFeeAttribution::Fill { .. } => &mut totals.matched,
-            AlpacaFeeAttribution::Account => &mut totals.account,
-            AlpacaFeeAttribution::Unmatched => &mut totals.unmatched,
-        };
-        *subtotal = subtotal
-            .checked_add(fee.net_amount)
-            .context("Alpaca fee subtotal overflow")?;
-        totals.total = totals
-            .total
-            .checked_add(fee.net_amount)
-            .context("Alpaca fee total overflow")?;
-        report.fees.push(AlpacaReconciledFee {
+        rows.push(AlpacaReconciledFee {
             id: fee.id,
             activity_sub_type: fee.activity_sub_type,
             date: fee.date,
@@ -223,7 +214,27 @@ async fn fetch_fee_report(
             attribution,
         });
     }
-    Ok(report)
+    summarize(rows)
+}
+
+fn summarize(fees: Vec<AlpacaReconciledFee>) -> anyhow::Result<AlpacaFeeReport> {
+    let mut totals = BTreeMap::<String, AlpacaFeeTotals>::new();
+    for fee in &fees {
+        let currency = totals.entry(fee.currency.clone()).or_default();
+        let subtotal = match &fee.attribution {
+            AlpacaFeeAttribution::Fill { .. } => &mut currency.matched,
+            AlpacaFeeAttribution::Account => &mut currency.account,
+            AlpacaFeeAttribution::Unmatched => &mut currency.unmatched,
+        };
+        *subtotal = subtotal
+            .checked_add(fee.net_amount)
+            .context("Alpaca fee subtotal overflow")?;
+        currency.total = currency
+            .total
+            .checked_add(fee.net_amount)
+            .context("Alpaca fee total overflow")?;
+    }
+    Ok(AlpacaFeeReport { fees, totals })
 }
 
 fn link(value: &Option<String>) -> Option<&str> {

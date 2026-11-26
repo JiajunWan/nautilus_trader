@@ -81,6 +81,7 @@ use tokio::{
 };
 
 use self::{
+    fees::{AlpacaFeeSync, AlpacaFeeSyncSettings},
     orders::{
         OrderGroup, extended_hours, option_order_request, order_list_request, order_request,
         replacement_instructions,
@@ -89,7 +90,7 @@ use self::{
     updates::{OrderState, TradeUpdate},
 };
 use crate::{
-    common::{ALPACA, connect_websocket, credential::AlpacaCredentials},
+    common::{ALPACA, connect_websocket, credential::AlpacaCredentials, enums::AlpacaEnvironment},
     config::AlpacaExecutionClientConfig,
     http::{AlpacaApiError, AlpacaHttpClient},
     option_provider::is_option_symbol,
@@ -103,6 +104,7 @@ type StreamReceiver = mpsc::UnboundedReceiver<(u64, Message)>;
 /// Native Alpaca execution client.
 pub struct AlpacaExecutionClient {
     core: ExecutionClientCore,
+    environment: AlpacaEnvironment,
     credentials: AlpacaCredentials,
     ws_url: String,
     proxy_url: Option<SecretString>,
@@ -112,6 +114,7 @@ pub struct AlpacaExecutionClient {
     ready_epoch: Arc<AtomicU64>,
     orders: Arc<Mutex<OrderState>>,
     tasks: TaskGroup,
+    fee_sync: Option<AlpacaFeeSyncSettings>,
 }
 
 impl fmt::Debug for AlpacaExecutionClient {
@@ -132,6 +135,9 @@ impl AlpacaExecutionClient {
         core: ExecutionClientCore,
         config: &AlpacaExecutionClientConfig,
     ) -> anyhow::Result<Self> {
+        if let Some(settings) = &config.fee_sync {
+            settings.validate()?;
+        }
         let credentials = config.credentials()?;
         let http = AlpacaHttpClient::new(
             config.trading_http_url(),
@@ -152,6 +158,7 @@ impl AlpacaExecutionClient {
 
         Ok(Self {
             core,
+            environment: config.environment,
             credentials,
             ws_url: config.private_ws_url().to_string(),
             proxy_url: config.proxy_url.clone(),
@@ -161,6 +168,7 @@ impl AlpacaExecutionClient {
             ready_epoch: Arc::new(AtomicU64::new(u64::MAX)),
             orders: Arc::new(Mutex::new(OrderState::default())),
             tasks: TaskGroup::new(),
+            fee_sync: config.fee_sync.clone(),
         })
     }
 
@@ -483,6 +491,14 @@ impl ExecutionClient for AlpacaExecutionClient {
         log::info!("Connected Alpaca execution client {}", self.core.client_id);
         self.socket = Some(socket);
         self.core.set_connected();
+        if let Some(settings) = self.fee_sync.clone()
+            && let Err(error) = self.spawn(
+                "fee_sync",
+                AlpacaFeeSync::run_from_http(self.http.clone(), self.environment, settings),
+            )
+        {
+            log::warn!("Could not start Alpaca fee synchronization: {error}");
+        }
         Ok(())
     }
 

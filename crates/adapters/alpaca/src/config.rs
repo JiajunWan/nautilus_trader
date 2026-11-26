@@ -19,10 +19,13 @@ use nautilus_core::string::secret::{SecretString, redact_option};
 use nautilus_model::{enums::AccountType, identifiers::AccountId};
 use serde::{Deserialize, Serialize};
 
-use crate::common::{
-    credential::AlpacaCredentials,
-    enums::{AlpacaEnvironment, AlpacaOptionFeed, AlpacaOvernightFeed, AlpacaStockFeed},
-    urls,
+use crate::{
+    common::{
+        credential::AlpacaCredentials,
+        enums::{AlpacaEnvironment, AlpacaOptionFeed, AlpacaOvernightFeed, AlpacaStockFeed},
+        urls,
+    },
+    execution::fees::AlpacaFeeSyncSettings,
 };
 
 /// Configuration for Alpaca stock and options market data and instrument discovery.
@@ -184,6 +187,8 @@ pub struct AlpacaExecutionClientConfig {
     /// HTTP request timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
+    /// Optional read-only brokerage fee synchronization on connect.
+    pub fee_sync: Option<AlpacaFeeSyncSettings>,
 }
 
 impl fmt::Debug for AlpacaExecutionClientConfig {

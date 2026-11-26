@@ -339,6 +339,33 @@ cargo run --locked -p nautilus-alpaca --example alpaca-fee-report -- \
 Use `live` to read the production account with the standard Live credentials.
 The example prints aggregate amounts and counts.
 
+### Incremental fee synchronization
+
+Run the same example with `--sync` to keep a local checkpoint and upsert
+posted fees by activity ID. The start time is the beginning of fee history to
+collect. Reuse the directory and start time to resume after a restart.
+
+```sh
+cargo run --locked -p nautilus-alpaca --example alpaca-fee-report -- \
+    paper --sync ./alpaca-paper-fees 2026-11-20T00:00:00Z
+```
+
+The example runs once by default. Append an interval in seconds (for example,
+`900`) to keep polling after startup. The execution client can also run the
+worker when connected. Set `fee_sync` on the native Rust
+`AlpacaExecutionClientConfig`. Its `AlpacaFeeSyncSettings` supplies
+`directory`, `start`, and `interval`. The job is opt-in and runs independently
+of order handling. The execution client stops it on disconnect. Successful
+polls commit the rows and checkpoint together. Each poll revisits the last
+three days of fee creation times and queries fills starting seven days before
+that fee window. Posted credits are retained with their original sign.
+
+Use a separate directory for each broker account and environment. The sync
+reads broker-posted amounts using the Trading API and records the original
+currency and cash-flow sign. Use the stored activity IDs to identify entries
+across synchronization runs. Paper can exercise the read-only sync path.
+Use Live activities to verify actual billed fees.
+
 ## Paper smoke test
 
 Run with a Paper API key and secret. The example uses SIP and BOATS by default.
