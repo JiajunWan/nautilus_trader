@@ -270,12 +270,14 @@ unmanaged, while its exposure remains visible in the leg position snapshots.
 
 The execution client reads `GET /v2/account` after subscribing to the private
 stream, on `QueryAccount`, and during reconnect reconciliation. Order events
-that can change cash or buying power also trigger a read. The client batches
-these notifications for one second, including events for orders placed outside
-Nautilus. Events received during a read schedule a follow-up. Transient errors
-retry with backoff. An idle stream makes no periodic account requests.
+that can change cash or buying power also trigger a read. The first such event
+starts a ten-second window. Additional events share the same read, including
+events for orders placed outside Nautilus. If another event arrives during
+the read, the next window starts when the read finishes. Transient errors retry
+with backoff. An idle stream makes no periodic account requests.
 Across all these paths, an older request cannot overwrite a newer published
-snapshot. Use `QueryAccount` to refresh changes unrelated to orders.
+snapshot. Use `QueryAccount` for an immediate read, including for changes
+unrelated to orders.
 
 Read `AccountState.info["equity"]`
 for the broker's net account equity, including marked positions. The same

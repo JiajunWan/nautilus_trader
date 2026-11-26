@@ -15,7 +15,11 @@
 
 //! Tests the account snapshots published by manual queries, order events, and recovery.
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use axum::{Json, Router, http::StatusCode, routing::get};
 use nautilus_alpaca::{
@@ -46,7 +50,8 @@ use tokio_tungstenite::WebSocketStream;
 use super::{accept_private, stream_update};
 
 const DEADLINE: Duration = Duration::from_secs(10);
-const EVENT_QUIET_WINDOW: Duration = Duration::from_millis(1300);
+const ORDER_BATCH_WINDOW: Duration = Duration::from_secs(10);
+const EVENT_QUIET_WINDOW: Duration = ORDER_BATCH_WINDOW.saturating_add(Duration::from_millis(300));
 
 type AccountReply = oneshot::Sender<Result<Json<Value>, StatusCode>>;
 
@@ -147,6 +152,18 @@ impl Broker {
             .unwrap()
     }
 
+    async fn batched_request(&mut self, since: Instant) -> AccountReply {
+        let reply = timeout(ORDER_BATCH_WINDOW + DEADLINE, self.requests.recv())
+            .await
+            .expect("missing order-triggered account request")
+            .unwrap();
+        assert!(
+            since.elapsed() >= ORDER_BATCH_WINDOW,
+            "early account refresh"
+        );
+        reply
+    }
+
     async fn next_event(&mut self) -> ExecutionEvent {
         timeout(DEADLINE, self.events.recv())
             .await
@@ -226,32 +243,56 @@ async fn a_failed_newer_query_does_not_discard_an_earlier_success() {
 }
 
 #[tokio::test]
-async fn coalesces_order_events_and_refreshes_again_after_an_inflight_change() {
+async fn coalesces_order_events_while_allowing_an_immediate_query() {
     let mut broker = Broker::connect(Router::new()).await;
+    let first_event = Instant::now();
     broker.send_update("A", false).await;
     broker.send_update("A", true).await;
     broker.send_update("B", false).await;
-    broker.request().await.send(Ok(snapshot("150"))).unwrap();
+
+    broker.query();
+    let explicit = timeout(Duration::from_secs(3), broker.request())
+        .await
+        .unwrap();
+    explicit.send(Ok(snapshot("125"))).unwrap();
+    broker.expect_snapshot("125").await;
+
+    broker
+        .batched_request(first_event)
+        .await
+        .send(Ok(snapshot("150")))
+        .unwrap();
     broker.expect_snapshot("150").await;
     assert!(
         timeout(EVENT_QUIET_WINDOW, broker.requests.recv())
             .await
             .is_err()
     );
+    broker.disconnect().await;
+}
 
+#[tokio::test]
+async fn refreshes_again_after_an_inflight_change() {
+    let mut broker = Broker::connect(Router::new()).await;
+    let first_event = Instant::now();
     broker.send_update("B", true).await;
-    let inflight = broker.request().await;
+    let inflight = broker.batched_request(first_event).await;
     // The ongoing account fetch must not block order reports or lose the new changes.
     broker.send_update("C", false).await;
     broker.send_update("C", true).await;
     assert!(
-        timeout(EVENT_QUIET_WINDOW, broker.requests.recv())
+        timeout(Duration::from_millis(1300), broker.requests.recv())
             .await
             .is_err()
     );
+    let released = Instant::now();
     inflight.send(Ok(snapshot("200"))).unwrap();
     broker.expect_snapshot("200").await;
-    broker.request().await.send(Ok(snapshot("300"))).unwrap();
+    broker
+        .batched_request(released)
+        .await
+        .send(Ok(snapshot("300")))
+        .unwrap();
     broker.expect_snapshot("300").await;
     assert!(
         timeout(EVENT_QUIET_WINDOW, broker.requests.recv())
@@ -264,9 +305,10 @@ async fn coalesces_order_events_and_refreshes_again_after_an_inflight_change() {
 #[tokio::test]
 async fn retries_a_failed_order_event_refresh_without_another_event() {
     let mut broker = Broker::connect(Router::new()).await;
+    let first_event = Instant::now();
     broker.send_update("A", true).await;
     broker
-        .request()
+        .batched_request(first_event)
         .await
         .send(Err(StatusCode::SERVICE_UNAVAILABLE))
         .unwrap();

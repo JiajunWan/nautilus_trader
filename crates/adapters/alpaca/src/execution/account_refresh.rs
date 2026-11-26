@@ -33,8 +33,8 @@ use tokio::{
 
 use super::{RecoveryAttempt, StreamTask, recovery_backoff, reports, retryable_recovery_error};
 
-// Leave REST capacity for order requests even under sustained trade updates.
-const ACCOUNT_REFRESH_DELAY: Duration = Duration::from_secs(1);
+// Keep sustained order activity to about six automatic account reads per minute
+const ACCOUNT_REFRESH_DELAY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 pub(super) struct AccountSnapshots {
