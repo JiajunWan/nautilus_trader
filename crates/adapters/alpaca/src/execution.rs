@@ -62,7 +62,7 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     data::{CustomData, ensure_custom_data_json_registered},
-    enums::{AssetClass, OmsType},
+    enums::{AccountType, AssetClass, OmsType},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
@@ -90,7 +90,7 @@ use self::{
         OrderGroup, extended_hours, option_order_request, order_list_request, order_request,
         replacement_instructions,
     },
-    reports::{Account, BrokerOrder, FillActivity},
+    reports::{BrokerOrder, FillActivity},
     updates::{OrderState, TradeUpdate},
 };
 use crate::{
@@ -427,8 +427,9 @@ impl ExecutionClient for AlpacaExecutionClient {
             self.tasks.start_generation()?;
         }
 
-        let account: Account = self.http.get("/v2/account", &()).await?;
-        let balance = account.balance()?;
+        let account =
+            reports::account_state(&self.http, self.core.account_id, self.core.account_type)
+                .await?;
         {
             let cache = self.core.cache();
             let mut state = self.order_state()?;
@@ -471,10 +472,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         let last_seen = now();
         self.publish_account_instruments().await;
 
-        if let Err(error) =
-            self.emitter
-                .try_emit_account_state(vec![balance], Vec::new(), true, now(), None)
-        {
+        if let Err(error) = self.emitter.try_send_account_state(account) {
             socket.disconnect().await;
             return Err(error);
         }
@@ -484,6 +482,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             credentials: self.credentials.clone(),
             http: self.http.clone(),
             emitter: self.emitter.clone(),
+            account_type: self.core.account_type,
             state: Arc::clone(&self.orders),
             last_seen,
             ready_epoch: Arc::clone(&self.ready_epoch),
@@ -535,9 +534,10 @@ impl ExecutionClient for AlpacaExecutionClient {
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
         let http = self.http.clone();
         let emitter = self.emitter.clone();
+        let account_type = self.core.account_type;
         self.spawn("query_account", async move {
-            let account: Account = http.get("/v2/account", &()).await?;
-            emitter.try_emit_account_state(vec![account.balance()?], Vec::new(), true, now(), None)
+            let account = reports::account_state(&http, emitter.account_id(), account_type).await?;
+            emitter.try_send_account_state(account)
         })
     }
 
@@ -1149,6 +1149,7 @@ struct StreamTask {
     credentials: AlpacaCredentials,
     http: AlpacaHttpClient,
     emitter: ExecutionEventEmitter,
+    account_type: AccountType,
     state: Arc<Mutex<OrderState>>,
     last_seen: UnixNanos,
     ready_epoch: Arc<AtomicU64>,
@@ -1336,14 +1337,13 @@ impl StreamTask {
 
     async fn reconcile(&self, epoch: u64) -> anyhow::Result<bool> {
         let start = self.last_seen.saturating_sub(DurationNanos::from_secs(1));
-        let (mut snapshot, account): (_, Account) = tokio::try_join!(
+        let (mut snapshot, account) = tokio::try_join!(
             reconciliation::snapshot(&self.http, &self.state, Some(start), false),
-            self.http.get("/v2/account", &()),
+            reports::account_state(&self.http, self.emitter.account_id(), self.account_type),
         )?;
         if !snapshot.complete || !self.is_current(epoch) {
             return Ok(false);
         }
-        let balance = account.balance()?;
         for order in snapshot.orders.values().filter(|order| order.is_combo()) {
             if !self
                 .apply_combo(
@@ -1398,8 +1398,7 @@ impl StreamTask {
             self.emitter.send_fill_report(fill);
         }
 
-        self.emitter
-            .try_emit_account_state(vec![balance], Vec::new(), true, now(), None)?;
+        self.emitter.try_send_account_state(account)?;
         Ok(true)
     }
 }

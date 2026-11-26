@@ -15,16 +15,17 @@
 
 use anyhow::{Context, ensure};
 use jiff::Timestamp;
-use nautilus_core::UnixNanos;
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     enums::{
-        AvgPxReconciliation, LiquiditySide, OrderSide, PositionSide, TrailingOffsetType,
-        TriggerType,
+        AccountType, AvgPxReconciliation, LiquiditySide, OrderSide, PositionSide,
+        TrailingOffsetType, TriggerType,
     },
+    events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -38,26 +39,101 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
-pub(super) struct Account {
+struct Account {
     currency: String,
     cash: Decimal,
+    equity: Option<Decimal>,
+    portfolio_value: Option<Decimal>,
+    buying_power: Option<Decimal>,
+    effective_buying_power: Option<Decimal>,
+    regt_buying_power: Option<Decimal>,
+    daytrading_buying_power: Option<Decimal>,
+    non_marginable_buying_power: Option<Decimal>,
+    options_buying_power: Option<Decimal>,
+    initial_margin: Option<Decimal>,
+    maintenance_margin: Option<Decimal>,
+    multiplier: Option<Decimal>,
 }
 
 impl Account {
-    pub(super) fn balance(&self) -> anyhow::Result<AccountBalance> {
+    fn to_state(
+        &self,
+        account_id: AccountId,
+        account_type: AccountType,
+        ts: UnixNanos,
+    ) -> anyhow::Result<AccountState> {
         let currency = Currency::USD();
         ensure!(
             self.currency == "USD",
             "Unsupported Alpaca account currency: {}",
             self.currency
         );
-        let cash = Money::from_decimal(self.cash, currency)?;
-        Ok(AccountBalance::new_checked(
-            cash,
-            Money::zero(currency),
-            cash,
-        )?)
+
+        // Only the cash portion of purchasing capacity belongs in AccountBalance.
+        // Preserve a cash deficit without depicting borrowed buying power as cash.
+        let power = self.effective_buying_power.or(self.buying_power);
+        let free = [self.non_marginable_buying_power, power]
+            .into_iter()
+            .flatten()
+            .map(|available| available.max(Decimal::ZERO))
+            .fold(self.cash, Decimal::min);
+        let balance = AccountBalance::from_total_and_free(self.cash, free, currency)?;
+
+        let mut margins = Vec::new();
+        if account_type == AccountType::Margin
+            && let Some((initial, maintenance)) = self.initial_margin.zip(self.maintenance_margin)
+        {
+            margins.push(MarginBalance::new_checked(
+                Money::from_decimal(initial, currency)?,
+                Money::from_decimal(maintenance, currency)?,
+                None,
+            )?);
+        }
+
+        // Preserve exact venue values independently of local portfolio valuation and
+        // the rounding required by Money. Omit fields the broker did not return.
+        let info = [
+            ("cash", Some(self.cash)),
+            ("equity", self.equity.or(self.portfolio_value)),
+            ("buying_power", self.buying_power),
+            ("effective_buying_power", self.effective_buying_power),
+            ("regt_buying_power", self.regt_buying_power),
+            ("daytrading_buying_power", self.daytrading_buying_power),
+            (
+                "non_marginable_buying_power",
+                self.non_marginable_buying_power,
+            ),
+            ("options_buying_power", self.options_buying_power),
+            ("initial_margin", self.initial_margin),
+            ("maintenance_margin", self.maintenance_margin),
+            ("multiplier", self.multiplier),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.to_owned(), Value::String(value?.to_string()))))
+        .collect();
+
+        Ok(AccountState::new(
+            account_id,
+            account_type,
+            vec![balance],
+            margins,
+            true,
+            UUID4::new(),
+            ts,
+            ts,
+            Some(currency),
+        )
+        .with_info(Some(Params::new(info))))
     }
+}
+
+pub(super) async fn account_state(
+    http: &AlpacaHttpClient,
+    account_id: AccountId,
+    account_type: AccountType,
+) -> anyhow::Result<AccountState> {
+    let account: Account = http.get("/v2/account", &()).await?;
+    account.to_state(account_id, account_type, super::now())
 }
 
 #[derive(Debug, Clone, Deserialize)]

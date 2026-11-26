@@ -505,6 +505,7 @@ async fn exercise_superseded_lookup(reconciliation: bool) {
         credentials,
         http,
         emitter,
+        account_type: AccountType::Margin,
         state: Arc::new(Mutex::new(state)),
         last_seen: ts,
         ready_epoch: Arc::new(AtomicU64::new(epoch)),

@@ -37,7 +37,7 @@ use nautilus_common::{
     live::runner::{set_data_event_sender, set_exec_event_sender},
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport,
-        execution::{QueryOrder, SubmitOrder, SubmitOrderList},
+        execution::{QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList},
     },
 };
 use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
@@ -51,7 +51,7 @@ use nautilus_model::{
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, TraderId},
     instruments::Instrument,
     orders::{Order, OrderAny, OrderList, OrderTestBuilder},
-    types::{Price, Quantity},
+    types::{Money, Price, Quantity},
 };
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -415,13 +415,25 @@ fn broker_api(
     submitted: mpsc::UnboundedSender<String>,
     queries: mpsc::UnboundedSender<String>,
     attempts: mpsc::UnboundedSender<oneshot::Sender<StatusCode>>,
+    account_changed: Arc<AtomicBool>,
 ) -> Router {
     let filled_at = Arc::new(OnceLock::new());
     Router::new()
         .route(
             "/v2/account",
-            get(|| async {
-                Json(json!({"account_number":"TEST","currency":"USD","cash":"10000"}))
+            get(async move || {
+                let initial = if account_changed.load(Ordering::Relaxed) {
+                    "0"
+                } else {
+                    "125.239"
+                };
+                Json(json!({
+                    "currency":"USD", "cash":"10000", "equity":"10650.127", "portfolio_value":"9000",
+                    "buying_power":"20149.77", "effective_buying_power":"19600",
+                    "regt_buying_power":"20010.75", "daytrading_buying_power":"39000",
+                    "non_marginable_buying_power":"9000", "options_buying_power":"8280.15",
+                    "initial_margin":initial, "maintenance_margin":"99.45", "multiplier":"4"
+                }))
             }),
         )
         .route(
@@ -463,6 +475,34 @@ fn broker_api(
         )
 }
 
+async fn expect_account(
+    events: &mut mpsc::UnboundedReceiver<ExecutionEvent>,
+    initial: &str,
+    reported_initial: &str,
+) {
+    let Some(ExecutionEvent::Account(state)) = events.recv().await else {
+        panic!("Expected a fresh Alpaca account snapshot");
+    };
+    assert!(state.is_reported);
+    assert_eq!(state.account_type, AccountType::Margin);
+    assert_eq!(state.balances.len(), 1);
+    assert_eq!(state.balances[0].total, Money::from("10000 USD"));
+    assert_eq!(state.balances[0].free, Money::from("9000 USD"));
+    assert_eq!(state.balances[0].locked, Money::from("1000 USD"));
+    assert_eq!(state.margins.len(), 1);
+    assert_eq!(state.margins[0].instrument_id, None);
+    assert_eq!(state.margins[0].initial, Money::from(initial));
+    assert_eq!(state.margins[0].maintenance, Money::from("99.45 USD"));
+    let info = state.info.unwrap();
+    assert_eq!(info.get_str("equity"), Some("10650.127"));
+    assert_eq!(info.get_str("buying_power"), Some("20149.77"));
+    assert_eq!(info.get_str("effective_buying_power"), Some("19600"));
+    assert_eq!(info.get_str("regt_buying_power"), Some("20010.75"));
+    assert_eq!(info.get_str("daytrading_buying_power"), Some("39000"));
+    assert_eq!(info.get_str("options_buying_power"), Some("8280.15"));
+    assert_eq!(info.get_str("initial_margin"), Some(reported_initial));
+}
+
 #[rstest]
 #[case::missing_order(StatusCode::NOT_FOUND, false)]
 #[case::temporary_rest_failure(StatusCode::SERVICE_UNAVAILABLE, false)]
@@ -490,7 +530,8 @@ async fn exercise_recovery(fault: StatusCode, reconnect_again: bool) {
     let (submitted, mut posts) = mpsc::unbounded_channel();
     let (queries, mut windows) = mpsc::unbounded_channel();
     let (attempts, mut lookups) = mpsc::unbounded_channel();
-    let app = broker_api(submitted, queries, attempts);
+    let account_changed = Arc::new(AtomicBool::new(false));
+    let app = broker_api(submitted, queries, attempts, Arc::clone(&account_changed));
     let server = tokio::spawn(axum::serve(http, app).into_future());
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
@@ -527,6 +568,20 @@ async fn exercise_recovery(fault: StatusCode, reconnect_again: bool) {
     let (connected, original) = tokio::join!(client.connect(), accept_private(&ws));
     connected.unwrap();
     assert!(client.is_connected());
+    expect_account(&mut events, "125.24 USD", "125.239").await;
+    client
+        .query_account(QueryAccount::new(
+            trader,
+            Some(id),
+            client.account_id(),
+            UUID4::new(),
+            0.into(),
+            None,
+            None,
+        ))
+        .unwrap();
+    expect_account(&mut events, "125.24 USD", "125.239").await;
+    account_changed.store(true, Ordering::Relaxed);
     submit(&client, "GAP");
     assert_eq!(posts.recv().await.unwrap(), "GAP");
     drop(original);
@@ -582,10 +637,7 @@ async fn exercise_recovery(fault: StatusCode, reconnect_again: bool) {
     assert_eq!(fills.len(), 1);
     assert_eq!(fills[0].last_qty, Quantity::from(1));
     assert_eq!(fills[0].last_px, Price::from("650.00"));
-    assert!(matches!(
-        events.recv().await,
-        Some(ExecutionEvent::Account(_))
-    ));
+    expect_account(&mut events, "0 USD", "0").await;
 
     // The next stream report arrives after recovery marks the epoch ready
     // and the broker's replayed fill has been deduplicated.

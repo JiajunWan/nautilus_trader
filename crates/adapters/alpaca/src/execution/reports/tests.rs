@@ -31,6 +31,57 @@ const TAIL: &str = "2026-11-20T14:30:00.123456789Z";
 const SAME_TAIL: &str = "2026-11-20T09:30:00.123456789-05:00";
 const CONTRACT: &str = "SPY261218C00600000";
 
+#[rstest]
+#[case::legacy(json!({"currency":"USD","cash":"25.50"}), "25.50", "25.50")]
+#[case::leveraged(
+    json!({"currency":"USD","cash":"25.50","buying_power":"200","options_buying_power":"10"}),
+    "25.50", "25.50",
+)]
+#[case::restricted(
+    json!({"currency":"USD","cash":"25.50","buying_power":"200","non_marginable_buying_power":"20","effective_buying_power":"15.003"}),
+    "25.50", "15.00",
+)]
+#[case::deficit(json!({"currency":"USD","cash":"-10","buying_power":"200"}), "-10.00", "-10.00")]
+#[case::over_limit(json!({"currency":"USD","cash":"25.50","buying_power":"-7"}), "25.50", "0.00")]
+fn account_keeps_cash_balance_distinct_from_buying_power(
+    #[case] response: Value,
+    #[case] total: &str,
+    #[case] free: &str,
+) {
+    let account: Account = serde_json::from_value(response).unwrap();
+    let state = account
+        .to_state(AccountId::from("ALPACA-001"), AccountType::Margin, 1.into())
+        .unwrap();
+    let balance = state.balances[0];
+    assert_eq!(balance.total, Money::from(format!("{total} USD").as_str()));
+    assert_eq!(balance.free, Money::from(format!("{free} USD").as_str()));
+    assert_eq!(balance.total, balance.free + balance.locked);
+    assert!(state.margins.is_empty());
+}
+
+#[rstest]
+#[case::cash_account(AccountType::Cash, Some("7.00"))]
+#[case::partial_margin_snapshot(AccountType::Margin, None)]
+fn account_preserves_legacy_equity_and_optional_margin_fields(
+    #[case] account_type: AccountType,
+    #[case] maintenance: Option<&str>,
+) {
+    let account: Account = serde_json::from_value(json!({
+        "currency":"USD","cash":"25.50","portfolio_value":"45.509",
+        "initial_margin":"10.245","maintenance_margin":maintenance,
+    }))
+    .unwrap();
+    let state = account
+        .to_state(AccountId::from("ALPACA-001"), account_type, 1.into())
+        .unwrap();
+    assert!(state.margins.is_empty());
+    let info = state.info.unwrap();
+    assert_eq!(info.get_str("equity"), Some("45.509"));
+    assert_eq!(info.get_str("initial_margin"), Some("10.245"));
+    assert_eq!(info.get_str("maintenance_margin"), maintenance);
+    assert!(!info.contains_key("daytrading_buying_power"));
+}
+
 async fn client(app: Router) -> AlpacaHttpClient {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = AlpacaDataClientConfig::builder()

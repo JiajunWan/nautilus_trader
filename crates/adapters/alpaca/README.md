@@ -266,6 +266,23 @@ combo leg executions are not imported as independent orders. Without the
 original Nautilus combo identity, an external multi-leg parent is left
 unmanaged, while its exposure remains visible in the leg position snapshots.
 
+## Account snapshots
+
+The execution client reads `GET /v2/account` at startup, on `QueryAccount`,
+and after recovering the private WebSocket. Read `AccountState.info["equity"]`
+for the broker's net account equity, including marked positions. The same
+snapshot exposes `cash`, `buying_power`, `effective_buying_power`,
+`regt_buying_power`, `daytrading_buying_power`, `non_marginable_buying_power`,
+`options_buying_power`, `initial_margin`, `maintenance_margin`, and `multiplier`
+as decimal strings when returned by Alpaca.
+
+`AccountBalance.total` holds cash. `free` is cash capped by reported
+non-marginable and effective buying power, with `buying_power` as a fallback
+for the effective field. `locked` is the difference. A cash deficit remains
+a negative balance. Use the venue fields for product-specific buying power.
+For margin accounts, the reported initial and maintenance requirements appear
+as one USD account-wide `MarginBalance` when both values are available.
+
 ## Elite Smart Router
 
 Select Elite Smart Router for your Alpaca trading account before using
