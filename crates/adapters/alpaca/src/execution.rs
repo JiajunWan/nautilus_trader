@@ -16,6 +16,7 @@
 //! Alpaca Trading API execution client for US equities and options.
 
 mod account_instruments;
+mod account_refresh;
 mod advanced;
 #[cfg(test)]
 mod combo_tests;
@@ -85,6 +86,7 @@ use tokio::{
 };
 
 use self::{
+    account_refresh::AccountSnapshots,
     fees::{AlpacaFeeSync, AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate},
     orders::{
         OrderGroup, extended_hours, option_order_request, order_list_request, order_request,
@@ -117,6 +119,7 @@ pub struct AlpacaExecutionClient {
     socket: Option<Arc<WebSocketClient>>,
     ready_epoch: Arc<AtomicU64>,
     orders: Arc<Mutex<OrderState>>,
+    accounts: Arc<AccountSnapshots>,
     tasks: TaskGroup,
     fee_sync: Option<AlpacaFeeSyncSettings>,
 }
@@ -172,6 +175,7 @@ impl AlpacaExecutionClient {
             socket: None,
             ready_epoch: Arc::new(AtomicU64::new(u64::MAX)),
             orders: Arc::new(Mutex::new(OrderState::default())),
+            accounts: Arc::new(AccountSnapshots::default()),
             tasks: TaskGroup::new(),
             fee_sync: config.fee_sync.clone(),
         })
@@ -342,6 +346,7 @@ impl AlpacaExecutionClient {
     async fn close(&mut self) -> anyhow::Result<()> {
         self.core.set_disconnected();
         self.tasks.abort();
+        self.accounts.invalidate();
         if let Some(socket) = self.socket.take() {
             socket.disconnect().await;
         }
@@ -410,6 +415,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         self.core.set_stopped();
         self.core.set_disconnected();
         self.tasks.abort();
+        self.accounts.invalidate();
         Ok(())
     }
 
@@ -427,9 +433,6 @@ impl ExecutionClient for AlpacaExecutionClient {
             self.tasks.start_generation()?;
         }
 
-        let account =
-            reports::account_state(&self.http, self.core.account_id, self.core.account_type)
-                .await?;
         {
             let cache = self.core.cache();
             let mut state = self.order_state()?;
@@ -470,9 +473,21 @@ impl ExecutionClient for AlpacaExecutionClient {
         }
 
         let last_seen = now();
+        // Subscribe first so account-changing orders during the initial REST read are buffered.
+        let ticket = self.accounts.begin();
+        let account =
+            match reports::account_state(&self.http, self.core.account_id, self.core.account_type)
+                .await
+            {
+                Ok(state) => state,
+                Err(e) => {
+                    socket.disconnect().await;
+                    return Err(e);
+                }
+            };
         self.publish_account_instruments().await;
 
-        if let Err(error) = self.emitter.try_send_account_state(account) {
+        if let Err(error) = self.accounts.publish(ticket, account, &self.emitter) {
             socket.disconnect().await;
             return Err(error);
         }
@@ -484,11 +499,11 @@ impl ExecutionClient for AlpacaExecutionClient {
             emitter: self.emitter.clone(),
             account_type: self.core.account_type,
             state: Arc::clone(&self.orders),
-            last_seen,
+            accounts: Arc::clone(&self.accounts),
             ready_epoch: Arc::clone(&self.ready_epoch),
         };
         self.ready_epoch.store(epoch, Ordering::Release);
-        if let Err(error) = self.spawn("trade_updates", task.run(rx)) {
+        if let Err(error) = self.spawn("trade_updates", task.run(rx, last_seen)) {
             socket.disconnect().await;
             return Err(error);
         }
@@ -535,9 +550,11 @@ impl ExecutionClient for AlpacaExecutionClient {
         let http = self.http.clone();
         let emitter = self.emitter.clone();
         let account_type = self.core.account_type;
+        let accounts = Arc::clone(&self.accounts);
+        let ticket = accounts.begin();
         self.spawn("query_account", async move {
             let account = reports::account_state(&http, emitter.account_id(), account_type).await?;
-            emitter.try_send_account_state(account)
+            accounts.publish(ticket, account, &emitter)
         })
     }
 
@@ -1151,33 +1168,36 @@ struct StreamTask {
     emitter: ExecutionEventEmitter,
     account_type: AccountType,
     state: Arc<Mutex<OrderState>>,
-    last_seen: UnixNanos,
+    accounts: Arc<AccountSnapshots>,
     ready_epoch: Arc<AtomicU64>,
 }
 
 impl StreamTask {
-    async fn run(mut self, mut rx: StreamReceiver) -> anyhow::Result<()> {
-        let result = self.run_session(&mut rx).await;
+    async fn run(self, mut rx: StreamReceiver, last_seen: UnixNanos) -> anyhow::Result<()> {
+        let (dirty_tx, dirty_rx) = mpsc::channel(1);
+        let result = tokio::select! {
+            result = self.run_session(&mut rx, last_seen, &dirty_tx) => result,
+            result = self.refresh_on_orders(dirty_rx) => result,
+        };
         self.ready_epoch.store(u64::MAX, Ordering::Release);
         self.socket.disconnect().await;
         result
     }
 
-    async fn run_session(&mut self, rx: &mut StreamReceiver) -> anyhow::Result<()> {
+    async fn run_session(
+        &self,
+        rx: &mut StreamReceiver,
+        mut last_seen: UnixNanos,
+        dirty: &mpsc::Sender<()>,
+    ) -> anyhow::Result<()> {
         let mut retry: Option<RecoveryAttempt> = None;
-        let mut backoff = ExponentialBackoff::new(
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-            2.0,
-            250,
-            false,
-        )?;
+        let mut backoff = recovery_backoff()?;
         loop {
             let frame = if let Some(attempt) = retry {
                 tokio::select! {
                     biased;
                     () = sleep_until(attempt.deadline) => {
-                        retry = self.recover(attempt, &mut backoff).await?;
+                        retry = self.recover(attempt, &mut backoff, last_seen).await?;
                         continue;
                     }
                     frame = rx.recv() => frame,
@@ -1201,6 +1221,11 @@ impl StreamTask {
             }
             match serde_json::from_slice::<PrivateMessage>(frame.as_bytes()) {
                 Ok(PrivateMessage::TradeUpdates(update)) => {
+                    if self.ready_epoch.load(Ordering::Acquire) == epoch && update.affects_account()
+                    {
+                        // Full means the pending account read already covers this notification.
+                        let _ = dirty.try_send(());
+                    }
                     let result = async {
                         let timestamp = update.ts_event()?;
                         if update.order.is_combo() && update.is_fill() {
@@ -1215,7 +1240,7 @@ impl StreamTask {
                         if self.is_current(epoch)
                             && self.ready_epoch.load(Ordering::Acquire) == epoch
                         {
-                            self.last_seen = self.last_seen.max(timestamp);
+                            last_seen = last_seen.max(timestamp);
                         }
                         Ok::<(), anyhow::Error>(())
                     }
@@ -1263,12 +1288,13 @@ impl StreamTask {
         &self,
         mut attempt: RecoveryAttempt,
         backoff: &mut ExponentialBackoff,
+        last_seen: UnixNanos,
     ) -> anyhow::Result<Option<RecoveryAttempt>> {
         let epoch = attempt.epoch;
         if !self.is_current(epoch) {
             return Ok(None);
         }
-        let result = Box::pin(self.reconcile(epoch)).await;
+        let result = Box::pin(self.reconcile(epoch, last_seen)).await;
         if !self.is_current(epoch) {
             return Ok(None);
         }
@@ -1335,8 +1361,9 @@ impl StreamTask {
         result
     }
 
-    async fn reconcile(&self, epoch: u64) -> anyhow::Result<bool> {
-        let start = self.last_seen.saturating_sub(DurationNanos::from_secs(1));
+    async fn reconcile(&self, epoch: u64, last_seen: UnixNanos) -> anyhow::Result<bool> {
+        let ticket = self.accounts.begin();
+        let start = last_seen.saturating_sub(DurationNanos::from_secs(1));
         let (mut snapshot, account) = tokio::try_join!(
             reconciliation::snapshot(&self.http, &self.state, Some(start), false),
             reports::account_state(&self.http, self.emitter.account_id(), self.account_type),
@@ -1398,9 +1425,19 @@ impl StreamTask {
             self.emitter.send_fill_report(fill);
         }
 
-        self.emitter.try_send_account_state(account)?;
+        self.accounts.publish(ticket, account, &self.emitter)?;
         Ok(true)
     }
+}
+
+fn recovery_backoff() -> anyhow::Result<ExponentialBackoff> {
+    ExponentialBackoff::new(
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+        2.0,
+        250,
+        false,
+    )
 }
 
 fn retryable_recovery_error(error: &anyhow::Error) -> bool {

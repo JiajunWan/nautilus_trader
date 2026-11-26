@@ -63,6 +63,25 @@ impl TradeUpdate {
         matches!(self.event.as_str(), "fill" | "partial_fill")
     }
 
+    pub(super) fn affects_account(&self) -> bool {
+        matches!(
+            self.event.as_str(),
+            "accepted"
+                | "pending_new"
+                | "new"
+                | "partial_fill"
+                | "fill"
+                | "pending_replace"
+                | "replaced"
+                | "order_replace_rejected"
+                | "canceled"
+                | "expired"
+                | "rejected"
+                | "done_for_day"
+                | "calculated"
+        )
+    }
+
     fn fill(
         &self,
         emitter: &ExecutionEventEmitter,
@@ -975,6 +994,42 @@ mod tests {
         let mut state = OrderState::default();
         state.register(&builder.build());
         (state, emitter, rx)
+    }
+
+    #[test]
+    fn only_changes_to_funds_schedule_an_account_refresh() {
+        for (expected, events) in [
+            (
+                true,
+                &[
+                    "accepted",
+                    "pending_new",
+                    "new",
+                    "partial_fill",
+                    "fill",
+                    "pending_replace",
+                    "replaced",
+                    "order_replace_rejected",
+                    "canceled",
+                    "expired",
+                    "rejected",
+                    "done_for_day",
+                    "calculated",
+                ][..],
+            ),
+            (
+                false,
+                &["pending_cancel", "order_cancel_rejected", "unknown"][..],
+            ),
+        ] {
+            for event in events {
+                assert_eq!(
+                    update(event, "new", "venue", "client").affects_account(),
+                    expected,
+                    "{event}"
+                );
+            }
+        }
     }
 
     fn update(event: &str, status: &str, id: &str, client_id: &str) -> TradeUpdate {

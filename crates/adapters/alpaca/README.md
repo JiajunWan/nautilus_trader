@@ -268,8 +268,16 @@ unmanaged, while its exposure remains visible in the leg position snapshots.
 
 ## Account snapshots
 
-The execution client reads `GET /v2/account` at startup, on `QueryAccount`,
-and after recovering the private WebSocket. Read `AccountState.info["equity"]`
+The execution client reads `GET /v2/account` after subscribing to the private
+stream, on `QueryAccount`, and during reconnect reconciliation. Order events
+that can change cash or buying power also trigger a read. The client batches
+these notifications for one second, including events for orders placed outside
+Nautilus. Events received during a read schedule a follow-up. Transient errors
+retry with backoff. An idle stream makes no periodic account requests.
+Across all these paths, an older request cannot overwrite a newer published
+snapshot. Use `QueryAccount` to refresh changes unrelated to orders.
+
+Read `AccountState.info["equity"]`
 for the broker's net account equity, including marked positions. The same
 snapshot exposes `cash`, `buying_power`, `effective_buying_power`,
 `regt_buying_power`, `daytrading_buying_power`, `non_marginable_buying_power`,

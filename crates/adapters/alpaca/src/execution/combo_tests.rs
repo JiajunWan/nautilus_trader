@@ -507,13 +507,13 @@ async fn exercise_superseded_lookup(reconciliation: bool) {
         emitter,
         account_type: AccountType::Margin,
         state: Arc::new(Mutex::new(state)),
-        last_seen: ts,
+        accounts: Arc::new(AccountSnapshots::default()),
         ready_epoch: Arc::new(AtomicU64::new(epoch)),
     });
     let old = Arc::clone(&task);
     let old_lookup = tokio::spawn(async move {
         if reconciliation {
-            Box::pin(old.reconcile(epoch)).await
+            Box::pin(old.reconcile(epoch, ts)).await
         } else {
             old.apply_combo(epoch, &incomplete_order, ts).await
         }
@@ -528,7 +528,7 @@ async fn exercise_superseded_lookup(reconciliation: bool) {
     assert!(events.try_recv().is_err());
     assert_eq!(lock_state(&task.state).unwrap().active_orders().len(), 1);
 
-    let (current_lookup, ()) = tokio::join!(Box::pin(task.reconcile(current)), async {
+    let (current_lookup, ()) = tokio::join!(Box::pin(task.reconcile(current, ts)), async {
         pending.recv().await.unwrap().send(()).unwrap();
     },);
     assert!(current_lookup.unwrap());
