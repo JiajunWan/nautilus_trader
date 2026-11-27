@@ -41,19 +41,30 @@ use super::*;
 
 const LONG: &str = "SPXW261120C07395000";
 const SHORT: &str = "SPXW261120C07400000";
+const INDEX_LEGS: [&str; 2] = [LONG, SHORT];
+const EQUITY_LEGS: [&str; 2] = ["AAPL261120C00245000", "AAPL261120C00250000"];
 const TS: &str = "2026-11-18T16:38:25.107400871Z";
 
-fn legs() -> [InstrumentAny; 2] {
-    [LONG, SHORT].map(|symbol| {
+fn legs(symbols: [&str; 2], asset_class: AssetClass) -> [InstrumentAny; 2] {
+    symbols.map(|symbol| {
         let id = crate::provider::instrument_id(symbol).unwrap();
         let currency = Currency::USD();
         OptionContract::builder()
             .instrument_id(id)
             .raw_symbol(id.symbol)
-            .asset_class(AssetClass::Index)
-            .underlying(Ustr::from("SPX"))
+            .asset_class(asset_class)
+            .underlying(Ustr::from(if asset_class == AssetClass::Index {
+                "SPX"
+            } else {
+                "AAPL"
+            }))
             .option_kind(OptionKind::Call)
-            .strike_price(Price::from(if symbol == LONG { "7395" } else { "7400" }))
+            .strike_price(Price::from(match symbol {
+                LONG => "7395",
+                SHORT => "7400",
+                symbol if symbol == EQUITY_LEGS[0] => "245",
+                _ => "250",
+            }))
             .strike_currency(currency)
             .quote_currency(currency)
             .settlement_currency(currency)
@@ -71,7 +82,7 @@ fn legs() -> [InstrumentAny; 2] {
     })
 }
 
-fn response(id: &str, status: &str) -> Value {
+fn response(id: &str, status: &str, [long, short]: [&str; 2]) -> Value {
     let filled = status == "filled";
     let closing = id == "COMBO-CLOSE";
     let child = |symbol, side, intent, price, suffix| {
@@ -92,11 +103,11 @@ fn response(id: &str, status: &str) -> Value {
         "type": "limit", "time_in_force": "day", "status": status, "created_at": TS,
         "filled_at": filled.then_some(TS),
         "legs": if closing {
-            [child(LONG, "sell", "sell_to_close", "25.30", "A"),
-             child(SHORT, "buy", "buy_to_close", "24.00", "B")]
+            [child(long, "sell", "sell_to_close", "25.30", "A"),
+             child(short, "buy", "buy_to_close", "24.00", "B")]
         } else {
-            [child(LONG, "buy", "buy_to_open", "24.50", "A"),
-             child(SHORT, "sell", "sell_to_open", "22.70", "B")]
+            [child(long, "buy", "buy_to_open", "24.50", "A"),
+             child(short, "sell", "sell_to_open", "22.70", "B")]
         }
     })
 }
@@ -112,7 +123,12 @@ fn update(order: &Value, event: &str) -> Message {
     )
 }
 
-async fn rest_fixture(listener: TcpListener, ws: mpsc::UnboundedSender<Message>) {
+async fn rest_fixture(
+    listener: TcpListener,
+    ws: mpsc::UnboundedSender<Message>,
+    symbols: [&str; 2],
+    extended: bool,
+) {
     loop {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut reader = BufReader::new(&mut socket);
@@ -144,12 +160,16 @@ async fn rest_fixture(listener: TcpListener, ws: mpsc::UnboundedSender<Message>)
             ("POST", "/v2/orders") => {
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 let id = body["client_order_id"].as_str().unwrap();
-                let expected = response(id, "new");
+                let expected = response(id, "new", symbols);
                 assert_eq!(body["order_class"], "mleg");
                 assert_eq!(body["limit_price"], expected["limit_price"]);
                 assert_eq!(body["qty"], "1");
                 assert_eq!(body["type"], "limit");
                 assert_eq!(body["time_in_force"], "day");
+                assert_eq!(
+                    body.get("extended_hours"),
+                    extended.then_some(&Value::Bool(true))
+                );
                 assert!(body.get("symbol").is_none());
                 assert!(body.get("side").is_none());
                 for (leg, wire) in body["legs"]
@@ -163,7 +183,7 @@ async fn rest_fixture(listener: TcpListener, ws: mpsc::UnboundedSender<Message>)
                     }
                 }
                 if id != "COMBO-CANCEL" {
-                    let fill = response(id, "filled");
+                    let fill = response(id, "filled", symbols);
                     ws.send(update(&fill["legs"][0], "fill")).unwrap();
                     let mut without_legs = fill.clone();
                     without_legs["legs"] = Value::Null;
@@ -172,11 +192,14 @@ async fn rest_fixture(listener: TcpListener, ws: mpsc::UnboundedSender<Message>)
                 }
                 expected
             }
-            ("GET", "/v2/orders/COMBO-OPEN-PARENT") => response("COMBO-OPEN", "filled"),
-            ("GET", "/v2/orders/COMBO-CLOSE-PARENT") => response("COMBO-CLOSE", "filled"),
+            ("GET", "/v2/orders/COMBO-OPEN-PARENT") => response("COMBO-OPEN", "filled", symbols),
+            ("GET", "/v2/orders/COMBO-CLOSE-PARENT") => response("COMBO-CLOSE", "filled", symbols),
             ("DELETE", "/v2/orders/COMBO-CANCEL-PARENT") => {
-                ws.send(update(&response("COMBO-CANCEL", "canceled"), "canceled"))
-                    .unwrap();
+                ws.send(update(
+                    &response("COMBO-CANCEL", "canceled", symbols),
+                    "canceled",
+                ))
+                .unwrap();
                 no_content = true;
                 Value::Null
             }
@@ -232,8 +255,15 @@ async fn order_event(events: &mut mpsc::UnboundedReceiver<ExecutionEvent>) -> Or
     .expect("Expected an order event")
 }
 
+#[rstest]
+#[case::regular_index(INDEX_LEGS, AssetClass::Index, false)]
+#[case::extended_equity(EQUITY_LEGS, AssetClass::Equity, true)]
 #[tokio::test]
-async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_parent() {
+async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_parent(
+    #[case] symbols: [&'static str; 2],
+    #[case] asset_class: AssetClass,
+    #[case] extended: bool,
+) {
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = AlpacaExecutionClientConfig::builder()
@@ -243,7 +273,7 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
         .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
         .build();
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
-    let rest_task = tokio::spawn(rest_fixture(http, updates_tx));
+    let rest_task = tokio::spawn(rest_fixture(http, updates_tx, symbols, extended));
     let ws_task = tokio::spawn(ws_fixture(ws, updates_rx));
     let (events_tx, mut events) = mpsc::unbounded_channel();
     set_exec_event_sender(events_tx);
@@ -252,12 +282,12 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
     let account_id = AccountId::from("ALPACA-001");
     let client_id = ClientId::from("ALPACA");
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let instruments = legs();
+    let instruments = legs(symbols, asset_class);
     let ids = instruments.each_ref().map(Instrument::id);
     let id = new_generic_spread_id(&[(ids[0], 1), (ids[1], -1)]).unwrap();
     let spread =
         option_spread::definition(id, &instruments.iter().collect::<Vec<_>>(), 0.into()).unwrap();
-    assert_eq!(spread.asset_class, AssetClass::Index);
+    assert_eq!(spread.asset_class, asset_class);
     assert_eq!(spread.multiplier, Quantity::from(100));
     for instrument in instruments.into_iter().chain([spread.into()]) {
         cache.borrow_mut().add_instrument(instrument).unwrap();
@@ -290,7 +320,7 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
             .time_in_force(TimeInForce::Day)
             .reduce_only(reduce_only)
             .build();
-        let cmd = SubmitOrder::from_order(
+        let mut cmd = SubmitOrder::from_order(
             &order,
             trader_id,
             Some(client_id),
@@ -298,6 +328,19 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
             UUID4::new(),
             0.into(),
         );
+        let extended_params = Params::new([("extended_hours".to_owned(), json!(true))].into());
+        if extended {
+            cmd.params = Some(extended_params);
+        } else {
+            let error = client
+                .submit_request(&order, Some(&extended_params))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("index option spreads require regular hours")
+            );
+        }
         cache
             .borrow_mut()
             .add_order(order.clone(), None, Some(client_id), false)
@@ -367,7 +410,7 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
             .order_state()
             .unwrap()
             .order_report(
-                &serde_json::from_value(response(name, "filled")).unwrap(),
+                &serde_json::from_value(response(name, "filled", symbols)).unwrap(),
                 account_id,
                 None,
                 0.into(),
@@ -388,10 +431,13 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
         .build();
     assert_eq!(
         client.submit_request(&single, None).unwrap()["symbol"],
-        LONG
+        symbols[0]
     );
     let params = serde_json::from_value(json!({"extended_hours": true})).unwrap();
-    assert!(client.submit_request(&single, Some(&params)).is_err());
+    assert_eq!(
+        client.submit_request(&single, Some(&params)).is_ok(),
+        extended
+    );
 
     client.disconnect().await.unwrap();
     assert!(events.try_recv().is_err());
@@ -418,7 +464,7 @@ async fn exercise_superseded_lookup(reconciliation: bool) {
     let rest_url = format!("http://{}", http.local_addr().unwrap());
     let ws_url = format!("ws://{}", ws.local_addr().unwrap());
     let name = "COMBO-OPEN";
-    let fill = response(name, "filled");
+    let fill = response(name, "filled", INDEX_LEGS);
     let mut incomplete = fill.clone();
     incomplete["legs"] = Value::Null;
     let incomplete_order: BrokerOrder = serde_json::from_value(incomplete.clone()).unwrap();
@@ -490,7 +536,7 @@ async fn exercise_superseded_lookup(reconciliation: bool) {
     state.register(&order);
     state
         .handle_combo(
-            &serde_json::from_value(response(name, "new")).unwrap(),
+            &serde_json::from_value(response(name, "new", INDEX_LEGS)).unwrap(),
             &emitter,
             ts,
         )

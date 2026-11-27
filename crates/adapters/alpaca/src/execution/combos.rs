@@ -30,7 +30,6 @@ use serde_json::{Value, json};
 
 use super::{
     advanced::AdvancedInstructions,
-    orders::extended_hours,
     reports::{BrokerOrder, order_side, quantity, timestamp, trade_id},
 };
 use crate::{option_spread, provider::instrument_id};
@@ -43,7 +42,11 @@ pub(super) fn cash_price(value: Decimal, side: OrderSide) -> Decimal {
     }
 }
 
-pub(super) fn request(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
+pub(super) fn request(
+    order: &OrderAny,
+    params: Option<&Params>,
+    extended: bool,
+) -> anyhow::Result<Value> {
     ensure!(
         order.order_type() == OrderType::Limit,
         OrderDeniedReason::UnsupportedOrderType {
@@ -51,8 +54,8 @@ pub(super) fn request(order: &OrderAny, params: Option<&Params>) -> anyhow::Resu
         },
     );
     ensure!(
-        order.time_in_force() == TimeInForce::Day && !extended_hours(params)?,
-        "Alpaca option combos require a regular-hours DAY order",
+        order.time_in_force() == TimeInForce::Day,
+        "Alpaca option combos require DAY time in force",
     );
     ensure!(
         order.quantity() == Quantity::from(1)
@@ -97,7 +100,7 @@ pub(super) fn request(order: &OrderAny, params: Option<&Params>) -> anyhow::Resu
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
+    let mut request = json!({
         "order_class": "mleg",
         "type": "limit",
         "time_in_force": "day",
@@ -105,7 +108,11 @@ pub(super) fn request(order: &OrderAny, params: Option<&Params>) -> anyhow::Resu
         "limit_price": limit.normalize().to_string(),
         "client_order_id": order.client_order_id().as_str(),
         "legs": legs,
-    }))
+    });
+    if extended {
+        request["extended_hours"] = json!(true);
+    }
+    Ok(request)
 }
 
 pub(super) fn parent_fill(

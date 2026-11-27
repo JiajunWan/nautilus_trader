@@ -309,8 +309,13 @@ impl AlpacaExecutionClient {
                         .with_context(|| format!("Load Alpaca option leg {id} before submitting"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            option_spread::definition(id, &instruments, now())?;
-            return combos::request(order, params);
+            let spread = option_spread::definition(id, &instruments, now())?;
+            let extended = extended_hours(params)?;
+            ensure!(
+                !extended || spread.asset_class() == AssetClass::Equity,
+                "Alpaca index option spreads require regular hours",
+            );
+            return combos::request(order, params, extended);
         }
         if is_option_symbol(id.symbol.as_str()) {
             let cache = self.core.cache();

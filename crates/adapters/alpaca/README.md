@@ -205,10 +205,15 @@ Request the spread through the strategy's instrument request or pass the leg
 OCC symbols and `str(spread_id.symbol)` in the Alpaca data config's
 `load_option_symbols`. Subscribe to the legs for quotes.
 
-Submit one regular-hours Limit DAY order on `spread_id`. The first version
-supports one lot with two to four option legs on the same underlying and
-requires Alpaca options Level 3. Index legs must share the same expiration
-and settlement session. A non-reduce-only order opens the legs. Set
+Submit one Limit DAY order on `spread_id`. The adapter supports one lot with
+two to four option legs on the same underlying and requires Alpaca options
+Level 3. Set `extended_hours: true` in the submit parameters to include
+Alpaca's options morning or curb session on eligible equity or ETF
+underlyings. Alpaca checks underlying and account eligibility against its
+current list. Index spreads use regular hours, and their legs must share
+the same expiration and settlement session.
+
+A non-reduce-only order opens the legs. Set
 `reduce_only=True` and reverse the side on the same spread ID to close them.
 For example, a Buy at 0.47 limits the debit to 0.47 for a long call spread.
 A reduce-only Sell at 0.35 limits the credit to at least 0.35. The adapter

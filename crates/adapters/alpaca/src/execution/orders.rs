@@ -526,7 +526,7 @@ mod tests {
         for result in [
             order_request(&equity, None),
             option_order_request(&option, None),
-            super::super::combos::request(&combo, None),
+            super::super::combos::request(&combo, None, false),
         ] {
             assert_eq!(
                 result.unwrap_err().downcast_ref::<OrderDeniedReason>(),
