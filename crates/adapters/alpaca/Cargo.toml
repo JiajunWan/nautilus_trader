@@ -86,3 +86,7 @@ required-features = ["examples"]
 [[example]]
 name = "alpaca-fee-report"
 path = "examples/fee_report.rs"
+
+[[example]]
+name = "alpaca-option-lifecycle"
+path = "examples/option_lifecycle.rs"

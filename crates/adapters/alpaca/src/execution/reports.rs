@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::collections::{BTreeMap, btree_map::Entry};
+
 use anyhow::{Context, ensure};
 use jiff::Timestamp;
 use nautilus_core::{Params, UUID4, UnixNanos};
@@ -568,6 +570,33 @@ impl ActivitiesQuery {
         self.page_token = next;
         Ok((page, more))
     }
+}
+
+pub(super) fn unique_activities<T: Eq>(
+    activities: impl IntoIterator<Item = T>,
+    id: impl Fn(&T) -> &str,
+    kind: &str,
+) -> anyhow::Result<BTreeMap<String, T>> {
+    let mut unique = BTreeMap::new();
+    for activity in activities {
+        let id = id(&activity);
+        ensure!(
+            !id.trim().is_empty(),
+            "Alpaca {kind} activity has an empty ID"
+        );
+        match unique.entry(id.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(activity);
+            }
+            Entry::Occupied(entry) => {
+                ensure!(
+                    entry.get() == &activity,
+                    "Conflicting Alpaca {kind} activity for the same ID"
+                );
+            }
+        }
+    }
+    Ok(unique)
 }
 
 pub(super) async fn fills(

@@ -19,20 +19,17 @@ mod lookup;
 mod sync;
 mod update;
 
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, ensure};
-use nautilus_core::{UnixNanos, string::secret::SecretString};
+use nautilus_core::UnixNanos;
 use nautilus_model::identifiers::TradeId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 pub use sync::{AlpacaFeeSync, AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate};
 
 use self::lookup::{FillEvidence, match_fills, requested_executions};
-use super::reports;
+use super::reports::{self, unique_activities};
 use crate::{
     config::AlpacaExecutionClientConfig,
     http::{AlpacaApiError, AlpacaHttpClient},
@@ -129,17 +126,8 @@ pub async fn request_fee_report(
     end: UnixNanos,
     fill_start: UnixNanos,
 ) -> anyhow::Result<AlpacaFeeReport> {
-    let http = fee_http_client(config)?;
+    let http = AlpacaHttpClient::for_execution(config)?;
     fetch_fee_report(&http, start, end, fill_start).await
-}
-
-fn fee_http_client(config: &AlpacaExecutionClientConfig) -> anyhow::Result<AlpacaHttpClient> {
-    AlpacaHttpClient::new(
-        config.trading_http_url(),
-        &config.credentials()?,
-        config.http_timeout_secs,
-        config.proxy_url.as_ref().map(SecretString::expose_secret),
-    )
 }
 
 async fn fetch_fee_report(
@@ -263,33 +251,6 @@ fn link(value: &Option<String>) -> Option<&str> {
 
 fn match_key(fee: &AlpacaReconciledFee) -> Option<(&str, &str)> {
     Some((link(&fee.order_id)?, link(&fee.execution_id)?))
-}
-
-fn unique_activities<T: Eq>(
-    activities: Vec<T>,
-    id: impl Fn(&T) -> &str,
-    kind: &str,
-) -> anyhow::Result<BTreeMap<String, T>> {
-    let mut unique = BTreeMap::new();
-    for activity in activities {
-        let id = id(&activity);
-        ensure!(
-            !id.trim().is_empty(),
-            "Alpaca {kind} activity has an empty ID"
-        );
-        match unique.entry(id.to_owned()) {
-            Entry::Vacant(entry) => {
-                entry.insert(activity);
-            }
-            Entry::Occupied(entry) => {
-                ensure!(
-                    entry.get() == &activity,
-                    "Conflicting Alpaca {kind} activity for the same ID"
-                );
-            }
-        }
-    }
-    Ok(unique)
 }
 
 #[cfg(test)]

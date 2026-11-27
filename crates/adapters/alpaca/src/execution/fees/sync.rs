@@ -26,7 +26,7 @@ use nautilus_core::{DurationNanos, UnixNanos};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AlpacaFeeAttribution, AlpacaReconciledFee, fee_http_client, fetch_fee_rows,
+    AlpacaFeeAttribution, AlpacaReconciledFee, fetch_fee_rows,
     lookup::{FillLookup, lookup_key},
     match_fills,
 };
@@ -109,7 +109,12 @@ impl AlpacaFeeSync {
         config: &AlpacaExecutionClientConfig,
         settings: AlpacaFeeSyncSettings,
     ) -> anyhow::Result<Self> {
-        Self::open_from_http(fee_http_client(config)?, config.environment, settings).await
+        Self::open_from_http(
+            AlpacaHttpClient::for_execution(config)?,
+            config.environment,
+            settings,
+        )
+        .await
     }
 
     async fn open_from_http(

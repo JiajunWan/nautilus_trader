@@ -22,6 +22,7 @@ mod advanced;
 mod combo_tests;
 mod combos;
 pub mod fees;
+pub mod option_lifecycle;
 mod orders;
 mod reconciliation;
 mod reports;

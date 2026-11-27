@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     common::{credential::AlpacaCredentials, with_broker_code},
-    config::AlpacaDataClientConfig,
+    config::{AlpacaDataClientConfig, AlpacaExecutionClientConfig},
     option_provider::{OptionCatalogEntry, load_option_catalog},
 };
 
@@ -100,6 +100,15 @@ impl fmt::Debug for AlpacaHttpClient {
 }
 
 impl AlpacaHttpClient {
+    pub(crate) fn for_execution(config: &AlpacaExecutionClientConfig) -> anyhow::Result<Self> {
+        Self::new(
+            config.trading_http_url(),
+            &config.credentials()?,
+            config.http_timeout_secs,
+            config.proxy_url.as_ref().map(SecretString::expose_secret),
+        )
+    }
+
     pub(crate) fn for_trading_data(config: &AlpacaDataClientConfig) -> anyhow::Result<Self> {
         Self::new(
             config.trading_http_url(),

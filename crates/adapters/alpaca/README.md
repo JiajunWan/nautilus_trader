@@ -341,6 +341,39 @@ An explicit VWAP or TWAP replacement must match the recorded original
 algorithm. For restored orders, that record can be recovered from the
 instruction object in the broker response when available.
 
+## Historical option settlement
+
+Run the read-only report for one Paper or Live account with a fixed RFC 3339
+posting cutoff, for example:
+
+```sh
+cargo run --locked -p nautilus-alpaca --example alpaca-option-lifecycle -- paper 2026-09-21T00:00:00Z
+```
+
+The report retrieves all available `OPEXP`, `OPEXC`, `OPASN`, `OPTRD` and
+`OPCSH` history through the cutoff. When removals exist it also pages historical
+`FILL` activities, retaining only fills for those contracts. This is an on-demand
+audit. It does not run on the order path or change account balances or positions.
+
+* `closing_position` is the signed end-of-day contract quantity reconstructed from
+  available fills and executed removals through the activity's New York business date.
+  A missing supporting fill gives `null`. Transfers, adjustments and missing history
+  require separate evidence. Partial exercises can leave a nonzero position.
+* The report links an exercise or assignment to a delivery only when both executed
+  records share a unique broker group, date and currency. For standard stock and ETF
+  options it verifies the historical contract's deliverable, signed share count,
+  strike and posted cash. Missing terms, missing groups and ambiguous legs remain
+  unresolved.
+* For SPX-family index options it matches the cash leg by full contract symbol and
+  direction. When Alpaca supplies an SPX settlement reference in the cash narrative,
+  it also recomputes intrinsic value using the OCC strike, right, multiplier and removed
+  contracts. With only a generic cash posting, the reference-based amount is `null`.
+* Cash totals use each executed activity ID once, including unmatched deliverables.
+  The JSON contains the evidence rows, their broker IDs and unmatched delivery IDs.
+  Reports are replacement snapshots scoped to one account and environment. Rebuild
+  after late postings and compare or replace overlapping snapshots without adding
+  their totals together.
+
 ## Fee reconciliation
 
 Use the Rust `execution::fees::request_fee_report` helper to read posted

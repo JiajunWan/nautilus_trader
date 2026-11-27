@@ -471,16 +471,7 @@ pub(crate) async fn load_option_contract(
         is_option_symbol(symbol),
         "Invalid Alpaca OCC option symbol {id}"
     );
-    let query = [("show_deliverables", "true")];
-    let contract: AlpacaOptionContract = http
-        .get(&format!("{CONTRACTS_PATH}/{symbol}"), &query)
-        .await
-        .with_context(|| format!("Loading Alpaca option contract {id}"))?;
-    ensure!(
-        contract.symbol == symbol,
-        "Alpaca returned {} for {id}",
-        contract.symbol
-    );
+    let contract = fetch_contract(http, symbol).await?;
     let qualification = contract.qualification();
     let kind = qualification.kind().with_context(|| {
         format!(
@@ -491,6 +482,74 @@ pub(crate) async fn load_option_contract(
         )
     })?;
     contract.instrument(kind, ts_init)
+}
+
+async fn fetch_contract(
+    http: &AlpacaHttpClient,
+    symbol: &str,
+) -> anyhow::Result<AlpacaOptionContract> {
+    let query = [("show_deliverables", "true")];
+    let contract: AlpacaOptionContract = http
+        .get(&format!("{CONTRACTS_PATH}/{symbol}"), &query)
+        .await
+        .with_context(|| format!("Loading Alpaca option contract {symbol}"))?;
+    ensure!(
+        contract.symbol == symbol,
+        "Alpaca returned {} for {symbol}",
+        contract.symbol
+    );
+    Ok(contract)
+}
+
+pub(crate) fn is_known_index_series(symbol: &str) -> bool {
+    is_option_symbol(symbol)
+        && INDEX_PRODUCTS.iter().any(|product| {
+            product
+                .series
+                .iter()
+                .any(|series| series.root == &symbol[..symbol.len() - 15])
+        })
+}
+
+/// Signed shares per positive removal quantity: assignment sells calls and buys puts.
+pub(crate) struct PhysicalDelivery {
+    pub underlying: String,
+    pub strike: Decimal,
+    pub shares_per_removal: Decimal,
+}
+
+pub(crate) async fn physical_delivery(
+    http: &AlpacaHttpClient,
+    symbol: &str,
+) -> anyhow::Result<Option<PhysicalDelivery>> {
+    let contract = match fetch_contract(http, symbol).await {
+        Ok(contract) => contract,
+        Err(err)
+            if err
+                .downcast_ref::<crate::http::AlpacaApiError>()
+                .is_some_and(|e| e.status == 404) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    if !matches!(
+        contract.qualification(),
+        Qualification::Ready(ContractKind::Equity)
+    ) {
+        return Ok(None);
+    }
+    let (_, right, strike) = contract.terms()?;
+    let shares = Decimal::from(STANDARD_MULTIPLIER);
+    Ok(Some(PhysicalDelivery {
+        underlying: contract.underlying_symbol,
+        strike,
+        shares_per_removal: if right == OptionKind::Call {
+            -shares
+        } else {
+            shares
+        },
+    }))
 }
 
 // Preserve legacy requests such as option_underlying=SPXW. New callers can always
