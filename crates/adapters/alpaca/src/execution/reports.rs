@@ -69,14 +69,28 @@ impl Account {
             self.currency
         );
 
-        // Only the cash portion of purchasing capacity belongs in AccountBalance.
-        // Preserve a cash deficit without depicting borrowed buying power as cash.
         let power = self.effective_buying_power.or(self.buying_power);
-        let free = [self.non_marginable_buying_power, power]
+        let free = if self.cash < Decimal::ZERO
+            && account_type == AccountType::Margin
+            && [
+                power,
+                self.non_marginable_buying_power,
+                self.options_buying_power,
+            ]
             .into_iter()
             .flatten()
-            .map(|available| available.max(Decimal::ZERO))
-            .fold(self.cash, Decimal::min);
+            .any(|available| available > Decimal::ZERO)
+        {
+            // A margin debit can coexist with broker credit. Zero free cash lets
+            // the venue assess zero-margin orders while preserving the cash total.
+            Decimal::ZERO
+        } else {
+            [self.non_marginable_buying_power, power]
+                .into_iter()
+                .flatten()
+                .map(|available| available.max(Decimal::ZERO))
+                .fold(self.cash, Decimal::min)
+        };
         let balance = AccountBalance::from_total_and_free(self.cash, free, currency)?;
 
         let mut margins = Vec::new();

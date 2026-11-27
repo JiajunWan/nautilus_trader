@@ -16,6 +16,16 @@
 use std::collections::HashMap;
 
 use axum::{Json, Router, extract::Query, routing::get};
+use nautilus_common::{
+    messages::execution::TradingCommand,
+    msgbus::{self, MessagingSwitchboard, stubs::get_typed_into_message_saving_handler},
+};
+use nautilus_live::testing::ExecutionHarness;
+use nautilus_model::{
+    enums::{OrderStatus, OrderType},
+    identifiers::{ClientId, TraderId},
+    orders::OrderTestBuilder,
+};
 use rstest::rstest;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -24,6 +34,7 @@ use super::*;
 use crate::{
     config::AlpacaDataClientConfig,
     market_data::{HistoryKind, HistoryRequest, historical},
+    provider::load_instrument,
 };
 
 const EARLY: &str = "2026-11-20T14:30:00.123456788Z";
@@ -41,7 +52,7 @@ const CONTRACT: &str = "SPY261218C00600000";
     json!({"currency":"USD","cash":"25.50","buying_power":"200","non_marginable_buying_power":"20","effective_buying_power":"15.003"}),
     "25.50", "15.00",
 )]
-#[case::deficit(json!({"currency":"USD","cash":"-10","buying_power":"200"}), "-10.00", "-10.00")]
+#[case::deficit_without_power(json!({"currency":"USD","cash":"-10"}), "-10.00", "-10.00")]
 #[case::over_limit(json!({"currency":"USD","cash":"25.50","buying_power":"-7"}), "25.50", "0.00")]
 fn account_keeps_cash_balance_distinct_from_buying_power(
     #[case] response: Value,
@@ -57,6 +68,120 @@ fn account_keeps_cash_balance_distinct_from_buying_power(
     assert_eq!(balance.free, Money::from(format!("{free} USD").as_str()));
     assert_eq!(balance.total, balance.free + balance.locked);
     assert!(state.margins.is_empty());
+}
+
+#[rstest]
+#[case::cash_account(AccountType::Cash, json!({"buying_power":"200","options_buying_power":"100"}), "-10 USD")]
+#[case::margin_without_power(AccountType::Margin, json!({"effective_buying_power":"0","buying_power":"200","options_buying_power":"-1"}), "-10 USD")]
+#[case::margin_stock_power(AccountType::Margin, json!({"buying_power":"200"}), "0 USD")]
+#[case::margin_non_marginable_power(AccountType::Margin, json!({"non_marginable_buying_power":"50"}), "0 USD")]
+#[case::margin_option_power(AccountType::Margin, json!({"options_buying_power":"100"}), "0 USD")]
+fn account_reports_negative_cash_without_granting_cash_credit(
+    #[case] account_type: AccountType,
+    #[case] mut fields: Value,
+    #[case] free: &str,
+) {
+    fields["cash"] = json!("-10");
+    fields["currency"] = json!("USD");
+    let account: Account = serde_json::from_value(fields).unwrap();
+    let state = account
+        .to_state(AccountId::from("ALPACA-001"), account_type, 1.into())
+        .unwrap();
+    let balance = state.balances[0];
+    assert_eq!(balance.total, Money::from("-10 USD"));
+    assert_eq!(balance.free, Money::from(free));
+    assert_eq!(balance.free + balance.locked, balance.total);
+    assert_eq!(state.info.unwrap().get_str("cash"), Some("-10"));
+}
+
+#[rstest]
+#[case::stock("SPY", "500.00", None)]
+#[case::option(CONTRACT, "5.00", None)]
+#[case::option_over_notional_limit(CONTRACT, "5.00", Some(499))]
+#[tokio::test]
+async fn margin_cash_deficit_respects_native_order_risk(
+    #[case] symbol: &str,
+    #[case] limit: &str,
+    #[case] max_notional: Option<u32>,
+) {
+    let stock = json!({"symbol":"SPY","class":"us_equity","exchange":"ARCA","status":"active",
+        "tradable":true,"fractionable":true});
+    let option = json!({"symbol":CONTRACT,"underlying_symbol":"SPY","root_symbol":"SPY",
+        "expiration_date":"2026-12-18","type":"call","style":"american","strike_price":"600",
+        "size":"100","multiplier":"100","status":"active","tradable":true,"ppind":true,
+        "deliverables":[{"type":"equity","symbol":"SPY","amount":"100",
+            "allocation_percentage":"100","settlement_method":"CCC","delayed_settlement":false}]});
+    let app = Router::new()
+        .route("/v2/assets/SPY", get(move || async { Json(stock) }))
+        .route(
+            &format!("/v2/options/contracts/{CONTRACT}"),
+            get(move || async { Json(option) }),
+        )
+        .route(
+            "/v2/account",
+            get(|| async {
+                Json(json!({
+                    "currency":"USD","cash":"-1250","effective_buying_power":"20000",
+                    "options_buying_power":"5000","non_marginable_buying_power":"5000"
+                }))
+            }),
+        );
+    let http = client(app).await;
+    let id = instrument_id(symbol).unwrap();
+    let instrument = load_instrument(&http, id, 1.into()).await.unwrap();
+    let account_id = AccountId::from("ALPACA-001");
+    let state = account_state(&http, account_id, AccountType::Margin)
+        .await
+        .unwrap();
+    let harness = ExecutionHarness::new(
+        TraderId::from("TESTER-001"),
+        ClientId::from("ALPACA"),
+        account_id,
+        instrument,
+    );
+    harness
+        .cache()
+        .borrow_mut()
+        .add_account(state.into())
+        .unwrap();
+    if let Some(max) = max_notional {
+        harness
+            .risk_engine()
+            .borrow_mut()
+            .set_max_notional_per_order(id, Decimal::from(max));
+    }
+    let (handler, commands) = get_typed_into_message_saving_handler::<TradingCommand>(None);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::exec_engine_queue_execute(),
+        handler,
+    );
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .price(Price::from(limit))
+        .build();
+    harness.submit_via_risk(&order);
+    let cached = harness.cache().borrow();
+    let cached_order = cached.order(&order.client_order_id()).unwrap();
+    if max_notional.is_some() {
+        assert!(commands.get_messages().is_empty());
+        assert_eq!(cached_order.status(), OrderStatus::Denied);
+        assert!(
+            cached_order
+                .last_event()
+                .message()
+                .unwrap()
+                .starts_with("NOTIONAL_EXCEEDS_MAX_PER_ORDER")
+        );
+    } else {
+        let forwarded = commands.get_messages();
+        assert!(
+            matches!(&forwarded[..], [TradingCommand::SubmitOrder(cmd)] if cmd.client_order_id == order.client_order_id()),
+            "{:?}",
+            cached_order.last_event().message()
+        );
+    }
 }
 
 #[rstest]

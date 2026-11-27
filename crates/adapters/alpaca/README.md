@@ -288,8 +288,12 @@ as decimal strings when returned by Alpaca.
 
 `AccountBalance.total` holds cash. `free` is cash capped by reported
 non-marginable and effective buying power, with `buying_power` as a fallback
-for the effective field. `locked` is the difference. A cash deficit remains
-a negative balance. Use the venue fields for product-specific buying power.
+for the effective field. On a margin account with a cash debit, any positive
+effective (or fallback), non-marginable, or options buying power sets `free`
+to zero. The debit stays in `total` and in the signed difference `locked = total - free`.
+Orders with zero local initial margin can then reach Alpaca for a product-specific
+buying power check. With no reported capacity, or on a cash account, the debit
+also stays in `free`. Use the venue fields for product-specific buying power.
 For margin accounts, the reported initial and maintenance requirements appear
 as one USD account-wide `MarginBalance` when both values are available.
 
