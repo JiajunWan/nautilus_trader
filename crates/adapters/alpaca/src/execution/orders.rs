@@ -85,11 +85,24 @@ pub(super) fn option_order_request(
         }
         order_type => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
     };
-    // Bind closing sales to an existing long position at the broker.
-    let (side, intent) = match order.order_side() {
-        OrderSide::Buy if !order.is_reduce_only() => ("buy", "buy_to_open"),
-        OrderSide::Buy => bail!("Alpaca buy-to-close is not supported by this adapter"),
-        OrderSide::Sell => ("sell", "sell_to_close"),
+    let default_intent = match (order.order_side(), order.is_reduce_only()) {
+        (OrderSide::Buy, false) => "buy_to_open",
+        (OrderSide::Buy, true) => "buy_to_close",
+        // Preserve the existing broker-side long-close guard for sells.
+        (OrderSide::Sell, _) => "sell_to_close",
+    };
+    let intent = match params.and_then(|params| params.get("position_intent")) {
+        Some(value) => value
+            .as_str()
+            .context("Alpaca position_intent must be a string")?,
+        None => default_intent,
+    };
+    let side = match (order.order_side(), order.is_reduce_only(), intent) {
+        (OrderSide::Buy, false, "buy_to_open") | (OrderSide::Buy, true, "buy_to_close") => "buy",
+        (OrderSide::Sell, _, "sell_to_close") | (OrderSide::Sell, false, "sell_to_open") => "sell",
+        _ => bail!(
+            "Alpaca position_intent {intent} conflicts with the option order side or reduce-only flag"
+        ),
     };
     let mut request = json!({
         "symbol": order.instrument_id().symbol.to_string(),
@@ -545,22 +558,72 @@ mod tests {
     }
 
     #[rstest]
-    #[case(OrderType::Market, OrderSide::Buy, false, "market", "buy_to_open")]
-    #[case(OrderType::Limit, OrderSide::Sell, true, "limit", "sell_to_close")]
+    #[case(
+        OrderType::Market,
+        OrderSide::Buy,
+        false,
+        false,
+        None,
+        "market",
+        "buy_to_open"
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Sell,
+        false,
+        true,
+        None,
+        "limit",
+        "sell_to_close"
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Sell,
+        true,
+        false,
+        None,
+        "limit",
+        "sell_to_close"
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Sell,
+        false,
+        true,
+        Some("sell_to_open"),
+        "limit",
+        "sell_to_open"
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Buy,
+        true,
+        true,
+        None,
+        "limit",
+        "buy_to_close"
+    )]
     fn maps_option_position_intent(
         #[case] order_type: OrderType,
         #[case] side: OrderSide,
+        #[case] reduce_only: bool,
         #[case] extended: bool,
+        #[case] explicit_intent: Option<&str>,
         #[case] wire_type: &str,
         #[case] wire_intent: &str,
     ) {
         let order = order_builder(order_type, "OPT-1")
             .instrument_id(InstrumentId::from("SPY261120C00745000.ALPACA"))
             .side(side)
+            .reduce_only(reduce_only)
             .price(Price::from("2.40"))
             .build();
-        let params = Params::new([("extended_hours".to_string(), json!(extended))].into());
-        let request = option_order_request(&order, Some(&params)).unwrap();
+        let mut params = [("extended_hours".to_owned(), json!(extended))].to_vec();
+        if let Some(intent) = explicit_intent {
+            params.push(("position_intent".to_owned(), json!(intent)));
+        }
+        let request =
+            option_order_request(&order, Some(&Params::new(params.into_iter().collect()))).unwrap();
         assert_eq!(request["symbol"], "SPY261120C00745000");
         assert_eq!(request["qty"], "1");
         assert_eq!(request["time_in_force"], "day");
@@ -572,6 +635,29 @@ mod tests {
         } else {
             assert!(request.get("limit_price").is_none());
         }
+    }
+
+    #[rstest]
+    #[case(OrderSide::Sell, true, json!("sell_to_open"))]
+    #[case(OrderSide::Buy, false, json!("sell_to_open"))]
+    #[case(OrderSide::Buy, false, json!("buy_to_close"))]
+    #[case(OrderSide::Buy, true, json!("buy_to_open"))]
+    #[case(OrderSide::Sell, false, json!("buy_to_open"))]
+    #[case(OrderSide::Sell, false, json!("open"))]
+    #[case(OrderSide::Sell, false, json!(true))]
+    fn denies_incompatible_option_position_intent(
+        #[case] side: OrderSide,
+        #[case] reduce_only: bool,
+        #[case] intent: Value,
+    ) {
+        let order = order_builder(OrderType::Limit, "OPT-1")
+            .instrument_id(InstrumentId::from("SPY261120C00745000.ALPACA"))
+            .side(side)
+            .reduce_only(reduce_only)
+            .price(Price::from("2.40"))
+            .build();
+        let params = Params::new([("position_intent".to_owned(), intent)].into());
+        assert!(option_order_request(&order, Some(&params)).is_err());
     }
 
     #[rstest]

@@ -159,10 +159,15 @@ for the broker's order and session restrictions.
 
 Submit a single Market or Limit order with DAY time in force for a loaded
 equity, ETF, or supported index option instrument. Index option orders
-execute during regular hours. Quantity counts whole contracts. The adapter sends buys
-with `buy_to_open` and sells with `sell_to_close`. It routes cancellation by
-Alpaca order ID and reconciles single-leg option orders and FILL activities
-using the complete OCC symbol. Position reports also include option positions.
+execute during regular hours. Quantity counts whole contracts. A regular buy sends
+`buy_to_open`, a reduce-only buy sends `buy_to_close`, and a sell defaults to
+`sell_to_close`. To open a short, submit a sell with `reduce_only=false` and
+`params={"position_intent": "sell_to_open"}`. Alpaca applies the account's
+collateral and options permissions. To change an option order, cancel and resubmit.
+
+The adapter routes cancellation by Alpaca order ID and reconciles single-leg
+option orders and FILL activities using the complete OCC symbol. Position reports
+also include option positions.
 
 Set `extended_hours: true` on DAY Limit orders for broker-enabled equity and
 ETF option contracts. Check the Paper asset's `has_options_extended_hours`
@@ -178,7 +183,10 @@ cargo run -p nautilus-alpaca --features examples --example alpaca-paper-smoke --
 Use `--market-round-trip` for DAY Market orders and `--regular-limit PRICE`
 for a passive DAY Limit cancellation. The eligible morning session can use
 `--extended-round-trip` or `--extended-limit PRICE`. Confirm both order
-receipts and the final position in Paper after each round trip.
+receipts and the final position in Paper after each round trip. For a
+cash-secured put, use `--short-limit-round-trip` or
+`--extended-short-round-trip` with `--option OCC_SYMBOL`. The smoke test caps
+strike collateral at $2,000 and sends the closing buy with reduce-only set.
 
 ### Multi-leg option orders
 

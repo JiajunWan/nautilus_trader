@@ -19,6 +19,7 @@ use jiff::{
     civil::{Date, time},
 };
 use nautilus_network::http::HttpClient;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use super::{
@@ -33,9 +34,17 @@ struct PaperOption {
     expiration_date: Date,
     tradable: bool,
     status: String,
+    #[serde(rename = "type")]
+    right: String,
+    strike_price: Decimal,
 }
 
-pub(super) async fn preflight(symbol: &str, now: Timestamp, client: &HttpClient) -> Result<()> {
+pub(super) async fn preflight(
+    symbol: &str,
+    now: Timestamp,
+    client: &HttpClient,
+    short_option: bool,
+) -> Result<()> {
     ensure!(
         (16..=21).contains(&symbol.len())
             && symbol
@@ -83,6 +92,22 @@ pub(super) async fn preflight(symbol: &str, now: Timestamp, client: &HttpClient)
         ensure!(
             clock.is_open && clock.next_close.as_second() - now.as_second() > 150,
             "Paper market must be open with enough time to reconcile",
+        );
+    }
+    if short_option {
+        #[derive(Deserialize)]
+        struct PaperBuyingPower {
+            cash: Decimal,
+            options_buying_power: Decimal,
+        }
+        let account: PaperBuyingPower = get(client, "/v2/account", &[]).await?;
+        let collateral = contract.strike_price * Decimal::from(100);
+        ensure!(
+            contract.right == "put"
+                && collateral > Decimal::ZERO
+                && collateral <= Decimal::from(2_000)
+                && account.cash.min(account.options_buying_power) >= collateral,
+            "Paper short smoke requires a cash-secured put with at most $2,000 in collateral",
         );
     }
     require_flat(symbol, "us_option", client).await

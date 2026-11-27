@@ -29,6 +29,8 @@
 //! Prefix extended round-trip or extended limit modes with `--symbol SYMBOL` to select an equity.
 //! Prefix a Market or Limit DAY round trip or a passive limit cancellation with
 //! `--option OCC_SYMBOL` to test a single equity option contract in Paper.
+//! For a cash-secured put, use `--option OCC_SYMBOL --short-limit-round-trip` in regular
+//! hours or `--option OCC_SYMBOL --extended-short-round-trip` in the options morning session.
 //! Use `--extended-dma-limit NASDAQ|ARCA PRICE` to submit and cancel a routed DAY limit.
 //! Use `-- --hold-limit DAY|GTC PRICE` to leave one nonmarketable, extended-hours
 //! order open. Verify and cancel it using `-- --verify-carryover DAY|GTC UUID`, or
@@ -306,12 +308,13 @@ struct PaperSmoke {
     regular_session: Option<Range<Timestamp>>,
     instrument_id: InstrumentId,
     option: bool,
+    short_option: bool,
     bar_type: BarType,
     node: LiveNodeHandle,
     observation: Rc<RefCell<Observation>>,
     active_order: Option<ClientOrderId>,
     submitted: bool,
-    round_trip_buy_filled: bool,
+    round_trip_entry_filled: bool,
     advanced_checked: usize,
 }
 
@@ -368,6 +371,7 @@ impl PaperSmoke {
         time_in_force: TimeInForce,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        let reduce_only = self.short_option && side == OrderSide::Buy;
         self.order().limit(
             self.instrument_id,
             side,
@@ -376,7 +380,7 @@ impl PaperSmoke {
             Some(time_in_force),
             None,
             None,
-            None,
+            Some(reduce_only),
             None,
             None,
             None,
@@ -400,13 +404,19 @@ impl PaperSmoke {
         };
 
         let cent = Decimal::new(1, 2);
-        let (side, price) = if self.option {
-            if self.round_trip_buy_filled {
+        let (side, price) = if self.short_option {
+            if self.round_trip_entry_filled {
+                (OrderSide::Buy, ask)
+            } else {
+                (OrderSide::Sell, bid)
+            }
+        } else if self.option {
+            if self.round_trip_entry_filled {
                 (OrderSide::Sell, bid)
             } else {
                 (OrderSide::Buy, ask)
             }
-        } else if self.round_trip_buy_filled {
+        } else if self.round_trip_entry_filled {
             let price = bid.round_dp_with_strategy(2, RoundingStrategy::ToNegativeInfinity) - cent;
             (OrderSide::Sell, price)
         } else {
@@ -414,7 +424,18 @@ impl PaperSmoke {
             (OrderSide::Buy, price)
         };
         let order = self.limit_order(side, Price::from_decimal_dp(price, 2)?, time_in_force, None);
-        self.submit(order, Some(extended_hours_params(extended_hours)))
+        let params = if self.short_option && side == OrderSide::Sell {
+            Params::new(
+                [
+                    ("extended_hours".into(), extended_hours.into()),
+                    ("position_intent".into(), "sell_to_open".into()),
+                ]
+                .into(),
+            )
+        } else {
+            extended_hours_params(extended_hours)
+        };
+        self.submit(order, Some(params))
     }
 
     fn submit_advanced_check(&mut self, quote: &QuoteTick) -> Result<()> {
@@ -510,7 +531,7 @@ impl PaperSmoke {
             if let Some(next) = self.remaining_modes.pop_front() {
                 self.mode = next;
                 self.submitted = false;
-                self.round_trip_buy_filled = false;
+                self.round_trip_entry_filled = false;
                 self.advanced_checked = 0;
                 log::info!("Starting paper workflow: {next:?}");
                 return;
@@ -635,14 +656,14 @@ nautilus_strategy!(PaperSmoke, {
             event.last_px
         );
         match self.mode {
-            Mode::MarketRoundTrip if !self.round_trip_buy_filled => {
-                self.round_trip_buy_filled = true;
+            Mode::MarketRoundTrip if !self.round_trip_entry_filled => {
+                self.round_trip_entry_filled = true;
                 if let Err(e) = self.submit(self.market_order(OrderSide::Sell), None) {
                     self.finish_execution(Err(e.to_string()));
                 }
             }
-            Mode::LimitRoundTrip { .. } if !self.round_trip_buy_filled => {
-                self.round_trip_buy_filled = true;
+            Mode::LimitRoundTrip { .. } if !self.round_trip_entry_filled => {
+                self.round_trip_entry_filled = true;
                 self.submitted = false;
             }
             Mode::MarketRoundTrip | Mode::LimitRoundTrip { .. } => self.finish_execution(Ok(())),
@@ -936,12 +957,13 @@ async fn main() -> Result<()> {
             Ok((target.duration_since(now) + SignedDuration::from_mins(4)).try_into()?)
         })
         .transpose()?;
+    let mut short_option = false;
     let (option, args) = match args.as_slice() {
         [flag, symbol, rest @ ..] if flag == "--option" => {
             ensure!(
                 matches!(
                     rest,
-                    [mode] if matches!(mode.as_str(), "--market-round-trip" | "--limit-round-trip" | "--extended-round-trip")
+                    [mode] if matches!(mode.as_str(), "--market-round-trip" | "--limit-round-trip" | "--extended-round-trip" | "--short-limit-round-trip" | "--extended-short-round-trip")
                 ) || matches!(rest, [mode, _] if matches!(mode.as_str(), "--regular-limit" | "--extended-limit")),
                 "Select a single-leg option DAY round trip or submit-and-cancel limit mode",
             );
@@ -956,7 +978,16 @@ async fn main() -> Result<()> {
                 local.weekday().to_monday_one_offset() <= 5 && session.contains(&local.time()),
                 "Paper option smoke mode requires an open session with time to reconcile",
             );
-            (Some(symbol), rest.to_vec())
+            let mode = match rest[0].as_str() {
+                "--short-limit-round-trip" => Some("--limit-round-trip"),
+                "--extended-short-round-trip" => Some("--extended-round-trip"),
+                _ => None,
+            };
+            short_option = mode.is_some();
+            (
+                Some(symbol),
+                mode.map_or_else(|| rest.to_vec(), |mode| vec![mode.to_owned()]),
+            )
         }
         _ => (None, args),
     };
@@ -983,7 +1014,7 @@ async fn main() -> Result<()> {
             regular_session = Some(account::regular_session(client).await?);
             account::require_flat("SPY", "us_equity", client).await?;
         } else {
-            options::preflight(symbol.as_str(), now, client).await?;
+            options::preflight(symbol.as_str(), now, client, short_option).await?;
         }
     }
     let suite = !modes.is_empty();
@@ -1092,12 +1123,13 @@ async fn main() -> Result<()> {
         regular_session: regular_session.clone(),
         instrument_id,
         option: option.is_some(),
+        short_option,
         bar_type: format!("{instrument_id}-1-MINUTE-LAST-EXTERNAL").parse()?,
         node: node.handle(),
         observation: Rc::clone(&observation),
         active_order: None,
         submitted: false,
-        round_trip_buy_filled: false,
+        round_trip_entry_filled: false,
         advanced_checked: 0,
     })?;
 
