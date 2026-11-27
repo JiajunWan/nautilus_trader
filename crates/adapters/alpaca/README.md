@@ -168,19 +168,21 @@ for the broker's order and session restrictions.
 
 Submit a single Market or Limit order with DAY time in force for a loaded
 equity, ETF, or supported index option instrument. Index option orders
-execute during regular hours. Quantity counts whole contracts. A regular buy sends
-`buy_to_open`, a reduce-only buy sends `buy_to_close`, and a sell defaults to
-`sell_to_close`. To open a short, submit a sell with `reduce_only=false` and
-`params={"position_intent": "sell_to_open"}`. Alpaca applies the account's
-collateral and options permissions. To change an option order, cancel and resubmit.
+execute during regular hours. Quantity counts whole contracts. To change an option
+order, cancel and resubmit.
 
-Set `infer_option_position_intent=true` on `AlpacaExecutionClientConfig`
-to let Alpaca determine the position effect for ordinary regular-hours
-single-leg US equity and ETF option Limit DAY orders. This is an account-level
-opt-in. A sell while flat may open a short if Alpaca approves the collateral.
-An explicit `position_intent` or `reduce_only` still takes precedence, so
-strategies that must close an existing position should set `reduce_only=true`.
-Alpaca evaluates the broker account's current positions.
+`AlpacaExecutionClientConfig` defaults `infer_option_position_intent` to
+`true`. For regular-hours Limit DAY orders, Alpaca determines opening or
+closing from the account's positions when the order has no explicit
+`position_intent` and is not reduce-only. A sell while flat may open a short
+subject to the account's options permissions and collateral.
+
+Set `reduce_only=true` for a close-only order. The adapter sends
+`buy_to_close` or `sell_to_close` for the corresponding side. Market orders,
+extended-hours orders, and orders submitted with inference disabled use an
+explicit intent. Their ordinary default is `buy_to_open` for buys and
+`sell_to_close` for sells. An opening sell on these paths uses
+`params={"position_intent": "sell_to_open"}`.
 
 The adapter routes cancellation by Alpaca order ID and reconciles single-leg
 option orders and FILL activities using the complete OCC symbol. Position reports

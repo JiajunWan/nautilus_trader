@@ -134,7 +134,7 @@ impl AlpacaExecutionClientConfig {
         base_url_ws_private = None,
         proxy_url = None,
         http_timeout_secs = None,
-        infer_option_position_intent = false,
+        infer_option_position_intent = true,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(

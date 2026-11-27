@@ -334,9 +334,7 @@ impl AlpacaExecutionClient {
                 ),
                 _ => anyhow::bail!("Unsupported Alpaca option asset class for {id}"),
             }
-            let infer =
-                self.infer_option_position_intent && instrument.asset_class() == AssetClass::Equity;
-            return option_order_request(order, params, infer);
+            return option_order_request(order, params, self.infer_option_position_intent);
         }
         order_request(order, params)
     }
@@ -1497,9 +1495,74 @@ async fn supported_fills(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::cache::Cache;
+    use nautilus_model::{
+        enums::{OrderSide, OrderType, TimeInForce},
+        identifiers::TraderId,
+        instruments::stubs::option_contract_appl,
+        orders::OrderTestBuilder,
+        types::{Price, Quantity},
+    };
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::stock("AAPL261204C00250000", AssetClass::Equity)]
+    #[case::etf("SPY261204C00700000", AssetClass::Equity)]
+    #[case::index("SPX261218C06800000", AssetClass::Index)]
+    #[case::weekly_index("SPXW261204C06800000", AssetClass::Index)]
+    fn uses_the_same_default_intent_for_single_leg_options(
+        #[case] symbol: &str,
+        #[case] asset_class: AssetClass,
+    ) {
+        let id = crate::provider::instrument_id(symbol).unwrap();
+        let mut instrument = option_contract_appl();
+        instrument.id = id;
+        instrument.raw_symbol = id.symbol;
+        instrument.asset_class = asset_class;
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.into())
+            .unwrap();
+        let config = AlpacaExecutionClientConfig::builder()
+            .api_key("fixture-key".into())
+            .api_secret("fixture-secret".into())
+            .build();
+        let core = ExecutionClientCore::new(
+            TraderId::from("TEST-001"),
+            ClientId::from("ALPACA"),
+            *ALPACA,
+            OmsType::Netting,
+            config.account_id,
+            config.account_type,
+            Some(Currency::USD()),
+            cache,
+        );
+        let client = AlpacaExecutionClient::new(core, &config).unwrap();
+        for (side, close_intent) in [
+            (OrderSide::Buy, "buy_to_close"),
+            (OrderSide::Sell, "sell_to_close"),
+        ] {
+            let request = |reduce_only| {
+                let order = OrderTestBuilder::new(OrderType::Limit)
+                    .instrument_id(id)
+                    .side(side)
+                    .price(Price::from("1.00"))
+                    .quantity(Quantity::from(1))
+                    .time_in_force(TimeInForce::Day)
+                    .reduce_only(reduce_only)
+                    .build();
+                client.submit_request(&order, None).unwrap()
+            };
+            assert!(request(false).get("position_intent").is_none());
+            assert_eq!(request(true)["position_intent"], close_intent);
+        }
+    }
 
     #[rstest]
     #[case(422, "insufficient buying power", true)]

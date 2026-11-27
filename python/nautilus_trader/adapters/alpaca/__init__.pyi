@@ -101,7 +101,7 @@ class AlpacaExecutionClientConfig:
         base_url_ws_private: str | None = None,
         proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
-        infer_option_position_intent: bool = False,
+        infer_option_position_intent: bool = True,
     ) -> None: ...
 
 @typing.final
