@@ -26,13 +26,12 @@ use nautilus_core::{
 use nautilus_model::{
     data::{Data, QuoteTick, TradeTick},
     enums::AggressorSide,
-    identifiers::TradeId,
     types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, de};
 
-use crate::provider::instrument_id;
+use crate::{market_data::option_trade_id, provider::instrument_id};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct OptionMessage<'a> {
@@ -106,11 +105,7 @@ impl OptionMessage<'_> {
             let condition = self
                 .condition
                 .context("Missing Alpaca option trade condition")?;
-            // OPRA messages carry no trade ID or sequence. Identical wire trades therefore
-            // share the same synthetic ID, including across a reconnect.
-            let key = format!("{symbol}:{ts_event}:{price}:{size}:{exchange}:{condition}");
-            let digest = blake3::hash(key.as_bytes()).to_hex();
-            let trade_id = TradeId::new_checked(&digest.as_str()[..32])?;
+            let trade_id = option_trade_id(id, ts_event, price, size, exchange, condition)?;
             Data::Trade(TradeTick::new_checked(
                 id,
                 Price::from_decimal_dp(price, price.scale().max(2) as u8)?,

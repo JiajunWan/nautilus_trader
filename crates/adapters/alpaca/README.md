@@ -67,6 +67,15 @@ trades. OPRA requires an Alpaca data entitlement and its signed agreement.
 use their own connection and the complete OCC symbol with venue `ALPACA`.
 Set `load_option_symbols` to publish selected contracts at startup.
 
+Use the standard history requests for option trades and externally aggregated
+LAST bars on individual OCC contracts. A trade request can include both stock
+and option contract IDs and returns one chronological batch. Request each bar
+type separately. Option historical trades and bars use Alpaca's account data
+entitlement and accept no feed override. For mixed stock and option trade
+requests, leave the feed parameter unset. Real-time `option_feed` selects the
+WebSocket feed. Alpaca currently has no supported historical option quote
+endpoint in this adapter.
+
 Query the Trading API contract directory by underlying to discover every active
 root Alpaca returns for a date range. Each row retains the broker's OCC symbol,
 underlying and root. The following Python request includes newly listed roots

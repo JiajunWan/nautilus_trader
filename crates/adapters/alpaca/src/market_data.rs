@@ -17,7 +17,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, binary_heap::PeekMut},
+    collections::{BTreeMap, BinaryHeap, binary_heap::PeekMut},
 };
 
 use anyhow::{Context, ensure};
@@ -161,6 +161,60 @@ impl StockTrade {
     }
 }
 
+// OPRA messages carry no trade ID or sequence. Match the same trade across REST and
+// the stream using their shared event fields. Identical messages share an identity.
+pub(crate) fn option_trade_id(
+    id: InstrumentId,
+    ts_event: UnixNanos,
+    price: Decimal,
+    size: u64,
+    exchange: &str,
+    condition: &str,
+) -> anyhow::Result<TradeId> {
+    let symbol = id.symbol;
+    let price = price.normalize();
+    let key = format!("{symbol}:{ts_event}:{price}:{size}:{exchange}:{condition}");
+    let digest = blake3::hash(key.as_bytes()).to_hex();
+    Ok(TradeId::new_checked(&digest.as_str()[..32])?)
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HistoricalOptionTrade {
+    #[serde(rename = "p", deserialize_with = "decimal")]
+    price: Decimal,
+    #[serde(rename = "s")]
+    size: u64,
+    #[serde(rename = "t")]
+    time: String,
+    #[serde(rename = "x")]
+    exchange: String,
+    #[serde(rename = "c")]
+    condition: String,
+}
+
+impl HistoricalOptionTrade {
+    pub(crate) fn tick(&self, id: InstrumentId) -> anyhow::Result<TradeTick> {
+        let ts_event = iso8601_to_unix_nanos(&self.time)?;
+        let price = self.price.normalize();
+        TradeTick::new_checked(
+            id,
+            Price::from_decimal_dp(price, price.scale().max(2) as u8)?,
+            Quantity::from_decimal_dp(Decimal::from(self.size), 0)?,
+            AggressorSide::NoAggressor,
+            option_trade_id(
+                id,
+                ts_event,
+                price,
+                self.size,
+                &self.exchange,
+                &self.condition,
+            )?,
+            ts_event,
+            ts_event,
+        )
+    }
+}
+
 stock_payload! {
     StockBar {
         #[serde(rename = "o", deserialize_with = "decimal")]
@@ -240,9 +294,9 @@ pub(crate) fn timeframe(bar_type: BarType) -> anyhow::Result<String> {
 #[derive(Debug, Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct HistoricalPage<T> {
-    quotes: Option<Vec<T>>,
-    trades: Option<Vec<T>>,
-    bars: Option<Vec<T>>,
+    quotes: Option<T>,
+    trades: Option<T>,
+    bars: Option<T>,
     next_page_token: Option<String>,
 }
 
@@ -262,13 +316,13 @@ impl HistoryKind {
         }
     }
 
-    fn rows<T>(self, page: HistoricalPage<T>) -> (Vec<T>, Option<String>) {
+    fn rows<T>(self, page: HistoricalPage<T>) -> (Option<T>, Option<String>) {
         let rows = match self {
             Self::Quotes => page.quotes,
             Self::Trades => page.trades,
             Self::Bars => page.bars,
         };
-        (rows.unwrap_or_default(), page.next_page_token)
+        (rows, page.next_page_token)
     }
 }
 
@@ -291,6 +345,47 @@ pub(crate) async fn historical<T: DeserializeOwned>(
     let symbol: String =
         url::form_urlencoded::byte_serialize(id.symbol.as_str().as_bytes()).collect();
     let path = format!("/v2/stocks/{symbol}/{}", kind.path());
+    history_pages(
+        http,
+        id,
+        kind,
+        spec,
+        &path,
+        &[("feed", feed)],
+        |rows: Vec<T>| rows,
+    )
+    .await
+}
+
+pub(crate) async fn option_history<T: DeserializeOwned>(
+    http: &AlpacaHttpClient,
+    id: InstrumentId,
+    kind: HistoryKind,
+    spec: &HistoryRequest,
+) -> anyhow::Result<Vec<T>> {
+    let path = format!("/v1beta1/options/{}", kind.path());
+    let symbol = id.symbol.as_str();
+    history_pages(
+        http,
+        id,
+        kind,
+        spec,
+        &path,
+        &[("symbols", symbol)],
+        |mut rows: BTreeMap<String, Vec<T>>| rows.remove(symbol).unwrap_or_default(),
+    )
+    .await
+}
+
+async fn history_pages<T, Page: DeserializeOwned>(
+    http: &AlpacaHttpClient,
+    id: InstrumentId,
+    kind: HistoryKind,
+    spec: &HistoryRequest,
+    path: &str,
+    selectors: &[(&str, &str)],
+    rows_for_symbol: impl Fn(Page) -> Vec<T>,
+) -> anyhow::Result<Vec<T>> {
     let mut data = Vec::new();
     let mut token: Option<String> = None;
     let mut seen = PageTokens::default();
@@ -304,7 +399,8 @@ pub(crate) async fn historical<T: DeserializeOwned>(
         }
 
         let limit_string = limit.to_string();
-        let mut query = vec![("feed", feed), ("limit", &limit_string), ("sort", "asc")];
+        let mut query = selectors.to_vec();
+        query.extend([("limit", limit_string.as_str()), ("sort", "asc")]);
         if let Some(start) = &spec.start {
             query.push(("start", start));
         }
@@ -316,15 +412,17 @@ pub(crate) async fn historical<T: DeserializeOwned>(
         }
         if let Some(token) = &token {
             seen.check(token, kind.path())
-                .with_context(|| format!("Fetching Alpaca history for {id} ({feed})"))?;
+                .with_context(|| format!("Fetching Alpaca history for {id} at {path}"))?;
             query.push(("page_token", token));
         }
-        let page: HistoricalPage<T> = http
-            .get(&path, &query)
+        let page: HistoricalPage<Page> = http
+            .get(path, &query)
             .await
-            .with_context(|| format!("Fetching Alpaca {} for {id} ({feed})", kind.path()))?;
+            .with_context(|| format!("Fetching Alpaca history for {id} at {path}"))?;
         let (rows, next_token) = kind.rows(page);
-        data.extend(rows);
+        if let Some(rows) = rows {
+            data.extend(rows_for_symbol(rows));
+        }
         let Some(next_token) = next_token else {
             break;
         };

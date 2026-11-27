@@ -49,7 +49,10 @@ use nautilus_core::{
     time::get_atomic_clock_realtime,
 };
 use nautilus_live::task::TaskGroup;
-use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
+use nautilus_model::{
+    data::TradeTick,
+    identifiers::{ClientId, InstrumentId, Venue},
+};
 use nautilus_network::websocket::WebSocketClient;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Notify, watch};
@@ -59,8 +62,8 @@ use crate::{
     config::AlpacaDataClientConfig,
     http::AlpacaHttpClient,
     market_data::{
-        HistoryKind, HistoryRequest, StockBar, StockQuote, StockTrade, historical, merge_history,
-        timeframe,
+        HistoricalOptionTrade, HistoryKind, HistoryRequest, StockBar, StockQuote, StockTrade,
+        historical, merge_history, option_history, timeframe,
     },
     market_stream::{StockChannel, StockStream, StockSubscriptions, validate_live_bar},
     option_provider::{is_option_symbol, load_option_chain},
@@ -68,7 +71,9 @@ use crate::{
     provider::{load_equities, load_instrument},
 };
 
-/// Native Alpaca quotes, trades, equity bars and instrument definitions.
+const MAX_HISTORY_REQUESTS: usize = 4;
+
+/// Native Alpaca quotes, trades, bars and instrument definitions.
 #[derive(Debug)]
 pub struct AlpacaDataClient {
     client_id: ClientId,
@@ -548,6 +553,14 @@ impl DataClient for AlpacaDataClient {
     }
 
     fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
+        validate_history_instruments(&request.instrument_ids)?;
+        ensure!(
+            !request
+                .instrument_ids
+                .iter()
+                .any(|id| is_option_symbol(id.symbol.as_str())),
+            "Alpaca does not expose historical option quotes",
+        );
         let spec = self.history(
             request.start,
             request.end,
@@ -555,7 +568,6 @@ impl DataClient for AlpacaDataClient {
             request.params.as_ref(),
             None,
         )?;
-        validate_stock_history(&request.instrument_ids)?;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
@@ -582,6 +594,8 @@ impl DataClient for AlpacaDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        validate_history_instruments(&request.instrument_ids)?;
+        validate_history_feed(&request.instrument_ids, request.params.as_ref())?;
         let spec = self.history(
             request.start,
             request.end,
@@ -589,19 +603,10 @@ impl DataClient for AlpacaDataClient {
             request.params.as_ref(),
             None,
         )?;
-        validate_stock_history(&request.instrument_ids)?;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
-            let trades = stock_history(
-                &http,
-                &request.instrument_ids,
-                HistoryKind::Trades,
-                &spec,
-                |row: &StockTrade, id| row.tick(id, None),
-                |trade| (trade.ts_event, trade.instrument_id),
-            )
-            .await?;
+            let trades = trade_history(&http, &request.instrument_ids, &spec).await?;
             Ok(DataResponse::Trades(TradesResponse::new(
                 request.request_id,
                 client_id,
@@ -618,7 +623,8 @@ impl DataClient for AlpacaDataClient {
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let bar_type = request.single_bar_type()?;
         let id = bar_type.instrument_id();
-        validate_stock_history(&[id])?;
+        validate_history_instruments(&[id])?;
+        validate_history_feed(&[id], request.params.as_ref())?;
         let spec = self.history(
             request.start,
             request.end,
@@ -629,15 +635,24 @@ impl DataClient for AlpacaDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let http = self.market.clone();
         self.spawn_request(request.request_id, async move {
-            let bars = stock_history(
-                &http,
-                &[id],
-                HistoryKind::Bars,
-                &spec,
-                |row: &StockBar, _| row.bar(bar_type, None),
-                |bar| bar.ts_event,
-            )
-            .await?;
+            let bars = if is_option_symbol(id.symbol.as_str()) {
+                let rows = option_history::<StockBar>(&http, id, HistoryKind::Bars, &spec).await?;
+                let bars = rows
+                    .iter()
+                    .map(|row| row.bar(bar_type, None))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                merge_history(vec![bars], spec.limit, |bar| bar.ts_event)
+            } else {
+                stock_history(
+                    &http,
+                    &[id],
+                    HistoryKind::Bars,
+                    &spec,
+                    |row: &StockBar, _| row.bar(bar_type, None),
+                    |bar| bar.ts_event,
+                )
+                .await?
+            };
             Ok(DataResponse::Bars(BarsResponse::new(
                 request.request_id,
                 client_id,
@@ -652,14 +667,23 @@ impl DataClient for AlpacaDataClient {
     }
 }
 
-fn validate_stock_history(ids: &[InstrumentId]) -> anyhow::Result<()> {
+fn validate_history_instruments(ids: &[InstrumentId]) -> anyhow::Result<()> {
     validate_instruments(ids)?;
     for id in ids {
         ensure!(
-            !is_option_symbol(id.symbol.as_str()) && !option_spread::is_spread(*id),
-            "Alpaca historical option data is not supported for {id}",
+            !option_spread::is_spread(*id),
+            "Request history for the individual Alpaca option spread legs: {id}",
         );
     }
+    Ok(())
+}
+
+fn validate_history_feed(ids: &[InstrumentId], params: Option<&Params>) -> anyhow::Result<()> {
+    ensure!(
+        params.is_none_or(|params| params.get("feed").is_none())
+            || !ids.iter().any(|id| is_option_symbol(id.symbol.as_str())),
+        "Alpaca historical option trades and bars do not support a feed override",
+    );
     Ok(())
 }
 
@@ -681,7 +705,6 @@ async fn stock_history<W: DeserializeOwned, T, K: Ord>(
     parse: impl Fn(&W, InstrumentId) -> anyhow::Result<T> + Copy,
     key: impl Fn(&T) -> K,
 ) -> anyhow::Result<Vec<T>> {
-    const MAX_HISTORY_REQUESTS: usize = 4;
     struct Source {
         id: InstrumentId,
         feed: &'static str,
@@ -702,4 +725,48 @@ async fn stock_history<W: DeserializeOwned, T, K: Ord>(
         .try_collect()
         .await?;
     Ok(merge_history(runs, spec.limit, key))
+}
+
+async fn trade_history(
+    http: &AlpacaHttpClient,
+    ids: &[InstrumentId],
+    spec: &HistoryRequest,
+) -> anyhow::Result<Vec<TradeTick>> {
+    enum Source {
+        Stock(InstrumentId, &'static str),
+        Option(InstrumentId),
+    }
+    let mut sources = Vec::new();
+    for &id in ids {
+        if is_option_symbol(id.symbol.as_str()) {
+            sources.push(Source::Option(id));
+        } else {
+            sources.extend(spec.feeds.iter().map(|&feed| Source::Stock(id, feed)));
+        }
+    }
+    let runs = stream::iter(sources)
+        .map(|source| async move {
+            match source {
+                Source::Stock(id, feed) => {
+                    historical::<StockTrade>(http, id, HistoryKind::Trades, spec, feed)
+                        .await?
+                        .iter()
+                        .map(|row| row.tick(id, None))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                }
+                Source::Option(id) => {
+                    option_history::<HistoricalOptionTrade>(http, id, HistoryKind::Trades, spec)
+                        .await?
+                        .iter()
+                        .map(|row| row.tick(id))
+                        .collect()
+                }
+            }
+        })
+        .buffered(MAX_HISTORY_REQUESTS)
+        .try_collect()
+        .await?;
+    Ok(merge_history(runs, spec.limit, |trade| {
+        (trade.ts_event, trade.instrument_id)
+    }))
 }
