@@ -187,6 +187,9 @@ pub struct AlpacaExecutionClientConfig {
     /// HTTP request timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
+    /// Lets Alpaca infer the intent of regular-hours single-leg equity option limit orders.
+    #[builder(default)]
+    pub infer_option_position_intent: bool,
     /// Optional read-only brokerage fee synchronization on connect.
     pub fee_sync: Option<AlpacaFeeSyncSettings>,
 }
@@ -196,6 +199,10 @@ impl fmt::Debug for AlpacaExecutionClientConfig {
         f.debug_struct(stringify!(AlpacaExecutionClientConfig))
             .field("environment", &self.environment)
             .field("account_type", &self.account_type)
+            .field(
+                "infer_option_position_intent",
+                &self.infer_option_position_intent,
+            )
             .field("http_timeout_secs", &self.http_timeout_secs)
             .field("base_url_http", &redact_option(self.base_url_http.as_ref()))
             .field(

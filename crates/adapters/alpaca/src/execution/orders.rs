@@ -50,6 +50,7 @@ pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow
 pub(super) fn option_order_request(
     order: &OrderAny,
     params: Option<&Params>,
+    infer_intent: bool,
 ) -> anyhow::Result<Value> {
     ensure!(
         order.contingency_type().is_none() && order.parent_order_id().is_none(),
@@ -92,28 +93,42 @@ pub(super) fn option_order_request(
         (OrderSide::Sell, _) => "sell_to_close",
     };
     let intent = match params.and_then(|params| params.get("position_intent")) {
-        Some(value) => value
-            .as_str()
-            .context("Alpaca position_intent must be a string")?,
-        None => default_intent,
+        Some(value) => Some(
+            value
+                .as_str()
+                .context("Alpaca position_intent must be a string")?,
+        ),
+        None if infer_intent
+            && !extended
+            && order.order_type() == OrderType::Limit
+            && !order.is_reduce_only() =>
+        {
+            None
+        }
+        None => Some(default_intent),
     };
     let side = match (order.order_side(), order.is_reduce_only(), intent) {
-        (OrderSide::Buy, false, "buy_to_open") | (OrderSide::Buy, true, "buy_to_close") => "buy",
-        (OrderSide::Sell, _, "sell_to_close") | (OrderSide::Sell, false, "sell_to_open") => "sell",
+        (OrderSide::Buy, false, None | Some("buy_to_open"))
+        | (OrderSide::Buy, true, Some("buy_to_close")) => "buy",
+        (OrderSide::Sell, _, Some("sell_to_close"))
+        | (OrderSide::Sell, false, None | Some("sell_to_open")) => "sell",
         _ => bail!(
-            "Alpaca position_intent {intent} conflicts with the option order side or reduce-only flag"
+            "Alpaca position_intent {} conflicts with the option order side or reduce-only flag",
+            intent.unwrap_or(default_intent)
         ),
     };
     let mut request = json!({
         "symbol": order.instrument_id().symbol.to_string(),
         "qty": order.quantity().as_decimal().normalize().to_string(),
         "side": side,
-        "position_intent": intent,
         "type": order_type,
         "time_in_force": "day",
         "client_order_id": order.client_order_id().to_string(),
         "extended_hours": extended,
     });
+    if let Some(intent) = intent {
+        request["position_intent"] = json!(intent);
+    }
     if order.order_type() == OrderType::Limit {
         request["limit_price"] = json!(limit_price(order)?);
     }
@@ -525,7 +540,7 @@ mod tests {
             .build();
         for result in [
             order_request(&equity, None),
-            option_order_request(&option, None),
+            option_order_request(&option, None, false),
             super::super::combos::request(&combo, None, false),
         ] {
             assert_eq!(
@@ -622,8 +637,12 @@ mod tests {
         if let Some(intent) = explicit_intent {
             params.push(("position_intent".to_owned(), json!(intent)));
         }
-        let request =
-            option_order_request(&order, Some(&Params::new(params.into_iter().collect()))).unwrap();
+        let request = option_order_request(
+            &order,
+            Some(&Params::new(params.into_iter().collect())),
+            false,
+        )
+        .unwrap();
         assert_eq!(request["symbol"], "SPY261120C00745000");
         assert_eq!(request["qty"], "1");
         assert_eq!(request["time_in_force"], "day");
@@ -634,6 +653,78 @@ mod tests {
             assert_eq!(request["limit_price"], "2.4");
         } else {
             assert!(request.get("limit_price").is_none());
+        }
+    }
+
+    #[rstest]
+    #[case(OrderType::Limit, OrderSide::Buy, false, false, None, None)]
+    #[case(OrderType::Limit, OrderSide::Sell, false, false, None, None)]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Buy,
+        true,
+        false,
+        None,
+        Some("buy_to_close")
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Sell,
+        true,
+        false,
+        None,
+        Some("sell_to_close")
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Sell,
+        false,
+        true,
+        None,
+        Some("sell_to_close")
+    )]
+    #[case(
+        OrderType::Market,
+        OrderSide::Buy,
+        false,
+        false,
+        None,
+        Some("buy_to_open")
+    )]
+    #[case(
+        OrderType::Limit,
+        OrderSide::Sell,
+        false,
+        false,
+        Some("sell_to_open"),
+        Some("sell_to_open")
+    )]
+    fn infers_intent_only_for_ordinary_regular_option_limits(
+        #[case] order_type: OrderType,
+        #[case] side: OrderSide,
+        #[case] reduce_only: bool,
+        #[case] extended: bool,
+        #[case] explicit: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let order = order_builder(order_type, "OPT-INFER")
+            .instrument_id(InstrumentId::from("AAL261204C00013000.ALPACA"))
+            .side(side)
+            .reduce_only(reduce_only)
+            .price(Price::from("0.25"))
+            .build();
+        let mut params = vec![("extended_hours".to_owned(), json!(extended))];
+        if let Some(explicit) = explicit {
+            params.push(("position_intent".to_owned(), json!(explicit)));
+        }
+        let params = Params::new(params.into_iter().collect());
+        let wire = option_order_request(&order, Some(&params), true).unwrap();
+        assert_eq!(
+            wire.get("position_intent").and_then(Value::as_str),
+            expected
+        );
+        if expected.is_none() {
+            assert!(!wire.as_object().unwrap().contains_key("position_intent"));
         }
     }
 
@@ -657,7 +748,7 @@ mod tests {
             .price(Price::from("2.40"))
             .build();
         let params = Params::new([("position_intent".to_owned(), intent)].into());
-        assert!(option_order_request(&order, Some(&params)).is_err());
+        assert!(option_order_request(&order, Some(&params), false).is_err());
     }
 
     #[rstest]
@@ -677,7 +768,7 @@ mod tests {
             .time_in_force(time_in_force)
             .build();
         let params = Params::new([("extended_hours".to_string(), json!(extended))].into());
-        assert!(option_order_request(&order, Some(&params)).is_err());
+        assert!(option_order_request(&order, Some(&params), false).is_err());
     }
 
     #[rstest]

@@ -174,6 +174,14 @@ execute during regular hours. Quantity counts whole contracts. A regular buy sen
 `params={"position_intent": "sell_to_open"}`. Alpaca applies the account's
 collateral and options permissions. To change an option order, cancel and resubmit.
 
+Set `infer_option_position_intent=true` on `AlpacaExecutionClientConfig`
+to let Alpaca determine the position effect for ordinary regular-hours
+single-leg US equity and ETF option Limit DAY orders. This is an account-level
+opt-in. A sell while flat may open a short if Alpaca approves the collateral.
+An explicit `position_intent` or `reduce_only` still takes precedence, so
+strategies that must close an existing position should set `reduce_only=true`.
+Alpaca evaluates the broker account's current positions.
+
 The adapter routes cancellation by Alpaca order ID and reconciles single-leg
 option orders and FILL activities using the complete OCC symbol. Position reports
 also include option positions.
