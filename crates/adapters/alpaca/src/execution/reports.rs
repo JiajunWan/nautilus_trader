@@ -330,21 +330,30 @@ pub(super) async fn positions(http: &AlpacaHttpClient) -> anyhow::Result<Vec<Pos
 }
 
 impl Position {
+    pub(super) fn signed_qty(&self) -> anyhow::Result<Decimal> {
+        match self.side.as_str() {
+            "long" => Ok(self.qty.abs()),
+            "short" => Ok(-self.qty.abs()),
+            other => anyhow::bail!("Unknown Alpaca position side {other}"),
+        }
+    }
+
     pub(super) fn to_report(
         &self,
         account_id: AccountId,
         ts_init: UnixNanos,
     ) -> anyhow::Result<PositionStatusReport> {
-        let side = match self.side.as_str() {
-            "long" => PositionSide::Long,
-            "short" => PositionSide::Short,
-            other => anyhow::bail!("Unknown Alpaca position side {other}"),
+        let qty = self.signed_qty()?;
+        let side = if self.side == "long" {
+            PositionSide::Long
+        } else {
+            PositionSide::Short
         };
         let report = PositionStatusReport::new(
             account_id,
             instrument_id(&self.symbol)?,
             side,
-            quantity(self.qty.abs())?,
+            quantity(qty.abs())?,
             ts_init,
             ts_init,
             None,
@@ -523,6 +532,8 @@ pub(super) struct ActivitiesQuery {
     direction: &'static str,
     page_size: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) activity_types: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<String>,
@@ -543,6 +554,7 @@ impl ActivitiesQuery {
         Self {
             direction: "asc",
             page_size: 100,
+            activity_types: None,
             after: start.map(|ts| ts.to_datetime_utc().to_string()),
             until: end.map(|ts| ts.to_datetime_utc().to_string()),
             order_id,
@@ -561,14 +573,24 @@ impl ActivitiesQuery {
     ) -> anyhow::Result<(Vec<T>, bool)> {
         let path = format!("/v2/account/activities/{activity_type}");
         let page: Vec<T> = http.get(&path, self).await?;
-        let next = next_page_id(&page, self.page_size, id);
+        let more = self.advance(&page, id, activity_type)?;
+        Ok((page, more))
+    }
+
+    pub(super) fn advance<T>(
+        &mut self,
+        page: &[T],
+        id: impl FnOnce(&T) -> &str,
+        activity_type: &str,
+    ) -> anyhow::Result<bool> {
+        let next = next_page_id(page, self.page_size, id);
         if let Some(cursor) = &next {
             self.seen
                 .check(cursor, &format!("{activity_type} activities"))?;
         }
         let more = next.is_some();
         self.page_token = next;
-        Ok((page, more))
+        Ok(more)
     }
 }
 

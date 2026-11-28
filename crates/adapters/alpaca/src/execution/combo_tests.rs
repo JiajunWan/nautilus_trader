@@ -157,6 +157,7 @@ async fn rest_fixture(
             ("GET", "/v2/account") => json!({
                 "account_number": "ALPACA-TEST", "currency": "USD", "cash": "100000",
             }),
+            ("GET", "/v2/account/activities") => json!([]),
             ("POST", "/v2/orders") => {
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 let id = body["client_order_id"].as_str().unwrap();

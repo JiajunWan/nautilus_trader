@@ -61,60 +61,59 @@ async fn reconciles_posted_deliveries_with_fills_across_pages_late_posts_and_rer
             get(|Path(symbol): Path<String>| async move { Json(contract(&symbol)) }),
         )
         .route(
-            "/v2/account/activities/{kind}",
-            get(
-                |Path(kind): Path<String>, Query(q): Query<HashMap<String, String>>| async move {
-                    assert!(!q.contains_key("after"));
-                    assert_eq!(q["direction"], "asc");
-                    let late = q["until"].starts_with("2026-09-21");
-                    let rows = match kind.as_str() {
-                        "FILL" => vec![
-                            fill("c", CALL, "buy", 1),
-                            fill("p", PUT, "sell", 1),
-                            fill("idx", SPX, "buy", 3),
-                            fill("weekly", SPXW, "sell", 2),
-                            fill("exp", "ABC260918P00050000", "buy", 1),
-                        ],
-                        "OPEXP" => vec![row(
-                            "expire",
-                            "zero",
-                            "OPEXP",
-                            "ABC260918P00050000",
-                            Some(-1),
-                            0,
-                        )],
-                        "OPEXC" => vec![
-                            row("exercise", "call", "OPEXC", CALL, Some(-1), 0),
-                            row("index", "index", "OPEXC", SPX, Some(-3), 0),
-                        ],
-                        "OPASN" => vec![
-                            row("assign", "put", "OPASN", PUT, Some(1), 0),
-                            row("weekly-assign", "weekly", "OPASN", SPXW, Some(2), 0),
-                        ],
-                        "OPTRD" => ["call", "put"]
-                            .map(|g| {
-                                let mut r =
-                                    row(&format!("{g}-stock"), g, "OPTRD", "XYZ", Some(100), -5000);
-                                r["price"] = json!("50");
-                                r
-                            })
-                            .to_vec(),
-                        "OPCSH" if late => {
-                            let mut r = row("index-cash", "index", "OPCSH", SPX, None, 600);
-                            r["description"] =
-                                json!("exercise ((SPX_px=52)-(strike=50))*(mult=100)*(qty=3)");
-                            if q.contains_key("page_token") {
-                                vec![r, row("weekly-cash", "weekly", "OPCSH", SPXW, None, -200)]
-                            } else {
-                                vec![r; 100]
-                            }
-                        }
-                        "OPCSH" => vec![],
-                        _ => panic!("unexpected request"),
-                    };
-                    Json(rows)
-                },
-            ),
+            "/v2/account/activities/FILL",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                assert!(!q.contains_key("after"));
+                assert!(q.contains_key("until"));
+                Json(vec![
+                    fill("c", CALL, "buy", 1),
+                    fill("p", PUT, "sell", 1),
+                    fill("idx", SPX, "buy", 3),
+                    fill("weekly", SPXW, "sell", 2),
+                    fill("exp", "ABC260918P00050000", "buy", 1),
+                ])
+            }),
+        )
+        .route(
+            "/v2/account/activities",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                assert!(!q.contains_key("after"));
+                assert_eq!(q["direction"], "asc");
+                assert_eq!(q["activity_types"], "OPEXP,OPEXC,OPASN,OPCSH,OPTRD");
+                let mut rows = vec![
+                    row("expire", "zero", "OPEXP", "ABC260918P00050000", Some(-1), 0),
+                    row("exercise", "call", "OPEXC", CALL, Some(-1), 0),
+                    row("index", "index", "OPEXC", SPX, Some(-3), 0),
+                    row("assign", "put", "OPASN", PUT, Some(1), 0),
+                    row("weekly-assign", "weekly", "OPASN", SPXW, Some(2), 0),
+                ];
+                for group in ["call", "put"] {
+                    let mut shares = row(
+                        &format!("{group}-stock"),
+                        group,
+                        "OPTRD",
+                        "XYZ",
+                        Some(100),
+                        -5000,
+                    );
+                    shares["price"] = json!("50");
+                    rows.push(shares);
+                }
+                if q["until"].starts_with("2026-09-21") {
+                    let mut cash = row("index-cash", "index", "OPCSH", SPX, None, 600);
+                    cash["description"] =
+                        json!("exercise ((SPX_px=52)-(strike=50))*(mult=100)*(qty=3)");
+                    if let Some(token) = q.get("page_token") {
+                        assert_eq!(token, "index-cash");
+                        return Json(vec![
+                            cash,
+                            row("weekly-cash", "weekly", "OPCSH", SPXW, None, -200),
+                        ]);
+                    }
+                    rows.resize(100, cash);
+                }
+                Json(rows)
+            }),
         );
     let config = broker(app).await;
     let read = async |until: &str| {
@@ -219,16 +218,12 @@ fn ambiguous_group_and_bad_index_amount_are_never_verified() {
 #[tokio::test]
 async fn conflicting_identity_aborts_report() {
     let config = broker(Router::new().route(
-        "/v2/account/activities/{kind}",
-        get(|Path(kind): Path<String>| async move {
-            Json(if kind == "OPEXP" {
-                vec![
-                    row("same", "g", "OPEXP", SPX, Some(-1), 0),
-                    row("same", "g", "OPEXP", SPX, Some(-2), 0),
-                ]
-            } else {
-                vec![]
-            })
+        "/v2/account/activities",
+        get(|| async {
+            Json(vec![
+                row("same", "g", "OPEXP", SPX, Some(-1), 0),
+                row("same", "g", "OPEXP", SPX, Some(-2), 0),
+            ])
         }),
     ))
     .await;
@@ -309,16 +304,20 @@ fn reconciles_the_underlying_sale_for_short_calls_and_long_puts(
 
 #[tokio::test]
 async fn unavailable_expired_contract_keeps_both_activities_visible() {
-    let app = Router::new().route(
-        "/v2/account/activities/{kind}",
-        get(|Path(kind): Path<String>| async move {
-            Json(match kind.as_str() {
-                "OPEXC" => vec![row("r", "g", "OPEXC", CALL, Some(-1), 0)],
-                "OPTRD" => vec![row("shares", "g", "OPTRD", "XYZ", Some(100), -5000)],
-                _ => vec![],
-            })
-        }),
-    );
+    let app = Router::new()
+        .route(
+            "/v2/account/activities/FILL",
+            get(|| async { Json(json!([])) }),
+        )
+        .route(
+            "/v2/account/activities",
+            get(|| async {
+                Json(vec![
+                    row("r", "g", "OPEXC", CALL, Some(-1), 0),
+                    row("shares", "g", "OPTRD", "XYZ", Some(100), -5000),
+                ])
+            }),
+        );
     let config = broker(app).await;
     let report = request_option_lifecycle_report(&config, 0.into())
         .await

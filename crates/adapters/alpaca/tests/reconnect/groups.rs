@@ -141,6 +141,8 @@ fn bracket_api(parent: NestedParent, calls: mpsc::Sender<(Method, Uri)>) -> Rout
                 .unwrap();
             next.run(request)
         }))
+        // The settlement worker runs independently of the bracket order requests above.
+        .route("/v2/account/activities", get(|| async { Json(json!([])) }))
 }
 
 #[rstest]

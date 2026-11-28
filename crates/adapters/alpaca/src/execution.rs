@@ -82,13 +82,14 @@ use nautilus_network::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::{Instant, sleep_until, timeout},
 };
 
 use self::{
     account_refresh::AccountSnapshots,
     fees::{AlpacaFeeSync, AlpacaFeeSyncSettings, AlpacaFeeSyncUpdate},
+    option_lifecycle::{AlpacaOptionSettlementUpdate, SettlementSync},
     orders::{
         OrderGroup, extended_hours, option_order_request, order_list_request, order_request,
         replacement_instructions,
@@ -143,6 +144,7 @@ impl AlpacaExecutionClient {
         core: ExecutionClientCore,
         config: &AlpacaExecutionClientConfig,
     ) -> anyhow::Result<Self> {
+        ensure_custom_data_json_registered::<AlpacaOptionSettlementUpdate>()?;
         if let Some(settings) = &config.fee_sync {
             settings.validate()?;
             ensure_custom_data_json_registered::<AlpacaFeeSyncUpdate>()?;
@@ -498,7 +500,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Err(error);
         }
 
-        let task = StreamTask {
+        let task = Arc::new(StreamTask {
             socket: Arc::clone(&socket),
             credentials: self.credentials.clone(),
             http: self.http.clone(),
@@ -507,11 +509,25 @@ impl ExecutionClient for AlpacaExecutionClient {
             state: Arc::clone(&self.orders),
             accounts: Arc::clone(&self.accounts),
             ready_epoch: Arc::clone(&self.ready_epoch),
-        };
+        });
+        let (settlement_tx, settlement_rx) = watch::channel(epoch);
         self.ready_epoch.store(epoch, Ordering::Release);
-        if let Err(error) = self.spawn("trade_updates", task.run(rx, last_seen)) {
+        if let Err(error) = self.spawn(
+            "trade_updates",
+            Arc::clone(&task).run(rx, last_seen, settlement_tx),
+        ) {
             socket.disconnect().await;
             return Err(error);
+        }
+        let sender = get_exec_event_sender();
+        let worker =
+            SettlementSync::default().run(task, self.environment, settlement_rx, move |update| {
+                sender
+                    .send(ExecutionEvent::Data(CustomData::from_arc(update)))
+                    .context("Publishing Alpaca option settlement update")
+            });
+        if let Err(error) = self.spawn("option_settlement", worker) {
+            log::warn!("Could not start Alpaca option settlement synchronization: {error}");
         }
         log::info!("Connected Alpaca execution client {}", self.core.client_id);
         self.socket = Some(socket);
@@ -1179,10 +1195,15 @@ struct StreamTask {
 }
 
 impl StreamTask {
-    async fn run(self, mut rx: StreamReceiver, last_seen: UnixNanos) -> anyhow::Result<()> {
+    async fn run(
+        self: Arc<Self>,
+        mut rx: StreamReceiver,
+        last_seen: UnixNanos,
+        settlement: watch::Sender<u64>,
+    ) -> anyhow::Result<()> {
         let (dirty_tx, dirty_rx) = mpsc::channel(1);
         let result = tokio::select! {
-            result = self.run_session(&mut rx, last_seen, &dirty_tx) => result,
+            result = self.run_session(&mut rx, last_seen, &dirty_tx, &settlement) => result,
             result = self.refresh_on_orders(dirty_rx) => result,
         };
         self.ready_epoch.store(u64::MAX, Ordering::Release);
@@ -1195,6 +1216,7 @@ impl StreamTask {
         rx: &mut StreamReceiver,
         mut last_seen: UnixNanos,
         dirty: &mpsc::Sender<()>,
+        settlement: &watch::Sender<u64>,
     ) -> anyhow::Result<()> {
         let mut retry: Option<RecoveryAttempt> = None;
         let mut backoff = recovery_backoff()?;
@@ -1204,6 +1226,9 @@ impl StreamTask {
                     biased;
                     () = sleep_until(attempt.deadline) => {
                         retry = self.recover(attempt, &mut backoff, last_seen).await?;
+                        if self.ready_epoch.load(Ordering::Acquire) == attempt.epoch {
+                            settlement.send_replace(attempt.epoch);
+                        }
                         continue;
                     }
                     frame = rx.recv() => frame,

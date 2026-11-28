@@ -371,7 +371,35 @@ An explicit VWAP or TWAP replacement must match the recorded original
 algorithm. For restored orders, that record can be recovered from the
 instruction object in the broker response when available.
 
-## Historical option settlement
+## Option settlement reconciliation
+
+After connecting and after each successful private-stream recovery, the execution
+client reads option settlement on a separate task. One Trading API query filters all
+five activity types and follows the broker's page cursor. An empty window costs one
+request. A cold start reads the previous seven days by posting time. Later reads
+start seven days before the last completed read so delayed legs can match earlier
+exercises or assignments. Use the historical report below for older data
+or to audit while the connection is steady.
+
+Subscribe to `data.AlpacaOptionSettlementUpdate` before connecting to receive the
+activity evidence and settlement outcomes alongside the broker's current net
+quantities for affected symbols and its reported USD cash. Read current quantities
+from `positions`. The historical report computes `closing_position` from fills.
+Zero quantity means the symbol was absent from a successful open-position
+snapshot. The activity, position, and account endpoints are separate reads.
+The current cash snapshot is the account total, while
+`cash_by_currency` is the activity subtotal for the read window. Settlement evidence
+is read-only and does not generate trades or balance adjustments.
+
+An identical reread on the same running connection emits no new update. A late
+delivery can revise an earlier unresolved outcome. A fresh client can replay the
+same evidence. Consumers should upsert by environment, broker account ID, and
+activity ID or replace overlapping snapshots without adding their totals. If a
+required read fails, the client leaves the completed cutoff unchanged. Transient
+failures retry the affected page, contract or account/position request within the
+current connection.
+
+### Historical audit
 
 Run the read-only report for one Paper or Live account with a fixed RFC 3339
 posting cutoff, for example:

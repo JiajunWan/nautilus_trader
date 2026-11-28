@@ -22,8 +22,13 @@ use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use nautilus_core::UnixNanos;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep_until;
 
-use super::reports::{self, ActivitiesQuery, unique_activities};
+use super::{
+    RecoveryAttempt, StreamTask, recovery_backoff,
+    reports::{ActivitiesQuery, unique_activities},
+    retryable_recovery_error,
+};
 use crate::{
     config::AlpacaExecutionClientConfig,
     http::AlpacaHttpClient,
@@ -31,6 +36,10 @@ use crate::{
         PhysicalDelivery, is_known_index_series, is_option_symbol, physical_delivery,
     },
 };
+
+mod sync;
+pub use sync::AlpacaOptionSettlementUpdate;
+pub(super) use sync::SettlementSync;
 
 /// Alpaca's non-trade activity types relevant to standard options settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +109,7 @@ impl OptionActivity {
 }
 
 /// Evidence for the settlement, independent of the reconstructed closing position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Settlement {
     /// Broker expiry with a contract removal and zero posted cash.
@@ -114,7 +123,7 @@ pub enum Settlement {
 }
 
 /// Outcome for one executed option removal.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OptionOutcome {
     /// Kind of verified delivery, or unresolved.
     pub settlement: Settlement,
@@ -172,34 +181,16 @@ pub async fn request_option_lifecycle_report(
     through: UnixNanos,
 ) -> anyhow::Result<OptionLifecycleReport> {
     let http = AlpacaHttpClient::for_execution(config)?;
-    let mut rows = Vec::new();
-    for (path, kind) in [
-        ("OPEXP", ActivityKind::Expiration),
-        ("OPEXC", ActivityKind::Exercise),
-        ("OPASN", ActivityKind::Assignment),
-        ("OPCSH", ActivityKind::Cash),
-        ("OPTRD", ActivityKind::Shares),
-    ] {
-        let query = ActivitiesQuery::new(None, Some(through), None);
-        let page = reports::activities(&http, path, query, |r: &OptionActivity| &r.id).await?;
-        ensure!(
-            page.iter().all(|r| r.activity_type == kind),
-            "Unexpected activity type in Alpaca {path} response"
-        );
-        rows.extend(page);
-    }
-    let activities = unique_activities(rows, |r| &r.id, "option lifecycle")?;
-    let mut symbols = BTreeSet::new();
-    for row in activities
+    let reader = SettlementReader {
+        http: &http,
+        session: None,
+    };
+    let activities = reader.activities(None, through).await?;
+    let symbols: BTreeSet<_> = activities
         .values()
         .filter(|r| r.posted() && r.activity_type.removal())
-    {
-        ensure!(
-            is_option_symbol(&row.symbol),
-            "Invalid option removal symbol"
-        );
-        symbols.insert(row.symbol.as_str());
-    }
+        .map(|r| r.symbol.as_str())
+        .collect();
     let mut relevant = Vec::new();
     if !symbols.is_empty() {
         let mut query = ActivitiesQuery::new(None, Some(through), None);
@@ -217,30 +208,99 @@ pub async fn request_option_lifecycle_report(
         }
     }
     let fills = unique_activities(relevant, |f| &f.id, "option fill")?;
-    let groups_with_shares: BTreeSet<_> = activities
-        .values()
-        .filter(|r| r.posted() && r.activity_type == ActivityKind::Shares)
-        .filter_map(OptionActivity::group)
-        .collect();
-    let physical_symbols: BTreeSet<_> = activities
-        .values()
-        .filter(|r| {
-            r.posted()
-                && matches!(
-                    r.activity_type,
-                    ActivityKind::Assignment | ActivityKind::Exercise
-                )
-                && r.group().is_some_and(|g| groups_with_shares.contains(g))
-        })
-        .map(|r| r.symbol.as_str())
-        .collect();
-    let mut terms = BTreeMap::new();
-    for symbol in physical_symbols {
-        if let Some(delivery) = physical_delivery(&http, symbol).await? {
-            terms.insert(symbol.to_owned(), delivery);
+    let terms = reader.physical_terms(&activities).await?;
+    summarize(through, activities, fills, &terms)
+}
+
+struct SettlementReader<'a> {
+    http: &'a AlpacaHttpClient,
+    // One-shot historical reports propagate errors. Live reads retry on the current connection.
+    session: Option<(&'a StreamTask, u64)>,
+}
+
+impl SettlementReader<'_> {
+    async fn read<T, F: Future<Output = anyhow::Result<T>>>(
+        &self,
+        mut request: impl FnMut() -> F,
+    ) -> anyhow::Result<T> {
+        let Some((stream, epoch)) = self.session else {
+            return request().await;
+        };
+        let mut attempt = RecoveryAttempt::new(epoch);
+        let mut backoff = recovery_backoff()?;
+        loop {
+            ensure!(
+                stream.is_current(epoch),
+                "Alpaca settlement stream epoch changed"
+            );
+            match request().await {
+                Err(error) if retryable_recovery_error(&error) => {
+                    let delay =
+                        attempt.schedule_retry(&error, backoff.next_duration(), Timestamp::now());
+                    log::warn!("Alpaca option settlement read will retry in {delay:?}: {error:#}");
+                    sleep_until(attempt.deadline).await;
+                }
+                result => return result,
+            }
         }
     }
-    summarize(through, activities, fills, &terms)
+
+    async fn activities(
+        &self,
+        start: Option<UnixNanos>,
+        through: UnixNanos,
+    ) -> anyhow::Result<BTreeMap<String, OptionActivity>> {
+        let mut query = ActivitiesQuery::new(start, Some(through), None);
+        query.activity_types = Some("OPEXP,OPEXC,OPASN,OPCSH,OPTRD");
+        let mut rows = Vec::new();
+        loop {
+            let page: Vec<OptionActivity> = self
+                .read(|| self.http.get("/v2/account/activities", &query))
+                .await?;
+            let more = query.advance(&page, |row| &row.id, "option settlement")?;
+            rows.extend(page);
+            if !more {
+                break;
+            }
+        }
+        ensure!(
+            rows.iter()
+                .filter(|r| r.posted() && r.activity_type.removal())
+                .all(|r| is_option_symbol(&r.symbol)),
+            "Invalid option removal symbol"
+        );
+        unique_activities(rows, |r| &r.id, "option lifecycle")
+    }
+
+    async fn physical_terms(
+        &self,
+        activities: &BTreeMap<String, OptionActivity>,
+    ) -> anyhow::Result<BTreeMap<String, PhysicalDelivery>> {
+        let groups_with_shares: BTreeSet<_> = activities
+            .values()
+            .filter(|r| r.posted() && r.activity_type == ActivityKind::Shares)
+            .filter_map(OptionActivity::group)
+            .collect();
+        let physical_symbols: BTreeSet<_> = activities
+            .values()
+            .filter(|r| {
+                r.posted()
+                    && matches!(
+                        r.activity_type,
+                        ActivityKind::Assignment | ActivityKind::Exercise
+                    )
+                    && r.group().is_some_and(|g| groups_with_shares.contains(g))
+            })
+            .map(|r| r.symbol.as_str())
+            .collect();
+        let mut terms = BTreeMap::new();
+        for symbol in physical_symbols {
+            if let Some(delivery) = self.read(|| physical_delivery(self.http, symbol)).await? {
+                terms.insert(symbol.to_owned(), delivery);
+            }
+        }
+        Ok(terms)
+    }
 }
 
 fn add(value: &mut Decimal, delta: Decimal) -> anyhow::Result<()> {
