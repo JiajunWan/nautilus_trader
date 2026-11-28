@@ -19,8 +19,8 @@ use anyhow::{Context, bail, ensure};
 use nautilus_core::Params;
 use nautilus_model::{
     enums::{
-        ContingencyType, OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType,
-        TriggerType,
+        AssetClass, ContingencyType, OrderSide, OrderStatus, OrderType, TimeInForce,
+        TrailingOffsetType, TriggerType,
     },
     events::OrderDeniedReason,
     identifiers::OrderListId,
@@ -50,6 +50,7 @@ pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow
 pub(super) fn option_order_request(
     order: &OrderAny,
     params: Option<&Params>,
+    underlying_class: AssetClass,
 ) -> anyhow::Result<Value> {
     ensure!(
         order.contingency_type().is_none() && order.parent_order_id().is_none(),
@@ -69,22 +70,37 @@ pub(super) fn option_order_request(
         AdvancedInstructions::from_params(params)?.is_none(),
         "Alpaca advanced instructions require an equity order",
     );
-    ensure!(
-        order.time_in_force() == TimeInForce::Day,
-        "Alpaca single-leg option execution requires DAY time in force",
-    );
     let extended = extended_hours(params)?;
-    let order_type = match order.order_type() {
-        OrderType::Limit => "limit",
-        OrderType::Market => {
-            ensure!(
-                !extended,
-                "Alpaca options require limit orders in extended hours"
-            );
-            "market"
-        }
-        order_type => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
-    };
+    match underlying_class {
+        AssetClass::Equity => {}
+        AssetClass::Index => ensure!(!extended, "Alpaca index options require regular hours"),
+        _ => bail!(
+            "Unsupported Alpaca option asset class for {}",
+            order.instrument_id()
+        ),
+    }
+    let order_type = order.order_type();
+    ensure!(
+        matches!(
+            order_type,
+            OrderType::Market | OrderType::Limit | OrderType::StopMarket | OrderType::StopLimit
+        ),
+        OrderDeniedReason::UnsupportedOrderType { order_type },
+    );
+    let time_in_force = order.time_in_force();
+    ensure!(
+        matches!(time_in_force, TimeInForce::Day | TimeInForce::Gtc),
+        "Alpaca options require DAY or GTC time in force",
+    );
+    ensure!(
+        !extended || (order_type == OrderType::Limit && time_in_force == TimeInForce::Day),
+        "Alpaca options extended hours requires a DAY limit order",
+    );
+    ensure!(
+        matches!(order.trigger_type(), None | Some(TriggerType::Default)),
+        "Alpaca option stops use the venue's default trigger",
+    );
+
     let default_intent = match (order.order_side(), order.is_reduce_only()) {
         (OrderSide::Buy, false) => "buy_to_open",
         (OrderSide::Buy, true) => "buy_to_close",
@@ -97,35 +113,22 @@ pub(super) fn option_order_request(
                 .as_str()
                 .context("Alpaca position_intent must be a string")?,
         ),
-        None if !extended && order.order_type() == OrderType::Limit && !order.is_reduce_only() => {
-            None
-        }
+        None if !extended && order_type == OrderType::Limit && !order.is_reduce_only() => None,
         None => Some(default_intent),
     };
-    let side = match (order.order_side(), order.is_reduce_only(), intent) {
+    match (order.order_side(), order.is_reduce_only(), intent) {
         (OrderSide::Buy, false, None | Some("buy_to_open"))
-        | (OrderSide::Buy, true, Some("buy_to_close")) => "buy",
-        (OrderSide::Sell, _, Some("sell_to_close"))
-        | (OrderSide::Sell, false, None | Some("sell_to_open")) => "sell",
+        | (OrderSide::Buy, true, Some("buy_to_close"))
+        | (OrderSide::Sell, _, Some("sell_to_close"))
+        | (OrderSide::Sell, false, None | Some("sell_to_open")) => {}
         _ => bail!(
             "Alpaca position_intent {} conflicts with the option order side or reduce-only flag",
             intent.unwrap_or(default_intent)
         ),
-    };
-    let mut request = json!({
-        "symbol": order.instrument_id().symbol.to_string(),
-        "qty": order.quantity().as_decimal().normalize().to_string(),
-        "side": side,
-        "type": order_type,
-        "time_in_force": "day",
-        "client_order_id": order.client_order_id().to_string(),
-        "extended_hours": extended,
-    });
+    }
+    let mut request = single_order_request(order, extended)?;
     if let Some(intent) = intent {
         request["position_intent"] = json!(intent);
-    }
-    if order.order_type() == OrderType::Limit {
-        request["limit_price"] = json!(limit_price(order)?);
     }
     Ok(request)
 }
@@ -343,7 +346,20 @@ fn equity_request(order: &OrderAny, extended: bool) -> anyhow::Result<Value> {
             "Alpaca extended hours requires a limit order with DAY or GTC time in force",
         );
     }
+    if matches!(
+        order_type,
+        OrderType::StopMarket | OrderType::StopLimit | OrderType::TrailingStopMarket
+    ) {
+        ensure!(
+            matches!(time_in_force, TimeInForce::Day | TimeInForce::Gtc),
+            "Alpaca supports only DAY and GTC for {order_type} orders, was {time_in_force}",
+        );
+    }
+    single_order_request(order, extended)
+}
 
+fn single_order_request(order: &OrderAny, extended: bool) -> anyhow::Result<Value> {
+    let order_type = order.order_type();
     let wire_order_type = match order_type {
         OrderType::Market => "market",
         OrderType::Limit => "limit",
@@ -352,17 +368,14 @@ fn equity_request(order: &OrderAny, extended: bool) -> anyhow::Result<Value> {
         OrderType::TrailingStopMarket => "trailing_stop",
         _ => bail!(OrderDeniedReason::UnsupportedOrderType { order_type }),
     };
-    let wire_time_in_force = match time_in_force {
+    let wire_time_in_force = match order.time_in_force() {
         TimeInForce::Day => "day",
         TimeInForce::Gtc => "gtc",
-        other if !matches!(order_type, OrderType::Market | OrderType::Limit) => {
-            bail!("Alpaca supports only DAY and GTC for {order_type} orders, was {other}")
-        }
         TimeInForce::Ioc => "ioc",
         TimeInForce::Fok => "fok",
         TimeInForce::AtTheOpen => "opg",
         TimeInForce::AtTheClose => "cls",
-        other => bail!("Alpaca does not support equity time in force {other}"),
+        other => bail!("Alpaca does not support time in force {other}"),
     };
     let side = match order.order_side() {
         OrderSide::Buy => "buy",
@@ -437,7 +450,7 @@ pub(super) fn parse_order_type(value: &str) -> anyhow::Result<OrderType> {
         "stop" => OrderType::StopMarket,
         "stop_limit" => OrderType::StopLimit,
         "trailing_stop" => OrderType::TrailingStopMarket,
-        _ => bail!("Unknown Alpaca equity order type {value}"),
+        _ => bail!("Unknown Alpaca order type {value}"),
     })
 }
 
@@ -449,7 +462,7 @@ pub(super) fn parse_time_in_force(value: &str) -> anyhow::Result<TimeInForce> {
         "fok" => TimeInForce::Fok,
         "opg" => TimeInForce::AtTheOpen,
         "cls" => TimeInForce::AtTheClose,
-        _ => bail!("Unknown Alpaca equity time in force {value}"),
+        _ => bail!("Unknown Alpaca time in force {value}"),
     })
 }
 
@@ -535,7 +548,7 @@ mod tests {
             .build();
         for result in [
             order_request(&equity, None),
-            option_order_request(&option, None),
+            option_order_request(&option, None, AssetClass::Equity),
             super::super::combos::request(&combo, None, false),
         ] {
             assert_eq!(
@@ -632,8 +645,8 @@ mod tests {
         if let Some(intent) = explicit_intent {
             params.push(("position_intent".to_owned(), json!(intent)));
         }
-        let request =
-            option_order_request(&order, Some(&Params::new(params.into_iter().collect()))).unwrap();
+        let params = Params::new(params.into_iter().collect());
+        let request = option_order_request(&order, Some(&params), AssetClass::Equity).unwrap();
         assert_eq!(request["symbol"], "SPY261120C00745000");
         assert_eq!(request["qty"], "1");
         assert_eq!(request["time_in_force"], "day");
@@ -709,7 +722,7 @@ mod tests {
             params.push(("position_intent".to_owned(), json!(explicit)));
         }
         let params = Params::new(params.into_iter().collect());
-        let wire = option_order_request(&order, Some(&params)).unwrap();
+        let wire = option_order_request(&order, Some(&params), AssetClass::Equity).unwrap();
         assert_eq!(
             wire.get("position_intent").and_then(Value::as_str),
             expected
@@ -739,13 +752,15 @@ mod tests {
             .price(Price::from("2.40"))
             .build();
         let params = Params::new([("position_intent".to_owned(), intent)].into());
-        assert!(option_order_request(&order, Some(&params)).is_err());
+        assert!(option_order_request(&order, Some(&params), AssetClass::Equity).is_err());
     }
 
     #[rstest]
     #[case(OrderType::Limit, TimeInForce::Gtc, Quantity::from(1), true)]
-    #[case(OrderType::Limit, TimeInForce::Day, Quantity::from("0.5"), true)]
+    #[case(OrderType::Limit, TimeInForce::Day, Quantity::from("0.5"), false)]
     #[case(OrderType::Market, TimeInForce::Day, Quantity::from(1), true)]
+    #[case(OrderType::StopMarket, TimeInForce::Day, Quantity::from(1), true)]
+    #[case(OrderType::StopLimit, TimeInForce::Ioc, Quantity::from(1), false)]
     fn rejects_invalid_option_combinations(
         #[case] order_type: OrderType,
         #[case] time_in_force: TimeInForce,
@@ -755,11 +770,59 @@ mod tests {
         let order = order_builder(order_type, "OPT-1")
             .instrument_id(InstrumentId::from("SPY261120C00745000.ALPACA"))
             .price(Price::from("2.40"))
+            .trigger_price(Price::from("2.30"))
             .quantity(quantity)
             .time_in_force(time_in_force)
             .build();
         let params = Params::new([("extended_hours".to_string(), json!(extended))].into());
-        assert!(option_order_request(&order, Some(&params)).is_err());
+        assert!(option_order_request(&order, Some(&params), AssetClass::Equity).is_err());
+    }
+
+    #[rstest]
+    #[case(OrderType::Market, "market", None, None)]
+    #[case(OrderType::Limit, "limit", Some("2.4"), None)]
+    #[case(OrderType::StopMarket, "stop", None, Some("2.3"))]
+    #[case(OrderType::StopLimit, "stop_limit", Some("2.4"), Some("2.3"))]
+    fn maps_regular_option_orders(
+        #[values(AssetClass::Equity, AssetClass::Index)] asset_class: AssetClass,
+        #[values(TimeInForce::Day, TimeInForce::Gtc)] tif: TimeInForce,
+        #[case] order_type: OrderType,
+        #[case] wire_type: &str,
+        #[case] limit: Option<&str>,
+        #[case] trigger: Option<&str>,
+    ) {
+        let order = order_builder(order_type, "OPT-ORDERS")
+            .side(OrderSide::Buy)
+            .instrument_id(InstrumentId::from(match asset_class {
+                AssetClass::Equity => "SPY261204C00745000.ALPACA",
+                _ => "SPXW261204C06800000.ALPACA",
+            }))
+            .price(Price::from("2.40"))
+            .trigger_price(Price::from("2.30"))
+            .time_in_force(tif)
+            .build();
+        let request = option_order_request(&order, None, asset_class).unwrap();
+        assert_eq!(request["type"], wire_type);
+        assert_eq!(
+            parse_time_in_force(request["time_in_force"].as_str().unwrap()).unwrap(),
+            tif
+        );
+        assert_eq!(request.get("limit_price").and_then(Value::as_str), limit);
+        assert_eq!(request.get("stop_price").and_then(Value::as_str), trigger);
+        assert_eq!(
+            request.get("position_intent").and_then(Value::as_str),
+            (order_type != OrderType::Limit).then_some("buy_to_open"),
+        );
+    }
+
+    #[test]
+    fn rejects_an_explicit_option_stop_trigger_source() {
+        let order = order_builder(OrderType::StopMarket, "OPT-TRIGGER")
+            .instrument_id(InstrumentId::from("SPY261204C00745000.ALPACA"))
+            .trigger_price(Price::from("2.30"))
+            .trigger_type(TriggerType::LastPrice)
+            .build();
+        assert!(option_order_request(&order, None, AssetClass::Equity).is_err());
     }
 
     #[rstest]

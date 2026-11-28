@@ -30,7 +30,10 @@ use nautilus_common::{
 use nautilus_core::UUID4;
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, AvgPxReconciliation, OmsType, OrderStatus, PositionSide},
+    enums::{
+        AccountType, AvgPxReconciliation, OmsType, OrderStatus, OrderType, PositionSide,
+        TimeInForce, TriggerType,
+    },
     identifiers::{AccountId, ClientId, InstrumentId, TraderId, VenueOrderId},
     types::{Price, Quantity},
 };
@@ -53,10 +56,10 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
     let fixture = tokio::spawn(async move {
         let order = json!({
             "id": venue_id, "client_order_id": "PAPER-OPT-TEST", "symbol": symbol,
-            "asset_class": "us_option", "order_class": "simple", "type": "limit",
-            "side": "buy", "time_in_force": "day", "position_intent": "buy_to_open",
+            "asset_class": "us_option", "order_class": "simple", "type": "stop_limit",
+            "side": "buy", "time_in_force": "gtc", "position_intent": "buy_to_open",
             "status": "filled", "qty": "1", "filled_qty": "1", "filled_avg_price": "2.40",
-            "limit_price": "2.41", "created_at": timestamp
+            "limit_price": "2.41", "stop_price": "2.39", "created_at": timestamp
         });
         for _ in 0..5 {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -144,6 +147,11 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
     assert_eq!(orders.len(), 1);
     assert_eq!(orders[0].instrument_id, instrument);
     assert_eq!(orders[0].order_status, OrderStatus::Filled);
+    assert_eq!(orders[0].order_type, OrderType::StopLimit);
+    assert_eq!(orders[0].time_in_force, TimeInForce::Gtc);
+    assert_eq!(orders[0].price, Some(Price::from("2.41")));
+    assert_eq!(orders[0].trigger_price, Some(Price::from("2.39")));
+    assert_eq!(orders[0].trigger_type, Some(TriggerType::Default));
 
     let fills = client
         .generate_fill_reports(GenerateFillReports::new(

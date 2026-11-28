@@ -264,9 +264,14 @@ impl BrokerOrder {
             report = report.with_price(Price::from_decimal(native_price(limit).normalize())?);
         }
         if let Some(price) = self.stop_price {
+            let trigger = if self.asset_class == "us_option" {
+                TriggerType::Default
+            } else {
+                TriggerType::LastPrice
+            };
             report = report
                 .with_trigger_price(Price::from_decimal(price.normalize())?)
-                .with_trigger_type(TriggerType::LastPrice);
+                .with_trigger_type(trigger);
         }
         if let Some(price) = self.filled_avg_price {
             report = report.with_avg_px(native_price(price));

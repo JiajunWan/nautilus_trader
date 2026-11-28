@@ -326,15 +326,7 @@ impl AlpacaExecutionClient {
                     "Load the Alpaca option instrument before submitting its order: {id}"
                 );
             };
-            match instrument.asset_class() {
-                AssetClass::Equity => {}
-                AssetClass::Index => ensure!(
-                    !extended_hours(params)?,
-                    "Alpaca index options require regular hours",
-                ),
-                _ => anyhow::bail!("Unsupported Alpaca option asset class for {id}"),
-            }
-            return option_order_request(order, params);
+            return option_order_request(order, params, instrument.asset_class());
         }
         order_request(order, params)
     }
@@ -1567,6 +1559,18 @@ mod tests {
             cache,
         );
         let client = AlpacaExecutionClient::new(core, &config).unwrap();
+        let limit = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(id)
+            .side(OrderSide::Buy)
+            .price(Price::from("1.00"))
+            .quantity(Quantity::from(1))
+            .time_in_force(TimeInForce::Day)
+            .build();
+        let extended = Params::new([("extended_hours".to_owned(), true.into())].into());
+        assert_eq!(
+            client.submit_request(&limit, Some(&extended)).is_ok(),
+            asset_class == AssetClass::Equity,
+        );
         for (side, close_intent) in [
             (OrderSide::Buy, "buy_to_close"),
             (OrderSide::Sell, "sell_to_close"),

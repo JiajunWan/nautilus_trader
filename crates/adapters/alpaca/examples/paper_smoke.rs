@@ -29,6 +29,8 @@
 //! Prefix extended round-trip or extended limit modes with `--symbol SYMBOL` to select an equity.
 //! Prefix a Market or Limit DAY round trip or a passive limit cancellation with
 //! `--option OCC_SYMBOL` to test a single equity option contract in Paper.
+//! Use `--option OCC_SYMBOL --native-option-order limit|stop-market|stop-limit DAY|GTC`
+//! to submit one passive option order and cancel it after acceptance in regular hours.
 //! For a cash-secured put, use `--option OCC_SYMBOL --short-limit-round-trip` in regular
 //! hours or `--option OCC_SYMBOL --extended-short-round-trip` in the options morning session.
 //! Use `--extended-dma-limit NASDAQ|ARCA PRICE` to submit and cancel a routed DAY limit.
@@ -133,6 +135,10 @@ enum Mode {
     Carryover {
         price: Price,
         extended_hours: bool,
+        time_in_force: TimeInForce,
+    },
+    NativeOptionOrder {
+        kind: OrderType,
         time_in_force: TimeInForce,
     },
     AdvancedChecks,
@@ -255,6 +261,18 @@ impl Mode {
                     price: parse_limit_price(price)?,
                     extended_hours: true,
                     time_in_force,
+                }
+            }
+            [mode, kind, tif] if mode == "--native-option-order" => {
+                let kind = match kind.as_str() {
+                    "limit" => OrderType::Limit,
+                    "stop-market" => OrderType::StopMarket,
+                    "stop-limit" => OrderType::StopLimit,
+                    _ => bail!("Expected limit, stop-market, or stop-limit"),
+                };
+                Self::NativeOptionOrder {
+                    kind,
+                    time_in_force: carryover_tif(tif)?,
                 }
             }
             [mode] if mode == "--advanced-checks" => Self::AdvancedChecks,
@@ -525,6 +543,84 @@ impl PaperSmoke {
         self.submit(order, None)
     }
 
+    fn submit_native_option_order(
+        &mut self,
+        quote: &QuoteTick,
+        kind: OrderType,
+        tif: TimeInForce,
+    ) -> Result<()> {
+        let Some((bid, ask)) = fresh_prices(quote) else {
+            self.submitted = false;
+            return Ok(());
+        };
+        let id = self.instrument_id;
+        let side = OrderSide::Buy;
+        let qty = Quantity::from(1);
+        let order = if kind == OrderType::Limit {
+            let passive = (bid / Decimal::TWO)
+                .round_dp_with_strategy(1, RoundingStrategy::ToNegativeInfinity);
+            ensure!(
+                passive > Decimal::ZERO,
+                "Paper option bid is too low for a passive limit"
+            );
+            self.limit_order(side, Price::from_decimal_dp(passive, 2)?, tif, None)
+        } else {
+            // Use a price away from the current market and align to a ten-cent increment.
+            let stop = (ask + ask.max(Decimal::ONE))
+                .round_dp_with_strategy(1, RoundingStrategy::ToPositiveInfinity);
+            let trigger = Price::from_decimal_dp(stop, 2)?;
+            match kind {
+                OrderType::StopMarket => self.order().stop_market(
+                    id,
+                    side,
+                    qty,
+                    trigger,
+                    None,
+                    Some(tif),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                OrderType::StopLimit => self.order().stop_limit(
+                    id,
+                    side,
+                    qty,
+                    trigger,
+                    trigger,
+                    None,
+                    Some(tif),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                _ => unreachable!("Native Paper option kind was validated"),
+            }
+        };
+        log::info!(
+            "Paper option check {} {} limit={:?} stop={:?}",
+            order.order_type(),
+            order.time_in_force(),
+            order.price(),
+            order.trigger_price(),
+        );
+        self.submit(order, None)
+    }
+
     fn finish_execution(&mut self, result: Result<(), String>) {
         if result.is_ok() {
             log::info!("Paper workflow complete: {:?}", self.mode);
@@ -578,10 +674,16 @@ nautilus_strategy!(PaperSmoke, {
                 event.client_order_id
             );
         } else {
-            log::info!("Paper accepted {}", event.client_order_id);
+            log::info!(
+                "Paper accepted {} {}",
+                event.client_order_id,
+                event.venue_order_id
+            );
         }
-        if matches!(self.mode, Mode::Limit { .. } | Mode::AdvancedChecks)
-            && let Err(e) = self.cancel_order(event.client_order_id, None, None)
+        if matches!(
+            self.mode,
+            Mode::Limit { .. } | Mode::NativeOptionOrder { .. } | Mode::AdvancedChecks
+        ) && let Err(e) = self.cancel_order(event.client_order_id, None, None)
         {
             self.finish_execution(Err(e.to_string()));
         }
@@ -593,7 +695,7 @@ nautilus_strategy!(PaperSmoke, {
         }
         self.active_order = None;
         match self.mode {
-            Mode::Limit { .. } => {
+            Mode::Limit { .. } | Mode::NativeOptionOrder { .. } => {
                 log::info!("Paper canceled {}", event.client_order_id);
                 self.finish_execution(Ok(()));
             }
@@ -667,7 +769,10 @@ nautilus_strategy!(PaperSmoke, {
                 self.submitted = false;
             }
             Mode::MarketRoundTrip | Mode::LimitRoundTrip { .. } => self.finish_execution(Ok(())),
-            Mode::Limit { .. } | Mode::Carryover { .. } | Mode::AdvancedChecks => {
+            Mode::Limit { .. }
+            | Mode::Carryover { .. }
+            | Mode::NativeOptionOrder { .. }
+            | Mode::AdvancedChecks => {
                 self.finish_execution(Err("Paper smoke order filled before cancellation".into()));
             }
             Mode::Data | Mode::History(_) => {}
@@ -745,6 +850,10 @@ impl DataActor for PaperSmoke {
                     time_in_force,
                 } => self.submit_limit_round_trip(quote, extended_hours, time_in_force),
                 Mode::AdvancedChecks => self.submit_advanced_check(quote),
+                Mode::NativeOptionOrder {
+                    kind,
+                    time_in_force,
+                } => self.submit_native_option_order(quote, kind, time_in_force),
                 Mode::Limit { .. } if self.option && fresh_prices(quote).is_none() => {
                     self.submitted = false;
                     Ok(())
@@ -964,8 +1073,9 @@ async fn main() -> Result<()> {
                 matches!(
                     rest,
                     [mode] if matches!(mode.as_str(), "--market-round-trip" | "--limit-round-trip" | "--extended-round-trip" | "--short-limit-round-trip" | "--extended-short-round-trip")
-                ) || matches!(rest, [mode, _] if matches!(mode.as_str(), "--regular-limit" | "--extended-limit")),
-                "Select a single-leg option DAY round trip or submit-and-cancel limit mode",
+                ) || matches!(rest, [mode, _] if matches!(mode.as_str(), "--regular-limit" | "--extended-limit"))
+                    || matches!(rest, [mode, _, _] if mode == "--native-option-order"),
+                "Select an option round trip, a passive limit, or --native-option-order KIND DAY|GTC",
             );
             let symbol = Symbol::new_checked(symbol)?;
             let local = now.in_tz(NEW_YORK)?;
@@ -1004,6 +1114,10 @@ async fn main() -> Result<()> {
     };
     let symbol = option.unwrap_or(default_symbol);
     let mode = modes.pop_front();
+    ensure!(
+        !matches!(mode, Some(Mode::NativeOptionOrder { .. })) || option.is_some(),
+        "--native-option-order requires --option OCC_SYMBOL",
+    );
     let regular_gtc = mode.is_some_and(Mode::is_regular_gtc);
     let rest = (option.is_some() || regular_gtc)
         .then(|| account::paper_client(proxy_url.as_ref()))

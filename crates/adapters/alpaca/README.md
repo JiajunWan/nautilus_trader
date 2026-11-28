@@ -166,18 +166,19 @@ for the broker's order and session restrictions.
 
 ### Single-leg options
 
-Submit a single Market or Limit order with DAY time in force for a loaded
-equity, ETF, or supported index option instrument. Index option orders
-execute during regular hours. Quantity counts whole contracts. To change an option
-order, cancel and resubmit.
+Submit a single Market, Limit, StopMarket, or StopLimit order with DAY or GTC
+time in force for a loaded equity, ETF, or supported index option instrument.
+Index option orders execute during regular hours. Option stops use the broker's
+default trigger. Quantity counts whole contracts. To change an option order,
+cancel and resubmit.
 
-For ordinary regular-hours Limit DAY orders, the adapter omits
+For ordinary regular-hours Limit orders, the adapter omits
 `position_intent` so Alpaca can determine opening or closing from the account's
 positions. A sell while flat may open a short subject to the account's options
 permissions and collateral.
 
 Set `reduce_only=true` for a close-only order. The adapter sends
-`buy_to_close` or `sell_to_close` for the corresponding side. Market orders
+`buy_to_close` or `sell_to_close` for the corresponding side. Market, stop,
 and extended-hours orders default to `buy_to_open` for buys and `sell_to_close`
 for sells. An opening sell on these paths uses
 `params={"position_intent": "sell_to_open"}`.
@@ -198,7 +199,11 @@ cargo run -p nautilus-alpaca --features examples --example alpaca-paper-smoke --
 ```
 
 Use `--market-round-trip` for DAY Market orders and `--regular-limit PRICE`
-for a passive DAY Limit cancellation. The eligible morning session can use
+for a passive DAY Limit cancellation. To verify acceptance and cancellation of
+a passive regular-hours order, run
+`--option OCC_SYMBOL --native-option-order limit|stop-market|stop-limit DAY|GTC`.
+This check reports the broker order ID and verifies that the contract has no
+position or working order at the end. The eligible morning session can use
 `--extended-round-trip` or `--extended-limit PRICE`. Confirm both order
 receipts and the final position in Paper after each round trip. For a
 cash-secured put, use `--short-limit-round-trip` or
