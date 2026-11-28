@@ -173,13 +173,45 @@ lost on emulator restart. The tag conflicts with an explicit
 `extended_hours: false` parameter. The released limit order must meet the
 same Alpaca order type and time-in-force rules as a native limit order.
 
+### Native order modification
+
+Use the strategy's standard `modify_order` with the original client order ID.
+Each amendment sends one `PATCH /v2/orders/{order_id}` to the current venue
+order ID. The original session, time in force and option position intent are
+preserved. Alpaca assigns a new venue order ID to a successful replacement.
+
+| Working order | Editable fields |
+|---------------|-----------------|
+| Market, including MOO and MOC | Total quantity |
+| Limit, including LOO, LOC and eligible extended-hours orders | Total quantity, limit price |
+| StopMarket | Total quantity, stop price before trigger |
+| StopLimit | Total quantity, limit price, stop price before trigger |
+| Native TrailingStopMarket | Total quantity |
+| One-lot option spread | Parent net limit price |
+
+Quantity means the new total whole shares or contracts, including previous
+fills. It must exceed the quantity already filled. The same mapping applies
+to stock, ETF and single-leg options, including index options, for orders
+supported by the instrument. Working bracket and OCO members use their own
+broker order IDs. Alpaca determines whether the member, account, order state
+and auction window allow the requested change.
+
+For example, call `modify_order` with only `quantity` to resize a working
+regular-hours market order before the open. The standard risk checks need a
+market price. Alpaca can reject a replace while the order is still
+`accepted` or `pending_new`. A pending replacement can also lose the race
+to a fill of the original order. Follow the strategy's order events for the
+outcome. Trail distance and time in force have no editable fields on the
+standard Nautilus modification command.
+
+See [Alpaca's replace endpoint](https://docs.alpaca.markets/us/reference/patchorderbyorderid-1).
+
 ### Single-leg options
 
 Submit a single Market, Limit, StopMarket, or StopLimit order with DAY or GTC
 time in force for a loaded equity, ETF, or supported index option instrument.
 Index option orders execute during regular hours. Option stops use the broker's
-default trigger. Quantity counts whole contracts. To change an option order,
-cancel and resubmit.
+default trigger. Quantity counts whole contracts.
 
 For ordinary regular-hours Limit orders, the adapter omits
 `position_intent` so Alpaca can determine opening or closing from the account's
@@ -255,8 +287,9 @@ It uses the parent net fill to update the combo order and the broker's leg
 fills to update the option positions. On reconciliation the adapter reports
 known parent orders from the local cache and reconciles positions by OCC
 symbol. Orders submitted outside Nautilus have no cached combo identity.
-Combo replacement and spread quote subscriptions are outside this initial
-support. See [Alpaca multi-leg orders](https://docs.alpaca.markets/us/docs/options-level-3-trading)
+Use `modify_order` on the parent to change its net limit. The adapter
+preserves leg ratios and the single-lot size. Alpaca may disable multi-leg
+replacement for an account. Spread quotes are unavailable. See [Alpaca multi-leg orders](https://docs.alpaca.markets/us/docs/options-level-3-trading)
 and [index options](https://docs.alpaca.markets/us/docs/index-options).
 
 ## Execution reconciliation

@@ -80,7 +80,7 @@ use nautilus_network::{
     websocket::{WebSocketClient, WebSocketConfig},
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::{
     sync::{mpsc, watch},
     time::{Instant, sleep_until, timeout},
@@ -92,7 +92,7 @@ use self::{
     option_lifecycle::{AlpacaOptionSettlementUpdate, SettlementSync},
     orders::{
         OrderGroup, extended_hours, option_order_request, order_list_request, order_request,
-        replacement_instructions,
+        replacement_request,
     },
     reports::{BrokerOrder, FillActivity},
     updates::{OrderState, TradeUpdate},
@@ -331,16 +331,28 @@ impl AlpacaExecutionClient {
         order_request(order, params)
     }
 
-    fn active_order_id(
+    fn prepare_replacement(
         &self,
         order: &OrderAny,
-        command_id: Option<VenueOrderId>,
-    ) -> anyhow::Result<VenueOrderId> {
-        self.order_state()?
-            .venue_for(order.client_order_id())
-            .or(order.venue_order_id())
-            .or(command_id)
-            .context("Alpaca order has no active broker order ID")
+        cmd: &ModifyOrder,
+        replacement_client_id: &str,
+    ) -> anyhow::Result<(VenueOrderId, Value)> {
+        ensure!(
+            self.is_connected(),
+            "Alpaca trade update stream is unavailable"
+        );
+        let mut state = self.order_state()?;
+        let venue_id = state.active_order_id(order, cmd.venue_order_id)?;
+        let existing = state.advanced_instructions(venue_id);
+        let mut payload = replacement_request(order, cmd, venue_id, existing)?;
+        let instructions = payload.get("advanced_instructions").or(existing).cloned();
+        payload["client_order_id"] = json!(replacement_client_id);
+        state.register(order);
+        state.register_alias(replacement_client_id.to_owned(), order.client_order_id());
+        if let Some(instructions) = instructions {
+            state.stage_advanced_instructions(replacement_client_id.to_owned(), instructions);
+        }
+        Ok((venue_id, payload))
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
@@ -631,43 +643,10 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let order = self.core.get_order(&cmd.client_order_id)?;
-        if is_option_symbol(order.instrument_id().symbol.as_str())
-            || option_spread::is_spread(order.instrument_id())
-        {
-            self.emitter.emit_order_modify_denied(
-                &order,
-                "Alpaca option modification is not supported",
-                now(),
-                cmd.causation_id,
-            );
-            return Ok(());
-        }
-        if !self.is_connected() {
-            self.emitter.emit_order_modify_denied(
-                &order,
-                "Alpaca trade update stream is unavailable",
-                now(),
-                cmd.causation_id,
-            );
-            return Ok(());
-        }
-        let venue_id = match self.active_order_id(&order, cmd.venue_order_id) {
-            Ok(venue_id) => venue_id,
-            Err(error) => {
-                self.emitter.emit_order_modify_denied(
-                    &order,
-                    &error.to_string(),
-                    now(),
-                    cmd.causation_id,
-                );
-                return Ok(());
-            }
-        };
-
-        let existing = self.order_state()?.advanced_instructions(venue_id).cloned();
-        let advanced =
-            match replacement_instructions(&order, existing.as_ref(), cmd.params.as_ref()) {
-                Ok(instructions) => instructions,
+        let replacement_client_id = UUID4::new().to_string();
+        let (venue_id, payload) =
+            match self.prepare_replacement(&order, &cmd, &replacement_client_id) {
+                Ok(request) => request,
                 Err(error) => {
                     self.emitter.emit_order_modify_denied(
                         &order,
@@ -678,56 +657,6 @@ impl ExecutionClient for AlpacaExecutionClient {
                     return Ok(());
                 }
             };
-
-        let mut payload = Map::new();
-        if let Some(instructions) = &advanced {
-            payload.insert("advanced_instructions".to_owned(), instructions.clone());
-        }
-        if let Some(qty) = cmd.quantity {
-            if qty.as_decimal().fract().is_zero() && !qty.is_zero() {
-                payload.insert("qty".to_string(), json!(qty.to_string()));
-            } else {
-                self.emitter.emit_order_modify_denied(
-                    &order,
-                    "Alpaca equity modify requires positive whole shares",
-                    now(),
-                    cmd.causation_id,
-                );
-                return Ok(());
-            }
-        }
-        if let Some(price) = cmd.price {
-            payload.insert(
-                "limit_price".to_string(),
-                json!(price.as_decimal().normalize().to_string()),
-            );
-        }
-        if let Some(price) = cmd.trigger_price {
-            payload.insert(
-                "stop_price".to_string(),
-                json!(price.as_decimal().normalize().to_string()),
-            );
-        }
-        if payload.is_empty() {
-            self.emitter.emit_order_modify_denied(
-                &order,
-                "Alpaca order modify requires at least one changed field",
-                now(),
-                cmd.causation_id,
-            );
-            return Ok(());
-        }
-
-        let replacement_client_id = UUID4::new().to_string();
-        payload.insert("client_order_id".to_string(), json!(replacement_client_id));
-        {
-            let mut state = self.order_state()?;
-            state.register(&order);
-            state.register_alias(replacement_client_id.clone(), order.client_order_id());
-            if let Some(instructions) = advanced.or(existing) {
-                state.stage_advanced_instructions(replacement_client_id.clone(), instructions);
-            }
-        }
 
         let http = self.http.clone();
         let emitter = self.emitter.clone();
@@ -745,14 +674,17 @@ impl ExecutionClient for AlpacaExecutionClient {
                 }
                 Err(error) => {
                     if let CommandFailure::VenueRejected(reason) = classify(&error) {
-                        lock_state(&state)?.forget_advanced_request(&staged_id);
-                        emitter.emit_order_modify_rejected(
-                            &order,
-                            Some(venue_id),
-                            &reason,
-                            now(),
-                            cmd.causation_id,
-                        );
+                        let mut state = lock_state(&state)?;
+                        state.forget_replacement_request(&staged_id);
+                        if let Some(working) = state.working_order(cmd.client_order_id, venue_id) {
+                            emitter.emit_order_modify_rejected(
+                                working,
+                                Some(venue_id),
+                                &reason,
+                                now(),
+                                cmd.causation_id,
+                            );
+                        }
                     }
                     Err(error)
                 }
@@ -760,14 +692,17 @@ impl ExecutionClient for AlpacaExecutionClient {
         });
         if result.is_err() {
             self.order_state()?
-                .forget_advanced_request(&replacement_client_id);
+                .forget_replacement_request(&replacement_client_id);
         }
         result
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         let order = self.core.get_order(&cmd.client_order_id)?;
-        let venue_id = match self.active_order_id(&order, cmd.venue_order_id) {
+        let venue_id = match self
+            .order_state()?
+            .active_order_id(&order, cmd.venue_order_id)
+        {
             Ok(venue_id) => venue_id,
             Err(error) => {
                 self.emitter.emit_order_cancel_denied(
@@ -1428,10 +1363,11 @@ impl StreamTask {
             .values()
             .filter(|order| order.supported() && order.replaced_by.is_none())
         {
-            let client_id = state
-                .broker_order_client_id(order)?
-                .or(Some(order.client_id()?));
-            let report = order.to_report(self.emitter.account_id(), client_id, now())?;
+            let Some(report) = state.order_report(order, self.emitter.account_id(), None, now())?
+            else {
+                continue;
+            };
+            let client_id = report.client_order_id;
             state.confirm_replacement(order, &self.emitter, report.ts_last)?;
             state.apply_snapshot(order, &report)?;
             let mut fills = fills_by_order

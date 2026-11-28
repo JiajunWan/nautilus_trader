@@ -190,6 +190,22 @@ impl BrokerOrder {
         self.order_class.as_deref() == Some("mleg") && self.symbol.is_empty()
     }
 
+    pub(super) fn confirms_replacement(&self) -> bool {
+        self.replaces.is_some()
+            && self.replaced_by.is_none()
+            && matches!(
+                self.status.as_str(),
+                "new"
+                    | "partially_filled"
+                    | "filled"
+                    | "accepted_for_bidding"
+                    | "done_for_day"
+                    | "pending_cancel"
+                    | "canceled"
+                    | "expired"
+            )
+    }
+
     fn submission_time(&self) -> anyhow::Result<Timestamp> {
         self.submitted_at
             .as_deref()

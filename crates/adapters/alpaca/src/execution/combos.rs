@@ -42,6 +42,15 @@ pub(super) fn cash_price(value: Decimal, side: OrderSide) -> Decimal {
     }
 }
 
+pub(super) fn limit_price(price: Price, side: OrderSide) -> anyhow::Result<Decimal> {
+    let net = cash_price(price.as_decimal(), side);
+    ensure!(
+        !net.is_zero(),
+        "Alpaca option combo net limit must be nonzero"
+    );
+    Ok(net)
+}
+
 pub(super) fn request(
     order: &OrderAny,
     params: Option<&Params>,
@@ -77,11 +86,7 @@ pub(super) fn request(
     let limit = order
         .price()
         .context("Alpaca combo missing a net limit price")?;
-    let limit = cash_price(limit.as_decimal(), order.order_side());
-    ensure!(
-        !limit.is_zero(),
-        "Alpaca option combo net limit must be nonzero"
-    );
+    let limit = limit_price(limit, order.order_side())?;
     let legs = option_spread::legs(order.instrument_id())?
         .into_iter()
         .map(|(id, ratio)| {

@@ -84,7 +84,7 @@ fn legs(symbols: [&str; 2], asset_class: AssetClass) -> [InstrumentAny; 2] {
 
 fn response(id: &str, status: &str, [long, short]: [&str; 2]) -> Value {
     let filled = status == "filled";
-    let closing = id == "COMBO-CLOSE";
+    let closing = matches!(id, "COMBO-CLOSE" | "COMBO-CANCEL");
     let child = |symbol, side, intent, price, suffix| {
         json!({
             "id": format!("{id}-{suffix}"), "client_order_id": format!("{id}-CHILD-{suffix}"),
@@ -195,12 +195,29 @@ async fn rest_fixture(
             }
             ("GET", "/v2/orders/COMBO-OPEN-PARENT") => response("COMBO-OPEN", "filled", symbols),
             ("GET", "/v2/orders/COMBO-CLOSE-PARENT") => response("COMBO-CLOSE", "filled", symbols),
-            ("DELETE", "/v2/orders/COMBO-CANCEL-PARENT") => {
-                ws.send(update(
-                    &response("COMBO-CANCEL", "canceled", symbols),
-                    "canceled",
-                ))
-                .unwrap();
+            ("PATCH", "/v2/orders/COMBO-CANCEL-PARENT") => {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let alias = body["client_order_id"].as_str().unwrap();
+                assert_eq!(
+                    body,
+                    json!({"limit_price": "-1.75", "client_order_id": alias})
+                );
+                let mut replacement = response("COMBO-CANCEL", "new", symbols);
+                replacement["id"] = json!("REPLACEMENT");
+                replacement["client_order_id"] = json!(alias);
+                replacement["replaces"] = json!("COMBO-CANCEL-PARENT");
+                replacement["limit_price"] = json!("-1.75");
+                let mut predecessor = response("COMBO-CANCEL", "replaced", symbols);
+                predecessor["replaced_by"] = json!("REPLACEMENT");
+                ws.send(update(&predecessor, "replaced")).unwrap();
+                ws.send(update(&replacement, "new")).unwrap();
+                replacement
+            }
+            ("DELETE", "/v2/orders/REPLACEMENT") => {
+                let mut canceled = response("COMBO-CANCEL", "canceled", symbols);
+                canceled["id"] = json!("REPLACEMENT");
+                canceled["replaces"] = json!("COMBO-CANCEL-PARENT");
+                ws.send(update(&canceled, "canceled")).unwrap();
                 no_content = true;
                 Value::Null
             }
@@ -309,7 +326,7 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
     for (name, side, price, reduce_only, filled) in [
         ("COMBO-OPEN", OrderSide::Buy, "1.95", false, "1.80"),
         ("COMBO-CLOSE", OrderSide::Sell, "1.25", true, "1.30"),
-        ("COMBO-CANCEL", OrderSide::Buy, "1.95", false, ""),
+        ("COMBO-CANCEL", OrderSide::Sell, "1.25", true, ""),
     ] {
         let mut builder = OrderTestBuilder::new(OrderType::Limit);
         let order = builder
@@ -357,6 +374,29 @@ async fn submits_and_reconciles_combo_parent_and_leg_fills_then_cancels_by_paren
         let venue_id = accepted.venue_order_id;
         assert_eq!(venue_id.as_str(), format!("{name}-PARENT"));
         if filled.is_empty() {
+            client
+                .modify_order(ModifyOrder::new(
+                    trader_id,
+                    Some(client_id),
+                    order.strategy_id(),
+                    id,
+                    order.client_order_id(),
+                    Some(venue_id),
+                    None,
+                    Some(Price::from("1.75")),
+                    None,
+                    UUID4::new(),
+                    0.into(),
+                    None,
+                    None,
+                ))
+                .unwrap();
+            let OrderEventAny::Updated(updated) = order_event(&mut events).await else {
+                panic!("Expected one combo parent update");
+            };
+            assert_eq!(updated.price, Some(Price::from("1.75")));
+            assert_eq!(updated.client_order_id, order.client_order_id());
+            assert_eq!(updated.venue_order_id, Some("REPLACEMENT".into()));
             client
                 .cancel_order(CancelOrder::new(
                     trader_id,

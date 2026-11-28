@@ -355,6 +355,248 @@ fn accept_order(mut order: OrderAny, account: AccountId, venue_id: &str) -> Orde
     order
 }
 
+#[derive(Debug)]
+struct AmendStrategy {
+    core: StrategyCore,
+    price: Option<Price>,
+}
+
+nautilus_strategy!(AmendStrategy);
+
+impl DataActor for AmendStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.modify_order(
+            "ORIGINAL".into(),
+            Some(Quantity::from(2)),
+            self.price,
+            None,
+            None,
+            None,
+        )
+    }
+}
+
+#[rstest]
+#[case::queued_market("AAPL", false, StatusCode::OK)]
+#[case::queued_market_broker_rejects("AAPL", false, StatusCode::UNPROCESSABLE_ENTITY)]
+#[case::extended_etf_gtc("QQQ", true, StatusCode::OK)]
+#[case::stock_option("AAPL261218C00200000", false, StatusCode::OK)]
+#[case::extended_etf_option("SPY261218C00600000", true, StatusCode::OK)]
+#[case::index_option("SPXW261218C06000000", false, StatusCode::OK)]
+#[case::lost_option_ack("SPXW261218C06000000", false, StatusCode::SERVICE_UNAVAILABLE)]
+#[tokio::test]
+async fn strategy_amends_a_working_order(
+    #[case] symbol: &'static str,
+    #[case] extended: bool,
+    #[case] http_status: StatusCode,
+) {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .build();
+    let is_option = !matches!(symbol, "AAPL" | "QQQ");
+    let is_limit = is_option || extended;
+    let tif = if extended && !is_option {
+        TimeInForce::Gtc
+    } else {
+        TimeInForce::Day
+    };
+    let (wire, mut patches) = mpsc::unbounded_channel();
+    let reject = http_status == StatusCode::UNPROCESSABLE_ENTITY;
+    let replacement = std::sync::Arc::new(std::sync::OnceLock::<Value>::new());
+    let recorded = replacement.clone();
+    let recent = replacement.clone();
+    let exact = replacement.clone();
+    let app = Router::new()
+        .route("/v2/account", get(|| async {
+            Json(json!({"account_number":"TEST","currency":"USD","cash":"1000000"}))
+        }))
+        .route("/v2/positions", get(|| async { Json(json!([])) }))
+        .route("/v2/account/activities", get(|| async { Json(json!([])) }))
+        .route("/v2/account/activities/FILL", get(|| async { Json(json!([])) }))
+        .route("/v2/orders", get(async move || Json(recent.get().cloned().into_iter().collect::<Vec<_>>())))
+        .route("/v2/orders/NEW", get(async move || Json(exact.get().unwrap().clone())))
+        .route("/v2/orders/OLD", get(|| async {
+            let mut row = order("OLD", false);
+            row["replaced_by"] = json!("NEW");
+            Json(row)
+        }).patch(async move |Json(body): Json<Value>| {
+            if reject {
+                wire.send(body).unwrap();
+                let error = json!({"code":42_210_000, "message":"cannot replace order in accepted status"});
+                return (http_status, Json(error));
+            }
+            let mut row = order("NEW", false);
+            row["replaces"] = json!("OLD");
+            row["client_order_id"] = body["client_order_id"].clone();
+            row["qty"] = body["qty"].clone();
+            row["symbol"] = json!(symbol);
+            row["extended_hours"] = json!(extended);
+            row["created_at"] = json!(get_atomic_clock_realtime().get_time_ns().to_rfc3339());
+            row["submitted_at"] = row["created_at"].clone();
+            if is_option { row["asset_class"] = json!("us_option"); }
+            row["time_in_force"] = json!(tif.to_string().to_lowercase());
+            if is_limit {
+                row["type"] = json!("limit");
+                row["limit_price"] = body["limit_price"].clone();
+            }
+            recorded.set(row.clone()).unwrap();
+            wire.send(body).unwrap();
+            if http_status == StatusCode::OK {
+                (http_status, Json(row))
+            } else {
+                (http_status, Json(json!({"message":"upstream unavailable"})))
+            }
+        }));
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+    let account = config.account_id;
+    let client = ClientId::from("ALPACA");
+    let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+        delay_post_stop: Duration::ZERO,
+        ..Default::default()
+    })
+    .unwrap()
+    .with_reconciliation(false)
+    .add_exec_client(
+        Some(client.to_string()),
+        Box::new(AlpacaExecutionClientFactory),
+        Box::new(config),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let cache = node.kernel().cache();
+    let id = InstrumentId::from(format!("{symbol}.ALPACA").as_str());
+    let instrument = if is_option {
+        let mut option = nautilus_model::instruments::stubs::option_contract_appl();
+        option.id = id;
+        option.raw_symbol = id.symbol;
+        if symbol.starts_with("SPX") {
+            option.asset_class = nautilus_model::enums::AssetClass::Index;
+        }
+        InstrumentAny::OptionContract(option)
+    } else {
+        InstrumentAny::Equity(nautilus_model::instruments::Equity {
+            id,
+            ..equity_aapl()
+        })
+    };
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+    if !is_limit {
+        let now = get_atomic_clock_realtime().get_time_ns();
+        cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                id,
+                Price::from("199.99"),
+                Price::from("200.00"),
+                Quantity::from(100),
+                Quantity::from(100),
+                now,
+                now,
+            ))
+            .unwrap();
+    }
+    let strategy = StrategyId::from("AMEND-001");
+    let original_id = ClientOrderId::from("ORIGINAL");
+    let mut builder = OrderTestBuilder::new(if is_limit {
+        OrderType::Limit
+    } else {
+        OrderType::Market
+    });
+    builder
+        .trader_id(node.kernel().trader_id())
+        .strategy_id(strategy)
+        .instrument_id(id)
+        .client_order_id(original_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(3))
+        .price(Price::from("1.00"))
+        .time_in_force(tif);
+    if extended {
+        builder.tags(vec![ALPACA_EXTENDED_HOURS_TAG.into()]);
+    }
+    let original = accept_order(builder.build(), account, "OLD");
+    cache
+        .borrow_mut()
+        .add_order(original, None, Some(client), false)
+        .unwrap();
+    node.add_strategy(AmendStrategy {
+        core: StrategyCore::new(StrategyConfig {
+            strategy_id: Some(strategy),
+            ..Default::default()
+        }),
+        price: is_limit.then(|| Price::from("1.25")),
+    })
+    .unwrap();
+    let handle = node.handle();
+    let broker = async {
+        let mut socket = accept_private(&ws).await;
+        let mut body = patches.recv().await.unwrap();
+        let alias = body
+            .as_object_mut()
+            .unwrap()
+            .remove("client_order_id")
+            .unwrap();
+        assert_ne!(alias, original_id.as_str());
+        assert_eq!(
+            body,
+            if is_limit {
+                json!({"qty":"2","limit_price":"1.25"})
+            } else {
+                json!({"qty":"2"})
+            }
+        );
+        if http_status == StatusCode::SERVICE_UNAVAILABLE {
+            drop(socket);
+            socket = accept_private(&ws).await;
+        }
+        loop {
+            let completed = cache.borrow().order(&original_id).is_some_and(|order| {
+                let observed = order.events().iter().any(|event| {
+                    if reject {
+                        matches!(event, OrderEventAny::ModifyRejected(_))
+                    } else {
+                        matches!(event, OrderEventAny::Updated(_))
+                    }
+                });
+                if observed {
+                    assert_eq!(order.status(), OrderStatus::Accepted);
+                    assert_eq!(order.time_in_force(), tif);
+                    if is_limit && !reject {
+                        assert_eq!(order.price(), Some(Price::from("1.25")));
+                    }
+                    assert_eq!(order.quantity(), Quantity::from(if reject { 3 } else { 2 }));
+                    assert_eq!(
+                        order.venue_order_id(),
+                        Some(if reject { "OLD" } else { "NEW" }.into())
+                    );
+                }
+                observed
+            });
+            if completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.stop();
+        socket
+    };
+    let (result, _socket) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(node.run(), broker)
+    })
+    .await
+    .expect("Expected the standard strategy modification to resolve");
+    result.unwrap();
+    assert!(patches.try_recv().is_err());
+    node.dispose();
+    server.abort();
+}
+
 #[tokio::test]
 async fn offline_close_replays_once_before_strategy_starts() {
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();

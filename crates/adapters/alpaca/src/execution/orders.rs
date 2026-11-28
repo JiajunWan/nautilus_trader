@@ -16,6 +16,7 @@
 //! Converts Nautilus orders to Alpaca order requests.
 
 use anyhow::{Context, bail, ensure};
+use nautilus_common::messages::execution::ModifyOrder;
 use nautilus_core::Params;
 use nautilus_model::{
     enums::{
@@ -23,11 +24,11 @@ use nautilus_model::{
         TrailingOffsetType, TriggerType,
     },
     events::OrderDeniedReason,
-    identifiers::OrderListId,
+    identifiers::{OrderListId, VenueOrderId},
     orders::{Order, OrderAny},
 };
 use rust_decimal::Decimal;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::advanced::AdvancedInstructions;
 use crate::{common::ALPACA_EXTENDED_HOURS_TAG, option_provider::is_option_symbol, option_spread};
@@ -133,7 +134,118 @@ pub(super) fn option_order_request(
     Ok(request)
 }
 
-pub(super) fn replacement_instructions(
+pub(super) fn replacement_request(
+    order: &OrderAny,
+    cmd: &ModifyOrder,
+    venue_id: VenueOrderId,
+    existing: Option<&Value>,
+) -> anyhow::Result<Value> {
+    use OrderType::{Limit, Market, StopLimit, StopMarket, TrailingStopMarket};
+
+    let kind = order.order_type();
+    let (has_limit, has_stop) = match kind {
+        Market | TrailingStopMarket => (false, false),
+        Limit => (true, false),
+        StopMarket => (false, true),
+        StopLimit => (true, true),
+        _ => bail!(OrderDeniedReason::UnsupportedOrderType { order_type: kind }),
+    };
+    ensure!(
+        !order.is_quote_quantity(),
+        "Alpaca notional orders cannot be replaced"
+    );
+    let params = cmd.params.as_ref();
+    if let Some(params) = params {
+        for field in [
+            "extended_hours",
+            "time_in_force",
+            "position_intent",
+            "trail",
+            "trail_price",
+            "trail_percent",
+        ] {
+            ensure!(
+                !params.contains_key(field),
+                "Alpaca modify_order cannot change {field}"
+            );
+        }
+    }
+    let spread = option_spread::is_spread(order.instrument_id());
+    let mut body = Map::new();
+    if let Some(qty) = cmd.quantity {
+        let total = qty.as_decimal();
+        ensure!(
+            total.fract().is_zero()
+                && order.quantity().as_decimal().fract().is_zero()
+                && qty > order.filled_qty(),
+            "Alpaca replacement requires whole shares or contracts and a total quantity above filled quantity",
+        );
+        ensure!(
+            !spread || total == Decimal::ONE,
+            "Alpaca combo execution supports one lot"
+        );
+        body.insert("qty".into(), json!(total.normalize().to_string()));
+    }
+    let instructions = replacement_instructions(order, existing, params)?;
+    ensure!(
+        cmd.quantity.is_some()
+            || cmd.price.is_some()
+            || cmd.trigger_price.is_some()
+            || instructions.is_some(),
+        "Alpaca order modify requires at least one changed field"
+    );
+    let has_stop = has_stop && order.is_triggered() != Some(true) && order.filled_qty().is_zero();
+    ensure!(
+        has_limit || cmd.price.is_none(),
+        "Alpaca {kind} has no limit price"
+    );
+    ensure!(
+        has_stop || cmd.trigger_price.is_none(),
+        "Alpaca {kind} has no editable stop price"
+    );
+    // The SDK requires the original price fields even when changing only quantity.
+    // Never copy those fields from the predecessor onto an already replaced order.
+    if (has_limit && cmd.price.is_none()) || (has_stop && cmd.trigger_price.is_none()) {
+        ensure!(
+            order.venue_order_id() == Some(venue_id),
+            "Alpaca cached prices do not belong to the active broker order"
+        );
+    }
+    if has_limit {
+        let price = cmd
+            .price
+            .or_else(|| order.price())
+            .context("Missing Alpaca limit price")?;
+        let limit = if spread {
+            super::combos::limit_price(price, order.order_side())?
+        } else {
+            let limit = price.as_decimal();
+            ensure!(limit > Decimal::ZERO, "Alpaca limit price must be positive");
+            limit
+        };
+        body.insert("limit_price".into(), json!(limit.normalize().to_string()));
+    }
+    if has_stop {
+        let price = cmd
+            .trigger_price
+            .or_else(|| order.trigger_price())
+            .context("Missing Alpaca stop price")?;
+        ensure!(
+            price.as_decimal() > Decimal::ZERO,
+            "Alpaca stop price must be positive"
+        );
+        body.insert(
+            "stop_price".into(),
+            json!(price.as_decimal().normalize().to_string()),
+        );
+    }
+    if let Some(instructions) = instructions {
+        body.insert("advanced_instructions".into(), instructions);
+    }
+    Ok(Value::Object(body))
+}
+
+fn replacement_instructions(
     order: &OrderAny,
     existing: Option<&Value>,
     params: Option<&Params>,
@@ -505,7 +617,7 @@ pub(super) fn parse_order_status(value: &str) -> anyhow::Result<OrderStatus> {
 mod tests {
     use nautilus_model::{
         identifiers::{ClientOrderId, InstrumentId, OrderListId, new_generic_spread_id},
-        orders::OrderTestBuilder,
+        orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
     };
     use rstest::rstest;
@@ -520,6 +632,137 @@ mod tests {
             .quantity(Quantity::from(1))
             .time_in_force(TimeInForce::Day);
         builder
+    }
+
+    fn amend(
+        order: &OrderAny,
+        qty: Option<Quantity>,
+        limit: Option<Price>,
+        stop: Option<Price>,
+    ) -> ModifyOrder {
+        ModifyOrder::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.venue_order_id(),
+            qty,
+            limit,
+            stop,
+            nautilus_core::UUID4::new(),
+            0.into(),
+            None,
+            None,
+        )
+    }
+
+    #[rstest]
+    #[case::market(OrderType::Market, TimeInForce::Day, false, false, true)]
+    #[case::moo(OrderType::Market, TimeInForce::AtTheOpen, false, false, true)]
+    #[case::moc(OrderType::Market, TimeInForce::AtTheClose, false, false, true)]
+    #[case::market_price(OrderType::Market, TimeInForce::Day, true, false, false)]
+    #[case::loo(OrderType::Limit, TimeInForce::AtTheOpen, true, false, true)]
+    #[case::loc(OrderType::Limit, TimeInForce::AtTheClose, true, false, true)]
+    #[case::limit_trigger(OrderType::Limit, TimeInForce::Gtc, false, true, false)]
+    #[case::limit_qty_only(OrderType::Limit, TimeInForce::Gtc, false, false, true)]
+    #[case::stop_qty_only(OrderType::StopMarket, TimeInForce::Day, false, false, true)]
+    #[case::stop_limit_price_only(OrderType::StopLimit, TimeInForce::Day, true, false, true)]
+    #[case::stop(OrderType::StopMarket, TimeInForce::Gtc, false, true, true)]
+    #[case::stop_limit(OrderType::StopLimit, TimeInForce::Day, true, true, true)]
+    #[case::stop_limit_trigger_only(OrderType::StopLimit, TimeInForce::Day, false, true, true)]
+    #[case::trailing_quantity(OrderType::TrailingStopMarket, TimeInForce::Day, false, false, true)]
+    #[case::trailing_absolute_stop(
+        OrderType::TrailingStopMarket,
+        TimeInForce::Day,
+        false,
+        true,
+        false
+    )]
+    fn encodes_native_modify_fields(
+        #[case] kind: OrderType,
+        #[case] tif: TimeInForce,
+        #[case] limit: bool,
+        #[case] stop: bool,
+        #[case] eligible: bool,
+    ) {
+        let mut order = order_builder(kind, "original")
+            .time_in_force(tif)
+            .price(Price::from("20"))
+            .trigger_price(Price::from("19"))
+            .trailing_offset(Decimal::ONE)
+            .trailing_offset_type(TrailingOffsetType::Price)
+            .build();
+        let venue = VenueOrderId::from("venue");
+        order
+            .apply(TestOrderEventStubs::accepted(
+                &order,
+                "ALPACA-001".into(),
+                venue,
+            ))
+            .unwrap();
+        let cmd = amend(
+            &order,
+            Some(Quantity::from(3)),
+            limit.then(|| Price::from("21.00")),
+            stop.then(|| Price::from("20.00")),
+        );
+        let request = replacement_request(&order, &cmd, "venue".into(), None);
+        if eligible {
+            let mut expected = json!({"qty":"3"});
+            if matches!(kind, OrderType::Limit | OrderType::StopLimit) {
+                expected["limit_price"] = json!(if limit { "21" } else { "20" });
+            }
+            if matches!(kind, OrderType::StopMarket | OrderType::StopLimit) {
+                expected["stop_price"] = json!(if stop { "20" } else { "19" });
+            }
+            assert_eq!(request.unwrap(), expected);
+        } else {
+            assert!(request.is_err());
+        }
+    }
+
+    #[test]
+    fn partial_stop_fill_preserves_limit_and_requires_total_above_filled() {
+        let mut order = order_builder(OrderType::StopLimit, "original")
+            .instrument_id(InstrumentId::from("AAPL.ALPACA"))
+            .quantity(Quantity::from(5))
+            .price(Price::from("20"))
+            .trigger_price(Price::from("19"))
+            .build();
+        let venue = VenueOrderId::from("venue");
+        let account = nautilus_model::identifiers::AccountId::from("ALPACA-001");
+        order
+            .apply(TestOrderEventStubs::accepted(&order, account, venue))
+            .unwrap();
+        let instrument = nautilus_model::instruments::stubs::equity_aapl().into();
+        order
+            .apply(TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                None,
+                None,
+                Some(Price::from("20")),
+                Some(Quantity::from(2)),
+                None,
+                None,
+                None,
+                Some(account),
+            ))
+            .unwrap();
+        let mut cmd = amend(&order, Some(Quantity::from(3)), None, None);
+        assert_eq!(
+            replacement_request(&order, &cmd, venue, None).unwrap(),
+            json!({"qty":"3","limit_price":"20"})
+        );
+        assert!(replacement_request(&order, &cmd, "successor".into(), None).is_err());
+        cmd.trigger_price = Some(Price::from("19.50"));
+        assert!(replacement_request(&order, &cmd, venue, None).is_err());
+        cmd.trigger_price = None;
+        for total in ["0", "1", "2", "2.5"] {
+            cmd.quantity = Some(Quantity::from(total));
+            assert!(replacement_request(&order, &cmd, venue, None).is_err());
+        }
     }
 
     #[rstest]

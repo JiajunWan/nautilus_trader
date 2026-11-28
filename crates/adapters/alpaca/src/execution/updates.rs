@@ -277,6 +277,11 @@ impl OrderState {
             .insert(broker_client_id, instructions);
     }
 
+    pub(super) fn forget_replacement_request(&mut self, alias: &str) {
+        self.broker_client_ids.remove(alias);
+        self.forget_advanced_request(alias);
+    }
+
     pub(super) fn forget_advanced_request(&mut self, broker_client_id: &str) {
         self.pending_advanced_instructions.remove(broker_client_id);
     }
@@ -346,6 +351,17 @@ impl OrderState {
         Ok(())
     }
 
+    pub(super) fn active_order_id(
+        &self,
+        order: &OrderAny,
+        command_id: Option<VenueOrderId>,
+    ) -> anyhow::Result<VenueOrderId> {
+        self.venue_for(order.client_order_id())
+            .or(order.venue_order_id())
+            .or(command_id)
+            .context("Alpaca order has no active broker order ID")
+    }
+
     pub(super) fn venue_for(&self, client_id: ClientOrderId) -> Option<VenueOrderId> {
         self.tracked
             .get(&client_id)
@@ -355,6 +371,22 @@ impl OrderState {
                     .get(&client_id)
                     .and_then(|order| order.venue_id)
             })
+    }
+
+    pub(super) fn working_order(
+        &self,
+        client_id: ClientOrderId,
+        venue_id: VenueOrderId,
+    ) -> Option<&OrderAny> {
+        self.tracked
+            .get(&client_id)
+            .filter(|tracked| {
+                !tracked.status.is_closed()
+                    && tracked
+                        .active_venue_id
+                        .is_none_or(|active| active == venue_id)
+            })
+            .map(|tracked| &tracked.order)
     }
 
     pub(super) fn client_for(&self, venue_id: VenueOrderId) -> Option<ClientOrderId> {
@@ -386,13 +418,7 @@ impl OrderState {
         let Some(predecessor) = order.replaces.as_deref() else {
             return Ok(());
         };
-        if order.replaced_by.is_some()
-            || !order.supported()
-            || !matches!(
-                order.status.as_str(),
-                "new" | "accepted" | "partially_filled" | "filled"
-            )
-        {
+        if !order.confirms_replacement() || !(order.supported() || order.is_combo()) {
             return Ok(());
         }
         let Some(client_id) = self.broker_order_client_id(order)? else {
@@ -409,7 +435,8 @@ impl OrderState {
         {
             return Ok(());
         }
-        let report = order.to_report(emitter.account_id(), Some(client_id), ts_event)?;
+        let combo = order.is_combo().then_some(&tracked.order);
+        let report = order.to_report_for(emitter.account_id(), Some(client_id), ts_event, combo)?;
         tracked.set_venue_id(venue_id, &mut self.active);
         self.venue_client_ids.insert(venue_id, client_id);
         emitter.emit_order_updated(
@@ -477,9 +504,15 @@ impl OrderState {
         if !order.supported() && combo.is_none() {
             return Ok(None);
         }
-        let client_id = client_id
-            .or(self.broker_order_client_id(order)?)
-            .or(Some(order.client_id()?));
+        let client_id = client_id.or(self.broker_order_client_id(order)?);
+        if order.replaces.is_some()
+            && !order.confirms_replacement()
+            && let Some(active) = client_id.and_then(|id| self.venue_for(id))
+            && active != order.venue_id()?
+        {
+            return Ok(None);
+        }
+        let client_id = client_id.or(Some(order.client_id()?));
         Ok(Some(
             order.to_report_for(account_id, client_id, ts_init, combo)?,
         ))
@@ -491,6 +524,12 @@ impl OrderState {
         emitter: &ExecutionEventEmitter,
         ts_event: UnixNanos,
     ) -> anyhow::Result<()> {
+        if snapshot.status == "replaced"
+            || (snapshot.replaced_by.is_some() && snapshot.status != "filled")
+        {
+            return Ok(());
+        }
+        self.confirm_replacement(snapshot, emitter, ts_event)?;
         let Some(order) = self.combo_order(snapshot)? else {
             return Ok(());
         };
@@ -501,14 +540,19 @@ impl OrderState {
             .tracked
             .get_mut(&client_id)
             .context("Missing Alpaca combo order")?;
-        ensure!(
-            tracked.active_venue_id.is_none_or(|id| id == venue_id),
-            "Alpaca combo broker order ID changed unexpectedly",
-        );
-        self.venue_client_ids.insert(venue_id, client_id);
-        tracked.set_venue_id(venue_id, &mut self.active);
         if tracked.status.is_closed() {
             return Ok(());
+        }
+        if tracked.active_venue_id.is_some_and(|id| id != venue_id) {
+            // Ignore stale or unconfirmed snapshots. A known predecessor's fill still counts.
+            if status != OrderStatus::Filled
+                || self.venue_client_ids.get(&venue_id) != Some(&client_id)
+            {
+                return Ok(());
+            }
+        } else {
+            self.venue_client_ids.insert(venue_id, client_id);
+            tracked.set_venue_id(venue_id, &mut self.active);
         }
         let filled = if status == OrderStatus::Filled {
             let ts_init = get_atomic_clock_realtime().get_time_ns();
@@ -765,6 +809,32 @@ impl OrderState {
         update: TradeUpdate,
         emitter: &ExecutionEventEmitter,
     ) -> anyhow::Result<()> {
+        let replace_rejected = update.event == "order_replace_rejected";
+        if replace_rejected || (update.event == "rejected" && update.order.replaces.is_some()) {
+            if let Some(id) = self.broker_order_client_id(&update.order)? {
+                let venue = update.order.venue_id()?;
+                // A rejected successor can identify the working order by its predecessor.
+                let target = self
+                    .venue_for(id)
+                    .filter(|active| Some(active.as_str()) == update.order.replaces.as_deref())
+                    .or(replace_rejected.then_some(venue));
+                if let Some(target) = target
+                    && let Some(order) = self.working_order(id, target)
+                {
+                    emitter.emit_order_modify_rejected(
+                        order,
+                        Some(target),
+                        "Alpaca trade stream rejected the replace",
+                        update.ts_event()?,
+                        None,
+                    );
+                    return Ok(());
+                }
+            }
+            if replace_rejected {
+                return Ok(());
+            }
+        }
         if update.order.is_combo() {
             let ts_event = update.ts_event()?;
             if update.event == "order_cancel_rejected" {
@@ -922,13 +992,6 @@ impl OrderState {
                 &tracked.order,
                 Some(venue_id),
                 "Alpaca trade stream rejected the cancel",
-                ts_event,
-                None,
-            ),
-            "order_replace_rejected" => emitter.emit_order_modify_rejected(
-                &tracked.order,
-                Some(venue_id),
-                "Alpaca trade stream rejected the replace",
                 ts_event,
                 None,
             ),
@@ -1548,6 +1611,56 @@ mod tests {
             state.advanced_instructions("venue-a".into()),
             Some(&instructions)
         );
+    }
+
+    #[rstest]
+    #[case("AAPL261218C00200000")]
+    #[case("SPXW261218C06000000")]
+    fn option_fill_wins_over_an_unconfirmed_replacement(#[case] symbol: &str) {
+        let (mut state, emitter, mut rx) = execution_rig_for(symbol);
+        let client_id = ClientOrderId::from("client-id");
+        let row = |event, status, venue, client| {
+            let mut item = update(event, status, venue, client);
+            item.order.symbol = symbol.into();
+            item.order.asset_class = "us_option".into();
+            item
+        };
+        state
+            .handle(row("new", "new", "old", "client-id"), &emitter)
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Accepted(_))
+        ));
+        let mut successor = row("accepted", "accepted", "next", "alias");
+        successor.order.replaces = Some("old".into());
+        state
+            .confirm_replacement(&successor.order, &emitter, 0.into())
+            .unwrap();
+        assert!(
+            state
+                .order_report(&successor.order, emitter.account_id(), None, 0.into())
+                .unwrap()
+                .is_none()
+        );
+        state.handle(successor, &emitter).unwrap();
+        state
+            .handle(row("fill", "filled", "old", "client-id"), &emitter)
+            .unwrap();
+        state
+            .handle(row("fill", "filled", "old", "client-id"), &emitter)
+            .unwrap();
+        let mut rejected = row("order_replace_rejected", "rejected", "next", "alias");
+        rejected.order.replaces = Some("old".into());
+        state.handle(rejected, &emitter).unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), ExecutionEvent::Order(OrderEventAny::Filled(fill))
+            if fill.client_order_id == client_id && fill.venue_order_id.as_str() == "old")
+        );
+        assert_eq!(state.venue_for(client_id), Some("old".into()));
+        assert!(state.active_orders().is_empty());
+        assert!(state.working_order(client_id, "old".into()).is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[rstest]
