@@ -84,10 +84,13 @@ async fn restores_option_order_fill_and_position_by_full_contract_symbol() {
                     multi_leg["order_class"] = json!("mleg");
                     json!([order, other, multi_leg])
                 }
-                "/v2/account/activities/FILL" => json!([{
-                    "id": "fill-activity", "order_id": venue_id, "symbol": symbol, "side": "buy",
-                    "qty": "1", "cum_qty": "1", "price": "2.40", "transaction_time": timestamp
-                }]),
+                "/v2/account/activities/FILL" => {
+                    assert!(url.query_pairs().any(|(k, v)| k == "order_id" && v == venue_id));
+                    json!([{
+                        "id": "fill-activity", "order_id": venue_id, "symbol": symbol, "side": "buy",
+                        "qty": "1", "cum_qty": "1", "price": "2.40", "transaction_time": timestamp
+                    }])
+                }
                 "/v2/positions" => json!([{
                     "symbol": symbol, "asset_class": "us_option", "qty": "1",
                     "side": "long", "avg_entry_price": "2.40"

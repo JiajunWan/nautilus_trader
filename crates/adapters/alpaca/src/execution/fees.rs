@@ -144,7 +144,7 @@ async fn fetch_fee_report(
     let wanted = requested_executions(&rows);
     if !wanted.is_empty() {
         let mut evidence = FillEvidence::default();
-        let fills = reports::fills(http, Some(fill_start), Some(end)).await?;
+        let fills = reports::fills(http, None, Some(fill_start), Some(end)).await?;
         evidence.observe(
             unique_activities(fills, |fill| &fill.id, "fill")?.into_values(),
             &wanted,

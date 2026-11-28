@@ -1465,7 +1465,7 @@ async fn supported_fills(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<FillActivity>> {
-    let fills = reports::fills(http, start, end).await?;
+    let fills = reports::fills(http, venue_order, start, end).await?;
     let mut supported_by_order = HashMap::new();
     let mut result = Vec::new();
     for fill in fills

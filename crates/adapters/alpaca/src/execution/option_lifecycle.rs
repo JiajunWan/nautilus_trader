@@ -180,9 +180,8 @@ pub async fn request_option_lifecycle_report(
         ("OPCSH", ActivityKind::Cash),
         ("OPTRD", ActivityKind::Shares),
     ] {
-        let page =
-            reports::activities(&http, path, None, Some(through), |r: &OptionActivity| &r.id)
-                .await?;
+        let query = ActivitiesQuery::new(None, Some(through), None);
+        let page = reports::activities(&http, path, query, |r: &OptionActivity| &r.id).await?;
         ensure!(
             page.iter().all(|r| r.activity_type == kind),
             "Unexpected activity type in Alpaca {path} response"

@@ -287,31 +287,40 @@ async fn orders_follow_the_last_raw_id_across_equal_timestamps(
     );
 }
 
+#[rstest]
+#[case::account(None)]
+#[case::order(Some(VenueOrderId::from("fixture")))]
 #[tokio::test]
-async fn fills_reject_a_nonconsecutive_repeated_cursor() {
+async fn fills_reject_a_nonconsecutive_repeated_cursor(#[case] order_id: Option<VenueOrderId>) {
     let http = client(Router::new().route(
         "/v2/account/activities/FILL",
-        get(|Query(query): Query<HashMap<String, String>>| async move {
-            let cursor = match query.get("page_token").map(String::as_str) {
-                None | Some("second") => "first",
-                Some("first") => "second",
-                other => panic!("Unexpected fill cursor {other:?}"),
-            };
-            Json(
-                (0..100)
-                    .map(|i| {
-                        json!({
-                            "id": if i == 99 {cursor.to_owned()} else {format!("{cursor}-{i}")},
-                            "order_id": "fixture", "symbol": "SPY", "side": "buy", "qty": "1",
-                            "cum_qty": "1", "price": "600", "transaction_time": TAIL,
+        get(
+            move |Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(
+                    query.get("order_id").map(String::as_str),
+                    order_id.as_ref().map(VenueOrderId::as_str),
+                );
+                let cursor = match query.get("page_token").map(String::as_str) {
+                    None | Some("second") => "first",
+                    Some("first") => "second",
+                    other => panic!("Unexpected fill cursor {other:?}"),
+                };
+                Json(
+                    (0..100)
+                        .map(|i| {
+                            json!({
+                                "id": if i == 99 {cursor.to_owned()} else {format!("{cursor}-{i}")},
+                                "order_id": "fixture", "symbol": "SPY", "side": "buy", "qty": "1",
+                                "cum_qty": "1", "price": "600", "transaction_time": TAIL,
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        }),
+                        .collect::<Vec<_>>(),
+                )
+            },
+        ),
     ))
     .await;
-    let error = fills(&http, None, None).await.unwrap_err();
+    let error = fills(&http, order_id, None, None).await.unwrap_err();
     assert_eq!(
         error.to_string(),
         "Alpaca FILL activities pagination repeated a token"

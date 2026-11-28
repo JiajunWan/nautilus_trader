@@ -601,20 +601,20 @@ pub(super) fn unique_activities<T: Eq>(
 
 pub(super) async fn fills(
     http: &AlpacaHttpClient,
+    order_id: Option<VenueOrderId>,
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<FillActivity>> {
-    activities(http, "FILL", start, end, |fill: &FillActivity| &fill.id).await
+    let query = ActivitiesQuery::new(start, end, order_id.map(|id| id.to_string()));
+    activities(http, "FILL", query, |fill: &FillActivity| &fill.id).await
 }
 
 pub(super) async fn activities<T: DeserializeOwned>(
     http: &AlpacaHttpClient,
     activity_type: &str,
-    start: Option<UnixNanos>,
-    end: Option<UnixNanos>,
+    mut query: ActivitiesQuery,
     id: impl Fn(&T) -> &str,
 ) -> anyhow::Result<Vec<T>> {
-    let mut query = ActivitiesQuery::new(start, end, None);
     let mut result = Vec::new();
     loop {
         let (page, more) = query.next_page(http, activity_type, &id).await?;

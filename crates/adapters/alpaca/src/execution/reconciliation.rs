@@ -116,7 +116,7 @@ pub(super) async fn snapshot(
                 Ok(Vec::new())
             }
         },
-        reports::fills(http, start, None),
+        reports::fills(http, None, start, None),
     )?;
     // A recent terminal snapshot takes precedence over an older open snapshot
     let mut orders: BTreeMap<_, _> = open
