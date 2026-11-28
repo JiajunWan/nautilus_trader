@@ -25,6 +25,9 @@ use nautilus_network::websocket::{EpochMessageHandler, WebSocketClient, WebSocke
 /// Alpaca client and venue name.
 pub const ALPACA_NAME: &str = "ALPACA";
 
+/// Order tag enabling extended hours, retained when an emulated order is restored.
+pub const ALPACA_EXTENDED_HOURS_TAG: &str = "ALPACA_EXTENDED_HOURS";
+
 /// Venue identifier for Alpaca US equities and options.
 pub static ALPACA_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(ALPACA_NAME));
 

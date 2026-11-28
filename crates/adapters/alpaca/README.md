@@ -164,6 +164,15 @@ See [order types and time-in-force](https://docs.alpaca.markets/us/docs/orders-a
 and [24/5 Trading](https://docs.alpaca.markets/us/docs/245-trading-for-trading-api)
 for the broker's order and session restrictions.
 
+For a locally emulated `STOP_LIMIT` or `TRAILING_STOP_LIMIT`, set
+`tags=["ALPACA_EXTENDED_HOURS"]` when creating the order to enable extended
+hours on the released limit order. With a persistent Nautilus cache, the tag
+survives a restart before the trigger. Use the tag as the source of the
+extended-hours setting for emulated orders because submit parameters are
+lost on emulator restart. The tag conflicts with an explicit
+`extended_hours: false` parameter. The released limit order must meet the
+same Alpaca order type and time-in-force rules as a native limit order.
+
 ### Single-leg options
 
 Submit a single Market, Limit, StopMarket, or StopLimit order with DAY or GTC

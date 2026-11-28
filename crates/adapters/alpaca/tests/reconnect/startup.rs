@@ -17,10 +17,15 @@
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
-use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::Query,
+    http::StatusCode,
+    routing::{get, post},
+};
 use futures_util::SinkExt;
 use nautilus_alpaca::{
-    common::{ALPACA_VENUE, enums::AlpacaEnvironment},
+    common::{ALPACA_EXTENDED_HOURS_TAG, ALPACA_VENUE, enums::AlpacaEnvironment},
     config::AlpacaExecutionClientConfig,
     execution::{
         AlpacaExecutionClient,
@@ -32,8 +37,8 @@ use nautilus_common::{
     actor::DataActor,
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::{set_data_event_sender, set_exec_event_sender},
-    messages::{ExecutionEvent, ExecutionReport},
+    live::runner::{get_data_event_sender, set_data_event_sender, set_exec_event_sender},
+    messages::{DataEvent, ExecutionEvent, ExecutionReport},
     msgbus::{self, ShareableMessageHandler},
 };
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
@@ -41,10 +46,12 @@ use nautilus_live::{
     ExecutionClientCore, builder::LiveNodeBuilder, config::LiveNodeConfig, node::LiveNodeHandle,
 };
 use nautilus_model::{
-    data::{CustomData, Data},
+    data::{CustomData, Data, QuoteTick},
     enums::{
         AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+        TrailingOffsetType, TriggerType,
     },
+    events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
         TradeId, TraderId, VenueOrderId,
@@ -55,14 +62,220 @@ use nautilus_model::{
     types::{Currency, Money, Price, Quantity},
 };
 use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy};
-use serde_json::json;
+use rstest::rstest;
+use rust_decimal::Decimal;
+use serde_json::{Value, json};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
 };
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{accept_private, stream_update};
+use super::{accept_private, order, stream_update};
+
+#[derive(Debug)]
+struct ExtendedStopStrategy {
+    core: StrategyCore,
+    order: Option<OrderAny>,
+}
+
+nautilus_strategy!(ExtendedStopStrategy);
+
+impl DataActor for ExtendedStopStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        if let Some(order) = self.order.take() {
+            self.submit_order(order, None, Some(ClientId::from("ALPACA")), None)?;
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::fixed(OrderType::StopLimit, TimeInForce::Day)]
+#[case::trailing(OrderType::TrailingStopLimit, TimeInForce::Gtc)]
+#[tokio::test]
+async fn restores_emulated_extended_hours_then_sends_limit(
+    #[case] order_type: OrderType,
+    #[case] time_in_force: TimeInForce,
+) {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = AlpacaExecutionClientConfig::builder()
+        .api_key("fixture-key".into())
+        .api_secret("fixture-secret".into())
+        .base_url_http(format!("http://{}", http.local_addr().unwrap()))
+        .base_url_ws_private(format!("ws://{}", ws.local_addr().unwrap()))
+        .build();
+
+    let (orders_tx, mut posts) = mpsc::unbounded_channel();
+    let app = Router::new()
+        .route(
+            "/v2/account",
+            get(|| async {
+                Json(json!({"account_number":"TEST","currency":"USD","cash":"10000"}))
+            }),
+        )
+        .route("/v2/positions", get(|| async { Json(json!([])) }))
+        .route("/v2/account/activities", get(|| async { Json(json!([])) }))
+        .route("/v2/orders", get(|| async { Json(json!([])) }))
+        .route(
+            "/v2/orders",
+            post(async move |Json(body): Json<Value>| {
+                let mut response = order("PAPER-STOP", false);
+                response["symbol"] = body["symbol"].clone();
+                response["type"] = body["type"].clone();
+                response["side"] = body["side"].clone();
+                response["time_in_force"] = body["time_in_force"].clone();
+                response["limit_price"] = body["limit_price"].clone();
+                response["extended_hours"] = body["extended_hours"].clone();
+                response["created_at"] =
+                    json!(get_atomic_clock_realtime().get_time_ns().to_rfc3339());
+                orders_tx.send((body, response.clone())).unwrap();
+                Json(response)
+            }),
+        );
+    let server = tokio::spawn(axum::serve(http, app).into_future());
+
+    let instrument_id = InstrumentId::from("AAPL.ALPACA");
+    let instrument = InstrumentAny::Equity(nautilus_model::instruments::Equity {
+        id: instrument_id,
+        ..equity_aapl()
+    });
+    let client_id = ClientId::from("ALPACA");
+    let strategy_id = StrategyId::from("RECOVERY-001");
+    let order_id = ClientOrderId::from("PAPER-STOP");
+
+    // Replay the order events into a fresh node without carrying the submit command
+    let mut serialized_events: Option<Vec<u8>> = None;
+    for restart in [false, true] {
+        let mut node = LiveNodeBuilder::from_config(LiveNodeConfig {
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_reconciliation(false)
+        .add_exec_client(
+            Some(client_id.to_string()),
+            Box::new(AlpacaExecutionClientFactory),
+            Box::new(config.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let cache = node.kernel().cache();
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+
+        let pending = if let Some(bytes) = serialized_events.take() {
+            let events: Vec<OrderEventAny> = serde_json::from_slice(&bytes).unwrap();
+            let restored = OrderAny::from_events(events).unwrap();
+            cache
+                .borrow_mut()
+                .add_order(restored, None, Some(client_id), false)
+                .unwrap();
+            None
+        } else {
+            let mut builder = OrderTestBuilder::new(order_type);
+            builder
+                .trader_id(node.kernel().trader_id())
+                .strategy_id(strategy_id)
+                .instrument_id(instrument_id)
+                .client_order_id(order_id)
+                .side(OrderSide::Sell)
+                .quantity(Quantity::from(1))
+                .price(Price::from("99.00"))
+                .trigger_price(Price::from("100.00"))
+                .time_in_force(time_in_force)
+                .tags(vec![ALPACA_EXTENDED_HOURS_TAG.into()])
+                .emulation_trigger(TriggerType::BidAsk);
+            if order_type == OrderType::TrailingStopLimit {
+                builder
+                    .trailing_offset(Decimal::ONE)
+                    .limit_offset(Decimal::ONE)
+                    .trailing_offset_type(TrailingOffsetType::Price);
+            }
+            Some(builder.build())
+        };
+        node.add_strategy(ExtendedStopStrategy {
+            core: StrategyCore::new(StrategyConfig {
+                strategy_id: Some(strategy_id),
+                ..Default::default()
+            }),
+            order: pending,
+        })
+        .unwrap();
+
+        let handle = node.handle();
+        let broker = async {
+            let mut socket = accept_private(&ws).await;
+            while !handle.is_running()
+                || !cache
+                    .borrow()
+                    .order(&order_id)
+                    .is_some_and(|order| order.status() == OrderStatus::Emulated)
+            {
+                tokio::task::yield_now().await;
+            }
+            assert!(posts.try_recv().is_err());
+
+            if restart {
+                let now = get_atomic_clock_realtime().get_time_ns();
+                let quote = QuoteTick::new(
+                    instrument_id,
+                    Price::from("99.50"),
+                    Price::from("99.51"),
+                    Quantity::from(10),
+                    Quantity::from(10),
+                    now,
+                    now,
+                );
+                let sender = get_data_event_sender();
+                sender.send(DataEvent::Data(Data::Quote(quote))).unwrap();
+                sender.send(DataEvent::Data(Data::Quote(quote))).unwrap();
+
+                let (body, response) = posts.recv().await.unwrap();
+                assert_eq!(body["client_order_id"], "PAPER-STOP");
+                assert_eq!(body["type"], "limit");
+                assert_eq!(
+                    body["time_in_force"],
+                    time_in_force.to_string().to_lowercase()
+                );
+                assert_eq!(body["extended_hours"], true);
+                assert!(body.get("stop_price").is_none());
+                let event = json!({
+                    "stream": "trade_updates",
+                    "data": {"event": "new", "timestamp": now.to_rfc3339(), "order": response},
+                });
+                socket.send(Message::text(event.to_string())).await.unwrap();
+                while !cache
+                    .borrow()
+                    .order(&order_id)
+                    .is_some_and(|order| order.status() == OrderStatus::Accepted)
+                {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                let cache = cache.borrow();
+                let pending = cache.order(&order_id).unwrap();
+                serialized_events = Some(serde_json::to_vec(&pending.events()).unwrap());
+            }
+            handle.stop();
+            socket
+        };
+        let (result, _socket) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(node.run(), broker)
+        })
+        .await
+        .expect("Emulated order failed to initialize or release");
+        result.unwrap();
+        assert!(posts.try_recv().is_err());
+        node.dispose();
+    }
+
+    server.abort();
+}
 
 #[derive(Debug)]
 struct ClosingStrategy {

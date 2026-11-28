@@ -312,7 +312,7 @@ impl AlpacaExecutionClient {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let spread = option_spread::definition(id, &instruments, now())?;
-            let extended = extended_hours(params)?;
+            let extended = extended_hours(order, params)?;
             ensure!(
                 !extended || spread.asset_class() == AssetClass::Equity,
                 "Alpaca index option spreads require regular hours",

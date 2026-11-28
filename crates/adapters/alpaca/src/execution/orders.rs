@@ -30,14 +30,14 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use super::advanced::AdvancedInstructions;
-use crate::{option_provider::is_option_symbol, option_spread};
+use crate::{common::ALPACA_EXTENDED_HOURS_TAG, option_provider::is_option_symbol, option_spread};
 
 pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<Value> {
     ensure!(
         order.contingency_type().is_none() && order.parent_order_id().is_none(),
         "Submit Alpaca contingent orders as an order list",
     );
-    let extended = extended_hours(params)?;
+    let extended = extended_hours(order, params)?;
     let mut request = equity_request(order, extended)?;
     if let Some(instructions) = AdvancedInstructions::from_params(params)? {
         instructions.validate_order(order.order_type(), order.time_in_force(), extended)?;
@@ -70,7 +70,7 @@ pub(super) fn option_order_request(
         AdvancedInstructions::from_params(params)?.is_none(),
         "Alpaca advanced instructions require an equity order",
     );
-    let extended = extended_hours(params)?;
+    let extended = extended_hours(order, params)?;
     match underlying_class {
         AssetClass::Equity => {}
         AssetClass::Index => ensure!(!extended, "Alpaca index options require regular hours"),
@@ -233,7 +233,7 @@ pub(super) fn order_list_request<'a>(
     let root = group.root;
     let has_entry = group.class != "oco";
     ensure!(
-        !extended_hours(params)?,
+        extended_hours_param(params)? != Some(true) && !orders.iter().any(has_extended_hours_tag),
         "Alpaca order groups do not support extended hours",
     );
     ensure!(
@@ -287,14 +287,32 @@ pub(super) fn order_list_request<'a>(
     Ok((request, group))
 }
 
-pub(super) fn extended_hours(params: Option<&Params>) -> anyhow::Result<bool> {
+pub(super) fn extended_hours(order: &OrderAny, params: Option<&Params>) -> anyhow::Result<bool> {
+    let tagged = has_extended_hours_tag(order);
+    let explicit = extended_hours_param(params)?;
+    ensure!(
+        !tagged || explicit != Some(false),
+        "Alpaca extended_hours=false conflicts with the {ALPACA_EXTENDED_HOURS_TAG} order tag",
+    );
+    Ok(explicit.unwrap_or(tagged))
+}
+
+fn has_extended_hours_tag(order: &OrderAny) -> bool {
+    order.tags().is_some_and(|tags| {
+        tags.iter()
+            .any(|tag| tag.as_str() == ALPACA_EXTENDED_HOURS_TAG)
+    })
+}
+
+fn extended_hours_param(params: Option<&Params>) -> anyhow::Result<Option<bool>> {
     params
         .and_then(|params| params.get("extended_hours"))
-        .map_or(Ok(false), |value| {
+        .map(|value| {
             value
                 .as_bool()
                 .context("Alpaca extended_hours must be a boolean")
         })
+        .transpose()
 }
 
 fn validate_equity_order(order: &OrderAny) -> anyhow::Result<()> {
@@ -563,6 +581,28 @@ mod tests {
         let order = order_builder(OrderType::Market, "ORDER-1").build();
         let params = Params::new([("extended_hours".to_string(), json!(true))].into());
         assert!(order_request(&order, Some(&params)).is_err());
+    }
+
+    #[rstest]
+    #[case(None, true)]
+    #[case(Some(true), true)]
+    #[case(Some(false), false)]
+    fn validates_extended_hours_tag_and_parameter(
+        #[case] explicit: Option<bool>,
+        #[case] valid: bool,
+    ) {
+        let order = order_builder(OrderType::Limit, "ORDER-1")
+            .price(Price::from("420.12"))
+            .tags(vec![ALPACA_EXTENDED_HOURS_TAG.into()])
+            .build();
+        let params =
+            explicit.map(|value| Params::new([("extended_hours".into(), json!(value))].into()));
+        let result = order_request(&order, params.as_ref());
+        if valid {
+            assert_eq!(result.unwrap()["extended_hours"], true);
+        } else {
+            assert!(result.is_err());
+        }
     }
 
     #[rstest]
