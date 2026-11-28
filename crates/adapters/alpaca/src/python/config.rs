@@ -45,7 +45,6 @@ nautilus_core::impl_pyo3_config_getters!(AlpacaExecutionClientConfig {
     base_url_http: Option<String>,
     base_url_ws_private: Option<String>,
     http_timeout_secs: u64,
-    infer_option_position_intent: bool,
 });
 
 #[pymethods]
@@ -134,7 +133,6 @@ impl AlpacaExecutionClientConfig {
         base_url_ws_private = None,
         proxy_url = None,
         http_timeout_secs = None,
-        infer_option_position_intent = true,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -147,7 +145,6 @@ impl AlpacaExecutionClientConfig {
         base_url_ws_private: Option<String>,
         proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
-        infer_option_position_intent: bool,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -161,7 +158,6 @@ impl AlpacaExecutionClientConfig {
             proxy_url: proxy_url.map(SecretString::from),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             fee_sync: defaults.fee_sync,
-            infer_option_position_intent,
         }
     }
 

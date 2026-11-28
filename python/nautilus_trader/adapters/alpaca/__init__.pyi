@@ -88,8 +88,6 @@ class AlpacaExecutionClientConfig:
     def base_url_ws_private(self) -> str | None: ...
     @property
     def http_timeout_secs(self) -> int: ...
-    @property
-    def infer_option_position_intent(self) -> bool: ...
     def __init__(
         self,
         environment: AlpacaEnvironment | None = None,
@@ -101,7 +99,6 @@ class AlpacaExecutionClientConfig:
         base_url_ws_private: str | None = None,
         proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
-        infer_option_position_intent: bool = True,
     ) -> None: ...
 
 @typing.final

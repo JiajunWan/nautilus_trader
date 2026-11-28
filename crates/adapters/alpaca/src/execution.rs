@@ -123,7 +123,6 @@ pub struct AlpacaExecutionClient {
     accounts: Arc<AccountSnapshots>,
     tasks: TaskGroup,
     fee_sync: Option<AlpacaFeeSyncSettings>,
-    infer_option_position_intent: bool,
 }
 
 impl fmt::Debug for AlpacaExecutionClient {
@@ -180,7 +179,6 @@ impl AlpacaExecutionClient {
             accounts: Arc::new(AccountSnapshots::default()),
             tasks: TaskGroup::new(),
             fee_sync: config.fee_sync.clone(),
-            infer_option_position_intent: config.infer_option_position_intent,
         })
     }
 
@@ -334,7 +332,7 @@ impl AlpacaExecutionClient {
                 ),
                 _ => anyhow::bail!("Unsupported Alpaca option asset class for {id}"),
             }
-            return option_order_request(order, params, self.infer_option_position_intent);
+            return option_order_request(order, params);
         }
         order_request(order, params)
     }

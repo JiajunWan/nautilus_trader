@@ -50,7 +50,6 @@ pub(super) fn order_request(order: &OrderAny, params: Option<&Params>) -> anyhow
 pub(super) fn option_order_request(
     order: &OrderAny,
     params: Option<&Params>,
-    infer_intent: bool,
 ) -> anyhow::Result<Value> {
     ensure!(
         order.contingency_type().is_none() && order.parent_order_id().is_none(),
@@ -98,11 +97,7 @@ pub(super) fn option_order_request(
                 .as_str()
                 .context("Alpaca position_intent must be a string")?,
         ),
-        None if infer_intent
-            && !extended
-            && order.order_type() == OrderType::Limit
-            && !order.is_reduce_only() =>
-        {
+        None if !extended && order.order_type() == OrderType::Limit && !order.is_reduce_only() => {
             None
         }
         None => Some(default_intent),
@@ -540,7 +535,7 @@ mod tests {
             .build();
         for result in [
             order_request(&equity, None),
-            option_order_request(&option, None, false),
+            option_order_request(&option, None),
             super::super::combos::request(&combo, None, false),
         ] {
             assert_eq!(
@@ -637,12 +632,8 @@ mod tests {
         if let Some(intent) = explicit_intent {
             params.push(("position_intent".to_owned(), json!(intent)));
         }
-        let request = option_order_request(
-            &order,
-            Some(&Params::new(params.into_iter().collect())),
-            false,
-        )
-        .unwrap();
+        let request =
+            option_order_request(&order, Some(&Params::new(params.into_iter().collect()))).unwrap();
         assert_eq!(request["symbol"], "SPY261120C00745000");
         assert_eq!(request["qty"], "1");
         assert_eq!(request["time_in_force"], "day");
@@ -718,7 +709,7 @@ mod tests {
             params.push(("position_intent".to_owned(), json!(explicit)));
         }
         let params = Params::new(params.into_iter().collect());
-        let wire = option_order_request(&order, Some(&params), true).unwrap();
+        let wire = option_order_request(&order, Some(&params)).unwrap();
         assert_eq!(
             wire.get("position_intent").and_then(Value::as_str),
             expected
@@ -748,7 +739,7 @@ mod tests {
             .price(Price::from("2.40"))
             .build();
         let params = Params::new([("position_intent".to_owned(), intent)].into());
-        assert!(option_order_request(&order, Some(&params), false).is_err());
+        assert!(option_order_request(&order, Some(&params)).is_err());
     }
 
     #[rstest]
@@ -768,7 +759,7 @@ mod tests {
             .time_in_force(time_in_force)
             .build();
         let params = Params::new([("extended_hours".to_string(), json!(extended))].into());
-        assert!(option_order_request(&order, Some(&params), false).is_err());
+        assert!(option_order_request(&order, Some(&params)).is_err());
     }
 
     #[rstest]

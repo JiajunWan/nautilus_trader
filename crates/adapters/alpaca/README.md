@@ -171,17 +171,15 @@ equity, ETF, or supported index option instrument. Index option orders
 execute during regular hours. Quantity counts whole contracts. To change an option
 order, cancel and resubmit.
 
-`AlpacaExecutionClientConfig` defaults `infer_option_position_intent` to
-`true`. For regular-hours Limit DAY orders, Alpaca determines opening or
-closing from the account's positions when the order has no explicit
-`position_intent` and is not reduce-only. A sell while flat may open a short
-subject to the account's options permissions and collateral.
+For ordinary regular-hours Limit DAY orders, the adapter omits
+`position_intent` so Alpaca can determine opening or closing from the account's
+positions. A sell while flat may open a short subject to the account's options
+permissions and collateral.
 
 Set `reduce_only=true` for a close-only order. The adapter sends
-`buy_to_close` or `sell_to_close` for the corresponding side. Market orders,
-extended-hours orders, and orders submitted with inference disabled use an
-explicit intent. Their ordinary default is `buy_to_open` for buys and
-`sell_to_close` for sells. An opening sell on these paths uses
+`buy_to_close` or `sell_to_close` for the corresponding side. Market orders
+and extended-hours orders default to `buy_to_open` for buys and `sell_to_close`
+for sells. An opening sell on these paths uses
 `params={"position_intent": "sell_to_open"}`.
 
 The adapter routes cancellation by Alpaca order ID and reconciles single-leg
